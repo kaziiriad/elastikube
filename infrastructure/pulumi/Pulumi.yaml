@@ -1,0 +1,38 @@
+name: k3s-autoscaler
+description: K3s autoscaler infrastructure on AWS
+runtime:
+  name: python
+  options:
+    toolchain: uv
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: aws-python
+  # AWS Configuration
+  aws:region:
+    value: ap-southeast-1
+  # K3s Configuration
+  k3s:clusterName:
+    value: production-k3s
+  k3s:minNodes:
+    value: 2
+  k3s:maxNodes:
+    value: 10
+  # EC2 Configuration
+  ec2:masterInstanceType:
+    value: t3.medium
+  ec2:workerInstanceType:
+    value: t3.small
+  ec2:amiId:
+    value: ami-0f1e31d01140d0ae2  # Ubuntu 22.04 in ap-southeast-1 (Singapore)
+  # Autoscaler Configuration
+  autoscaler:checkInterval:
+    value: 120  # 2 minutes in seconds
+  autoscaler:scaleUpThreshold:
+    value: 70  # CPU percentage
+  autoscaler:scaleDownThreshold:
+    value: 30  # CPU percentage
+  autoscaler:scaleUpCooldown:
+    value: 300  # 5 minutes in seconds
+  autoscaler:scaleDownCooldown:
+    value: 900  # 15 minutes in seconds
