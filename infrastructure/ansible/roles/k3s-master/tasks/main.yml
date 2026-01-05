@@ -1,0 +1,125 @@
+---
+# K3s Master node setup
+- name: Download and install k3s server
+  shell: |
+    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --node-ip={{ ansible_default_ipv4.address }} --tls-san {{ ansible_default_ipv4.address }}" sh -
+  args:
+    creates: /usr/local/bin/k3s
+
+- name: Wait for k3s to be ready
+  wait_for:
+    path: /etc/rancher/k3s/k3s.yaml
+    delay: 5
+    timeout: 300
+
+- name: Set kubeconfig permissions
+  file:
+    path: /etc/rancher/k3s/k3s.yaml
+    mode: '0644'
+
+- name: Get k3s node token
+  shell: cat /var/lib/rancher/k3s/server/node-token
+  register: k3s_token
+  changed_when: false
+
+- name: Get master node IP
+  shell: hostname -I | awk '{print $1}'
+  register: master_ip
+  changed_when: false
+
+- name: Display master info
+  debug:
+    msg: "Master IP: {{ master_ip.stdout }}, Token: {{ k3s_token.stdout[:20] }}..."
+
+- name: Set master IP as fact for workers
+  set_fact:
+    master_node_ip: "{{ master_ip.stdout }}"
+    k3s_cluster_token: "{{ k3s_token.stdout }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['workers'] }}"
+  run_once: true
+
+# Store cluster info in S3 for autoscaler Lambda
+- name: Upload k3s token to S3 for autoscaler
+  aws_s3:
+    bucket: "{{ s3_bucket_name }}"
+    object: /k3s-token
+    content: "{{ k3s_token.stdout }}"
+    mode: put
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key | default(omit) }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key | default(omit) }}"
+    AWS_DEFAULT_REGION: "{{ aws_region | default('ap-southeast-1') }}"
+  ignore_errors: true  # May fail if no AWS creds on instance
+
+- name: Upload master IP to S3 for autoscaler
+  aws_s3:
+    bucket: "{{ s3_bucket_name }}"
+    object: /master-ip
+    content: "{{ master_ip.stdout }}"
+    mode: put
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key | default(omit) }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key | default(omit) }}"
+    AWS_DEFAULT_REGION: "{{ aws_region | default('ap-southeast-1') }}"
+  ignore_errors: true
+
+- name: Create Prometheus namespace
+  command: kubectl create namespace prometheus
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  ignore_errors: true
+
+- name: Add Prometheus Helm repository
+  command: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  ignore_errors: true
+
+- name: Update Helm repositories
+  command: helm repo update
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+# Install Prometheus with NodePort for autoscaler access
+- name: Create Prometheus values file
+  copy:
+    dest: /tmp/prometheus-values.yaml
+    content: |
+      server:
+        service:
+          type: NodePort
+          nodePort: 30900
+        global:
+          scrape_interval: 15s
+
+- name: Install Prometheus via Helm
+  command: |
+    helm upgrade --install prometheus prometheus-community/prometheus \
+      --namespace prometheus \
+      --values /tmp/prometheus-values.yaml \
+      --set server.service.type=NodePort \
+      --set server.service.nodePort=30900 \
+      --wait --timeout 5m
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  async: 300
+  poll: 0
+
+- name: Wait for Prometheus to be ready
+  wait_for:
+    timeout: 120
+  delegate_to: localhost
+  become: false
+
+- name: Get Prometheus service status
+  command: kubectl get svc prometheus-server -n prometheus
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: prometheus_status
+  changed_when: false
+
+- name: Display Prometheus status
+  debug:
+    var: prometheus_status.stdout_lines
