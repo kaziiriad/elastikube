@@ -138,7 +138,7 @@ jobs:
       - name: Verify runner status
         run: |
           ssh -o StrictHostKeyChecking=no ubuntu@${{ env.BASTION_IP }} << 'EOF'
-            sudo ./actions-runner/svc.sh status
+            cd actions-runner && sudo ./svc.sh status
           EOF
 
       - name: Setup complete
