@@ -20,6 +20,10 @@ from pulumi_aws import ec2, lambda_, dynamodb, s3, iam
 # =============================================================================
 config = pulumi.Config()
 
+# Get AWS account ID for unique bucket naming
+caller_identity = aws.get_caller_identity()
+account_id = caller_identity.account_id
+
 # AWS Region
 region = config.get("aws:region", "ap-southeast-1")
 
@@ -29,10 +33,10 @@ min_nodes = config.get_int("k3s:minNodes", 2)
 max_nodes = config.get_int("k3s:maxNodes", 10)
 
 # EC2 Configuration
-master_instance_type = config.get("ec2:masterInstanceType", "t3.medium")
+master_instance_type = config.get("ec2:masterInstanceType", "t3.small")  # Free Tier eligible
 worker_instance_type = config.get("ec2:workerInstanceType", "t3.small")
 # Ubuntu 22.04 AMI IDs (update if using different region)
-ami_id = config.get("ec2:amiId", "ami-0f1e31d01140d0ae2")  # ap-southeast-1
+ami_id = config.get("ec2:amiId", "ami-0c687e8f5c4e54af5")  # ap-southeast-1 (Ubuntu 22.04)
 
 # Autoscaler Configuration
 check_interval = config.get_int("autoscaler:checkInterval", 120)
@@ -192,9 +196,10 @@ security_group = aws.ec2.SecurityGroup("k3s-secgrp",
 # =============================================================================
 # S3 Bucket for K3s Token and Scripts
 # =============================================================================
+# Use account ID for globally unique bucket name (deterministic, works across updates)
 k3s_bucket = s3.Bucket(
     "k3s-config-bucket",
-    bucket=f"{cluster_name}-config",
+    bucket=pulumi.Output.concat(cluster_name, "-config-", account_id),
     tags={**common_tags, "Name": "k3s-config-bucket"}
 )
 
@@ -469,46 +474,55 @@ worker_instance_profile = iam.InstanceProfile(
 # Note: These are initial seed instances. The autoscaler Lambda will
 # dynamically add/remove worker nodes based on cluster metrics.
 
-# SSH Key Pair (optional - set PUBLIC_KEY env var to enable)
-public_key = os.getenv("PUBLIC_KEY")
-key_pair = None
-if public_key:
-    key_pair = aws.ec2.KeyPair("MyKeyPair",
-        key_name="MyKeyPair",
-        public_key=public_key
-    )
+# SSH Key Pair - use existing MyKeyPair in AWS
+# Note: Key pair must already exist in AWS for this region
+existing_key_name = config.get("ec2:keyPairName", "MyKeyPair")
 
-# Master Instance
+# Master Instance (in public subnet for SSH access during Ansible deployment)
 master_instance = ec2.Instance(
     'master-instance',
     instance_type=master_instance_type,
     ami=ami_id,
-    subnet_id=private_subnet.id,
+    subnet_id=public_subnet.id,  # Public subnet for SSH access
     vpc_security_group_ids=[security_group.id],
-    key_name=key_pair.key_name if key_pair else None,
+    associate_public_ip_address=True,  # Enable SSH access for Ansible
+    key_name=existing_key_name,
     tags={**common_tags, 'Name': 'k3s-master', 'NodeRole': 'master'}
 )
 
-# Worker Instance 1 (permanent)
+# Worker Instance 1 (permanent, in public subnet for SSH access)
 worker_instance_1 = ec2.Instance('worker-instance-1',
     instance_type=worker_instance_type,
     ami=ami_id,
-    subnet_id=private_subnet.id,
+    subnet_id=public_subnet.id,  # Public subnet for SSH access
     vpc_security_group_ids=[security_group.id],
+    associate_public_ip_address=True,  # Enable SSH access for Ansible
     iam_instance_profile=worker_instance_profile.name,
-    key_name=key_pair.key_name if key_pair else None,
+    key_name=existing_key_name,
     tags={**common_tags, 'Name': 'k3s-worker-1', 'NodeRole': 'worker', 'Permanent': 'true'}
 )
 
-# Worker Instance 2 (permanent)
+# Worker Instance 2 (permanent, in public subnet for SSH access)
 worker_instance_2 = ec2.Instance('worker-instance-2',
     instance_type=worker_instance_type,
     ami=ami_id,
-    subnet_id=private_subnet.id,
+    subnet_id=public_subnet.id,  # Public subnet for SSH access
     vpc_security_group_ids=[security_group.id],
+    associate_public_ip_address=True,  # Enable SSH access for Ansible
     iam_instance_profile=worker_instance_profile.name,
-    key_name=key_pair.key_name if key_pair else None,
+    key_name=existing_key_name,
     tags={**common_tags, 'Name': 'k3s-worker-2', 'NodeRole': 'worker', 'Permanent': 'true'}
+)
+
+# =============================================================================
+# EventBridge Rule
+# =============================================================================
+
+# EventBridge Rule - triggers every 2 minutes
+event_rule = aws.cloudwatch.EventRule(
+    "k3s-autoscaler-schedule",
+    schedule_expression="rate(2 minutes)",
+    tags={**common_tags, "Name": "k3s-autoscaler-schedule"}
 )
 
 # =============================================================================
@@ -523,30 +537,52 @@ lambda_log_group = aws.cloudwatch.LogGroup(
     tags={**common_tags, "Name": "k3s-autoscaler-logs"}
 )
 
-# TODO: Create the Lambda function package
-# The actual Lambda code will be in lambda/ directory
-# For now, we'll create a placeholder that you'll update later
+# Lambda deployment package (assume it's built locally)
+# Build the Lambda package first: cd ../../lambda && ./build.sh
+lambda_archive = pulumi.FileArchive(f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/lambda/build/lambda.zip")
 
-# Placeholder: You'll need to build and package the Lambda code
-# pulumi.LoggedWarning("Lambda function placeholder - implement packaging in lambda/ directory")
-
-# =============================================================================
-# EventBridge Rule
-# =============================================================================
-
-# EventBridge Rule - triggers every 2 minutes
-event_rule = aws.cloudwatch.EventRule(
-    "k3s-autoscaler-schedule",
-    schedule_expression="rate 2 minutes",
-    tags={**common_tags, "Name": "k3s-autoscaler-schedule"}
+# Lambda Function
+lambda_function = lambda_.Function(
+    "k3s-autoscaler-function",
+    runtime="python3.11",
+    handler="main.lambda_handler",
+    role=lambda_role.arn,
+    timeout=300,  # 5 minutes (max Lambda timeout)
+    memory_size=256,  # 256 MB
+    environment=lambda_.FunctionEnvironmentArgs(
+        variables={
+            "CLUSTER_NAME": cluster_name,
+            "PROMETHEUS_URL": "http://localhost:30900",  # TODO: Get from worker IPs
+            "STATE_TABLE_NAME": cluster_state_table.name,
+            "WAL_TABLE_NAME": wal_table.name,
+            "MIN_NODES": str(min_nodes),
+            "MAX_NODES": str(max_nodes),
+            "SCALE_UP_THRESHOLD": str(scale_up_threshold),
+            "SCALE_DOWN_THRESHOLD": str(scale_down_threshold),
+            "SCALE_UP_COOLDOWN": str(scale_up_cooldown),
+            "SCALE_DOWN_COOLDOWN": str(scale_down_cooldown),
+            "DRY_RUN": "false",
+        }
+    ),
+    code=lambda_archive,
+    tags={**common_tags, "Name": "k3s-autoscaler"}
 )
 
-# TODO: Add EventBridge target to invoke Lambda
-# This will be added after Lambda function is created
-# event_target = aws.cloudwatch.EventTarget("k3s-autoscaler-target",
-#     rule=event_rule.name,
-#     arn=lambda_function.arn,
-# )
+# Lambda Permission for EventBridge to invoke
+lambda_permission = aws.lambda_.Permission(
+    "k3s-autoscaler-eventbridge-permission",
+    action="lambda:InvokeFunction",
+    function=lambda_function.name,
+    principal="events.amazonaws.com",
+    source_arn=event_rule.arn,
+)
+
+# EventBridge Target - invokes Lambda
+event_target = aws.cloudwatch.EventTarget(
+    "k3s-autoscaler-target",
+    rule=event_rule.name,
+    arn=lambda_function.arn,
+)
 
 # =============================================================================
 # CloudWatch Alarms
@@ -616,9 +652,19 @@ pulumi.export("dynamodb_cluster_state_table", cluster_state_table.name)
 pulumi.export("dynamodb_wal_table", wal_table.name)
 pulumi.export("s3_config_bucket", k3s_bucket.bucket)
 pulumi.export("lambda_role_arn", lambda_role.arn)
+pulumi.export("lambda_function_arn", lambda_function.arn)
+pulumi.export("lambda_function_name", lambda_function.name)
 pulumi.export("worker_instance_profile", worker_instance_profile.name)
 pulumi.export("cloudwatch_log_group", lambda_log_group.name)
 pulumi.export("event_rule_arn", event_rule.arn)
+
+# EC2 Instance IPs (for Ansible deployment)
+pulumi.export("master_public_ip", master_instance.public_ip)
+pulumi.export("worker_1_public_ip", worker_instance_1.public_ip)
+pulumi.export("worker_2_public_ip", worker_instance_2.public_ip)
+
+# Security Group ID
+pulumi.export("security_group_id", security_group.id)
 
 # Configuration outputs
 pulumi.export("config_min_nodes", min_nodes)
