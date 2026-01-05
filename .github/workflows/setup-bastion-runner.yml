@@ -128,9 +128,9 @@ jobs:
             # Install jq for JSON parsing
             sudo apt-get install -y jq
 
-            # Install Pulumi
-            curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
-            uv pip install pulumi pulumi-aws --system
+            # # Install Pulumi (with sudo for uv)
+            # curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR="/usr/local/bin" sh
+            # /usr/local/bin/uv pip install pulumi pulumi-aws --break-system-packages
 
             echo "✓ All tools installed"
           EOF
