@@ -128,9 +128,11 @@ jobs:
             # Install jq for JSON parsing
             sudo apt-get install -y jq
 
-            # # Install Pulumi (with sudo for uv)
-            # curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR="/usr/local/bin" sh
-            # /usr/local/bin/uv pip install pulumi pulumi-aws --break-system-packages
+            # Install AWS CLI
+            sudo apt-get install -y unzip
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
 
             echo "✓ All tools installed"
           EOF
