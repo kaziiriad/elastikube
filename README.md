@@ -78,37 +78,75 @@ Production-grade autoscaling system for K3s clusters on AWS using AWS Lambda, Dy
 ### Prerequisites
 
 - AWS CLI configured
-- Terraform >= 1.0
+- Pulumi >= 3.0
+- Ansible >= 2.15
 - Python 3.11+
-- Existing K3s cluster
 
 ### Deploy Infrastructure
 
 ```bash
-cd infrastructure/terraform
-terraform init
-terraform plan
-terraform apply
+cd infrastructure/pulumi
+pulumi stack init prod
+pulumi up
 ```
 
-### Deploy Lambda Function
+### Deploy K3s with Ansible
 
 ```bash
-cd lambda
-pip install -r requirements.txt -t package
-cd package && zip -r ../lambda_function.zip .
-cd .. && zip -g lambda_function.zip lambda_function.py
-aws lambda update-function-code --function-name k3s-autoscaler --zip-file fileb://lambda_function.zip
+cd infrastructure/scripts
+./deploy-k3s.sh
 ```
+
+## CI/CD with GitHub Actions
+
+This project uses GitHub Actions with self-hosted runners on the bastion host.
+
+### Required GitHub Secrets
+
+Configure the following secrets in your GitHub repository settings:
+
+| Secret Name | Description | Example |
+|-------------|-------------|---------|
+| `AWS_ACCESS_KEY_ID` | AWS access key with EC2/VPC/IAM permissions | `AKIAIOSFODNN7EXAMPLE` |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret access key | `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` |
+| `PULUMI_ACCESS_TOKEN` | Pulumi authentication token | `pulum-abc123...` |
+| `SSH_PRIVATE_KEY` | SSH key pair for EC2 instances (contents of .pem file) | `-----BEGIN RSA PRIVATE KEY-----\n...` |
+| `GIT_RUNNER_TOKEN` | GitHub Actions runner registration token | `ABCD1234...` (from repo Settings → Actions → Runners → New self-hosted runner) |
+
+### Workflow Triggers
+
+- **Deploy Infrastructure** (`infra.yml`): Triggered on push to `master` with changes in `infrastructure/pulumi/**`
+  - Runs on GitHub-hosted `ubuntu-latest` runner
+  - Provisions VPC, bastion, and K3s EC2 instances
+
+- **Setup Bastion Runner** (`setup-bastion-runner.yml`): Triggered after successful infrastructure deployment
+  - Installs GitHub Actions self-hosted runner on bastion
+  - Installs Ansible, kubectl, Pulumi, and other tools
+
+- **Deploy K3s** (`k3s-deploy.yml`): Triggered on push to `master` with changes in `infrastructure/ansible/**`, or after runner setup
+  - Runs on **self-hosted** bastion runner
+  - Deploys K3s cluster with Ansible
+  - Has direct access to private subnet K3s nodes
+
+### Manual Deployment
+
+For local deployment, see:
+- Infrastructure: `infrastructure/pulumi/README.md`
+- K3s setup: `infrastructure/scripts/deploy-k3s.sh`
 
 ## Directory Structure
 
 ```
 production/
 ├── .github/workflows/          # GitHub Actions CI/CD
+│   ├── infra.yml               # Infrastructure deployment (Pulumi)
+│   ├── setup-bastion-runner.yml # GitHub Actions runner setup
+│   └── k3s-deploy.yml          # K3s cluster deployment (Ansible)
 ├── ci/                          # CI/CD configurations
 ├── infrastructure/
-│   ├── terraform/              # Terraform IaC
+│   ├── pulumi/                 # Pulumi IaC for AWS resources
+│   ├── ansible/                # Ansible playbooks for K3s setup
+│   ├── scripts/                # Deployment scripts
 │   └── cloudformation/         # CloudFormation templates
 ├── lambda/
 │   ├── src/
