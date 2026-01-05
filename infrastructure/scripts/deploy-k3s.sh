@@ -27,19 +27,20 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Check prerequisites
-for cmd in ansible jq kubectl helm; do
+# Check prerequisites (note: helm is installed by Ansible on nodes)
+for cmd in ansible jq kubectl; do
     if ! command -v $cmd &> /dev/null; then
         log_error "$cmd is not installed. Please install it first:"
         case $cmd in
             ansible) echo "  pip install ansible-core" ;;
             jq) echo "  sudo apt-get install jq  # Ubuntu/Debian" ;;
             kubectl) echo "  curl -LO https://dl.k8s.io/release/\$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl && sudo install kubectl /usr/local/bin/" ;;
-            helm) echo "  curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash" ;;
         esac
         exit 1
     fi
 done
+
+log_info "Note: Helm will be installed on nodes by Ansible"
 
 # Change to pulumi directory
 cd "$INFRA_DIR/pulumi"
@@ -54,14 +55,16 @@ if [ -z "$OUTPUTS" ]; then
 fi
 
 # Extract IPs and S3 bucket using jq
-MASTER_IP=$(echo "$OUTPUTS" | jq -r '.master_public_ip.value // empty')
-WORKER_1_IP=$(echo "$OUTPUTS" | jq -r '.worker_1_public_ip.value // empty')
-WORKER_2_IP=$(echo "$OUTPUTS" | jq -r '.worker_2_public_ip.value // empty')
+BASTION_IP=$(echo "$OUTPUTS" | jq -r '.bastion_public_ip.value // empty')
+MASTER_IP=$(echo "$OUTPUTS" | jq -r '.master_private_ip.value // empty')
+WORKER_1_IP=$(echo "$OUTPUTS" | jq -r '.worker_1_private_ip.value // empty')
+WORKER_2_IP=$(echo "$OUTPUTS" | jq -r '.worker_2_private_ip.value // empty')
 S3_BUCKET=$(echo "$OUTPUTS" | jq -r '.s3_config_bucket.value // empty')
 
 # Validate we got the IPs
-if [ -z "$MASTER_IP" ] || [ -z "$WORKER_1_IP" ] || [ -z "$WORKER_2_IP" ] || [ -z "$S3_BUCKET" ]; then
+if [ -z "$BASTION_IP" ] || [ -z "$MASTER_IP" ] || [ -z "$WORKER_1_IP" ] || [ -z "$WORKER_2_IP" ] || [ -z "$S3_BUCKET" ]; then
     log_error "Failed to extract infrastructure details from Pulumi outputs."
+    log_error "Bastion IP: $BASTION_IP"
     log_error "Master IP: $MASTER_IP"
     log_error "Worker 1 IP: $WORKER_1_IP"
     log_error "Worker 2 IP: $WORKER_2_IP"
@@ -70,9 +73,10 @@ if [ -z "$MASTER_IP" ] || [ -z "$WORKER_1_IP" ] || [ -z "$WORKER_2_IP" ] || [ -z
 fi
 
 log_info "Extracted infrastructure details:"
-echo "  Master:    $MASTER_IP"
-echo "  Worker 1:  $WORKER_1_IP"
-echo "  Worker 2:  $WORKER_2_IP"
+echo "  Bastion:   $BASTION_IP (SSH access)"
+echo "  Master:    $MASTER_IP (private)"
+echo "  Worker 1:  $WORKER_1_IP (private)"
+echo "  Worker 2:  $WORKER_2_IP (private)"
 echo "  S3 Bucket: $S3_BUCKET"
 
 # Check if key pair file exists
@@ -90,7 +94,8 @@ mkdir -p "$ANSIBLE_DIR/inventory"
 # Generate Ansible inventory from template
 log_info "Generating Ansible inventory file..."
 
-sed -e "s|__MASTER_IP__|$MASTER_IP|g" \
+sed -e "s|__BASTION_IP__|$BASTION_IP|g" \
+    -e "s|__MASTER_IP__|$MASTER_IP|g" \
     -e "s|__WORKER_1_IP__|$WORKER_1_IP|g" \
     -e "s|__WORKER_2_IP__|$WORKER_2_IP|g" \
     -e "s|__KEY_FILE__|$KEY_FILE|g" \
@@ -100,7 +105,7 @@ sed -e "s|__MASTER_IP__|$MASTER_IP|g" \
 log_info "Inventory file created at: $ANSIBLE_DIR/inventory/hosts.ini"
 
 # Wait for instances to be ready
-log_info "Waiting for instances to be ready (this may take 2-3 minutes)..."
+log_info "Waiting for bastion host to be ready..."
 
 wait_for_ssh() {
     local host=$1
@@ -121,9 +126,35 @@ wait_for_ssh() {
     return 1
 }
 
-wait_for_ssh "$MASTER_IP"
-wait_for_ssh "$WORKER_1_IP"
-wait_for_ssh "$WORKER_2_IP"
+# Wait for bastion first
+wait_for_ssh "$BASTION_IP"
+
+log_info "Waiting for K3s nodes to be ready via bastion (this may take 2-3 minutes)..."
+
+# Wait for private subnet nodes via bastion
+wait_for_node_via_bastion() {
+    local node_ip=$1
+    local node_name=$2
+    local max_attempts=60
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ProxyJump="ubuntu@$BASTION_IP" -i "$KEY_FILE" ubuntu@$node_ip "echo ready" &> /dev/null; then
+            log_info "✓ $node_name is ready"
+            return 0
+        fi
+        echo -n "."
+        sleep 3
+        attempt=$((attempt + 1))
+    done
+
+    log_error "$node_name did not become ready in time"
+    return 1
+}
+
+wait_for_node_via_bastion "$MASTER_IP" "master"
+wait_for_node_via_bastion "$WORKER_1_IP" "worker-1"
+wait_for_node_via_bastion "$WORKER_2_IP" "worker-2"
 
 echo ""
 
@@ -137,21 +168,29 @@ ansible-playbook -i inventory/hosts.ini site.yml
 # Set up local kubeconfig
 log_info "Setting up local kubeconfig..."
 mkdir -p "$KUBECONFIG_DIR"
-scp -i "$KEY_FILE" ubuntu@$MASTER_IP:/etc/rancher/k3s/k3s.yaml "$KUBECONFIG_DIR/kubeconfig"
 
-# Update kubeconfig with the master IP
+# Copy kubeconfig from master via bastion
+scp -o ProxyJump="ubuntu@$BASTION_IP" -i "$KEY_FILE" ubuntu@$MASTER_IP:/etc/rancher/k3s/k3s.yaml "$KUBECONFIG_DIR/kubeconfig"
+
+# Update kubeconfig with the master private IP
 sed -i "s|127.0.0.1|$MASTER_IP|g" "$KUBECONFIG_DIR/kubeconfig"
 
 log_info "K3s cluster deployment completed!"
 echo ""
 log_info "Cluster Summary:"
-echo "  Kubeconfig: $KUBECONFIG_DIR/kubeconfig"
-echo "  Master IP:  $MASTER_IP"
+echo "  Bastion:     $BASTION_IP (SSH access)"
+echo "  Kubeconfig:  $KUBECONFIG_DIR/kubeconfig"
+echo "  Master IP:   $MASTER_IP (private)"
 echo ""
 log_info "To access the cluster:"
 echo "  export KUBECONFIG=$KUBECONFIG_DIR/kubeconfig"
 echo "  kubectl get nodes"
 echo ""
+log_info "To SSH directly to nodes (via bastion):"
+echo "  ssh -o ProxyJump=ubuntu@$BASTION_IP -i $KEY_FILE ubuntu@$MASTER_IP"
+echo ""
 log_info "To verify Prometheus is running:"
 echo "  kubectl get pods -n prometheus"
 echo "  kubectl get svc prometheus-server -n prometheus"
+echo ""
+log_info "NOTE: Nodes are in private subnet. Access via bastion at $BASTION_IP"
