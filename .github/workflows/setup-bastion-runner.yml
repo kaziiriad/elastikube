@@ -37,7 +37,7 @@ jobs:
         run: pulumi login
 
       - name: Pulumi stack select
-        run: pulumi stack select prod --cwd infrastructure/pulumi
+        run: pulumi stack select prod-v3 --cwd infrastructure/pulumi
 
       - name: Pulumi refresh
         run: pulumi refresh --yes --cwd infrastructure/pulumi
