@@ -148,38 +148,83 @@ private_route_table_association = ec2.RouteTableAssociation(
     route_table_id=private_route_table.id
 )
 
-# Security Group for K3s cluster traffic
-security_group = aws.ec2.SecurityGroup("k3s-secgrp",
-    description='Enable K3s cluster and monitoring access',
+# Security Group for Bastion Host (SSH access from internet)
+bastion_security_group = aws.ec2.SecurityGroup("bastion-secgrp",
+    description='Enable SSH access to bastion host',
     vpc_id=vpc.id,
     ingress=[
-        # SSH access (optional - for debugging, consider restricting CIDR)
+        # SSH access from internet (restrict to your IP in production)
         {
             "protocol": "tcp",
             "from_port": 22,
             "to_port": 22,
             "cidr_blocks": ["0.0.0.0/0"],
         },
-        # Kubernetes API Server
+    ],
+    egress=[{
+        "protocol": "-1",
+        "from_port": 0,
+        "to_port": 0,
+        "cidr_blocks": ["0.0.0.0/0"],
+    }],
+    tags={
+        'Name': 'bastion-secgrp',
+    }
+)
+
+# Security Group for K3s cluster traffic (private subnet)
+security_group = aws.ec2.SecurityGroup("k3s-secgrp",
+    description='Enable K3s cluster and monitoring access',
+    vpc_id=vpc.id,
+    ingress=[
+        # SSH access ONLY from bastion host
+        {
+            "protocol": "tcp",
+            "from_port": 22,
+            "to_port": 22,
+            "security_groups": [bastion_security_group.id],
+        },
+        # Kubernetes API Server (within VPC)
         {
             "protocol": "tcp",
             "from_port": 6443,
             "to_port": 6443,
-            "cidr_blocks": ["0.0.0.0/0"],
+            "cidr_blocks": ["10.0.0.0/16"],
         },
-        # Prometheus (for autoscaler access)
+        # Prometheus (for autoscaler access - within VPC)
         {
             "protocol": "tcp",
             "from_port": 9090,
             "to_port": 9090,
-            "cidr_blocks": ["0.0.0.0/0"],
+            "cidr_blocks": ["10.0.0.0/16"],
         },
-        # Prometheus NodePort (autoscaler queries this)
+        # Prometheus NodePort (autoscaler queries this - within VPC)
         {
             "protocol": "tcp",
             "from_port": 30900,
             "to_port": 30900,
-            "cidr_blocks": ["0.0.0.0/0"],
+            "cidr_blocks": ["10.0.0.0/16"],
+        },
+        # K3s flannel VXLAN (for pod network)
+        {
+            "protocol": "udp",
+            "from_port": 8472,
+            "to_port": 8472,
+            "cidr_blocks": ["10.0.0.0/16"],
+        },
+        # K3s supervisor API
+        {
+            "protocol": "tcp",
+            "from_port": 6443,
+            "to_port": 6443,
+            "cidr_blocks": ["10.0.0.0/16"],
+        },
+        # NodePort services range
+        {
+            "protocol": "tcp",
+            "from_port": 30000,
+            "to_port": 32767,
+            "cidr_blocks": ["10.0.0.0/16"],
         },
     ],
     egress=[{
@@ -478,37 +523,49 @@ worker_instance_profile = iam.InstanceProfile(
 # Note: Key pair must already exist in AWS for this region
 existing_key_name = config.get("ec2:keyPairName", "MyKeyPair")
 
-# Master Instance (in public subnet for SSH access during Ansible deployment)
+# Bastion Host (in public subnet for SSH access)
+bastion_instance = ec2.Instance(
+    'bastion-instance',
+    instance_type="t3.micro",  # Smallest instance for bastion
+    ami=ami_id,
+    subnet_id=public_subnet.id,
+    vpc_security_group_ids=[bastion_security_group.id],
+    associate_public_ip_address=True,
+    key_name=existing_key_name,
+    tags={**common_tags, 'Name': 'k3s-bastion', 'NodeRole': 'bastion'}
+)
+
+# Master Instance (in private subnet - accessed via bastion)
 master_instance = ec2.Instance(
     'master-instance',
     instance_type=master_instance_type,
     ami=ami_id,
-    subnet_id=public_subnet.id,  # Public subnet for SSH access
+    subnet_id=private_subnet.id,  # Private subnet for security
     vpc_security_group_ids=[security_group.id],
-    associate_public_ip_address=True,  # Enable SSH access for Ansible
+    associate_public_ip_address=False,  # No public IP
     key_name=existing_key_name,
     tags={**common_tags, 'Name': 'k3s-master', 'NodeRole': 'master'}
 )
 
-# Worker Instance 1 (permanent, in public subnet for SSH access)
+# Worker Instance 1 (permanent, in private subnet)
 worker_instance_1 = ec2.Instance('worker-instance-1',
     instance_type=worker_instance_type,
     ami=ami_id,
-    subnet_id=public_subnet.id,  # Public subnet for SSH access
+    subnet_id=private_subnet.id,  # Private subnet for security
     vpc_security_group_ids=[security_group.id],
-    associate_public_ip_address=True,  # Enable SSH access for Ansible
+    associate_public_ip_address=False,  # No public IP
     iam_instance_profile=worker_instance_profile.name,
     key_name=existing_key_name,
     tags={**common_tags, 'Name': 'k3s-worker-1', 'NodeRole': 'worker', 'Permanent': 'true'}
 )
 
-# Worker Instance 2 (permanent, in public subnet for SSH access)
+# Worker Instance 2 (permanent, in private subnet)
 worker_instance_2 = ec2.Instance('worker-instance-2',
     instance_type=worker_instance_type,
     ami=ami_id,
-    subnet_id=public_subnet.id,  # Public subnet for SSH access
+    subnet_id=private_subnet.id,  # Private subnet for security
     vpc_security_group_ids=[security_group.id],
-    associate_public_ip_address=True,  # Enable SSH access for Ansible
+    associate_public_ip_address=False,  # No public IP
     iam_instance_profile=worker_instance_profile.name,
     key_name=existing_key_name,
     tags={**common_tags, 'Name': 'k3s-worker-2', 'NodeRole': 'worker', 'Permanent': 'true'}
@@ -658,13 +715,18 @@ pulumi.export("worker_instance_profile", worker_instance_profile.name)
 pulumi.export("cloudwatch_log_group", lambda_log_group.name)
 pulumi.export("event_rule_arn", event_rule.arn)
 
-# EC2 Instance IPs (for Ansible deployment)
-pulumi.export("master_public_ip", master_instance.public_ip)
-pulumi.export("worker_1_public_ip", worker_instance_1.public_ip)
-pulumi.export("worker_2_public_ip", worker_instance_2.public_ip)
-
-# Security Group ID
+# Security Group IDs
 pulumi.export("security_group_id", security_group.id)
+pulumi.export("bastion_security_group_id", bastion_security_group.id)
+
+# Bastion Host (for SSH access)
+pulumi.export("bastion_public_ip", bastion_instance.public_ip)
+pulumi.export("bastion_private_ip", bastion_instance.private_ip)
+
+# K3s Cluster Nodes (private IPs only - accessed via bastion)
+pulumi.export("master_private_ip", master_instance.private_ip)
+pulumi.export("worker_1_private_ip", worker_instance_1.private_ip)
+pulumi.export("worker_2_private_ip", worker_instance_2.private_ip)
 
 # Configuration outputs
 pulumi.export("config_min_nodes", min_nodes)
