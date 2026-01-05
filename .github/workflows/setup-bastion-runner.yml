@@ -26,30 +26,21 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-southeast-1
 
-      - name: Install Pulumi
+      - name: Get Bastion IP from AWS
+        id: get_bastion_ip
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
-          uv pip install pulumi --system
+          BASTION_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=k3s-bastion" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
 
-      - name: Pulumi login
-        env:
-          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
-        run: pulumi login
+          if [ -z "$BASTION_IP" ] || [ "$BASTION_IP" == "None" ]; then
+            echo "Error: Could not find bastion instance"
+            exit 1
+          fi
 
-      - name: Pulumi stack select
-        run: pulumi stack select prod-v3 --cwd infrastructure/pulumi
-
-      - name: Pulumi refresh
-        run: pulumi refresh --yes --cwd infrastructure/pulumi
-
-      - name: Get Bastion IP
-        id: pulumi_outputs
-        run: |
-          BASTION_IP=$(pulumi stack output bastion_public_ip --cwd infrastructure/pulumi)
           echo "BASTION_IP=$BASTION_IP" >> $GITHUB_ENV
           echo "::notice title=Bastion IP::$BASTION_IP"
-        env:
-          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
 
       - name: Set up SSH agent
         uses: webfactory/ssh-agent@v0.5.3
