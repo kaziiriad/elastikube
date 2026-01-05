@@ -7,6 +7,7 @@ on:
     paths:
       - 'infrastructure/pulumi/**'
       - '.github/workflows/infra.yml'
+  workflow_dispatch:
 
 jobs:
   deploy:
