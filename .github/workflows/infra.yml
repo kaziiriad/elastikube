@@ -27,6 +27,11 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
           uv pip install pulumi pulumi-aws --system
 
+      - name: Build Lambda package
+        run: |
+          pip install uv
+          cd lambda && ./build.sh
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
@@ -55,13 +60,15 @@ jobs:
           WORKER1_IP=$(pulumi stack output worker_1_private_ip --cwd infrastructure/pulumi)
           WORKER2_IP=$(pulumi stack output worker_2_private_ip --cwd infrastructure/pulumi)
           S3_BUCKET=$(pulumi stack output s3_config_bucket --cwd infrastructure/pulumi)
+          LAMBDA_ARN=$(pulumi stack output lambda_function_arn --cwd infrastructure/pulumi)
 
           echo "BASTION_IP=$BASTION_IP" >> $GITHUB_ENV
           echo "MASTER_IP=$MASTER_IP" >> $GITHUB_ENV
           echo "WORKER1_IP=$WORKER1_IP" >> $GITHUB_ENV
           echo "WORKER2_IP=$WORKER2_IP" >> $GITHUB_ENV
           echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
+          echo "LAMBDA_ARN=$LAMBDA_ARN" >> $GITHUB_ENV
 
-          echo "::notice title=Infrastructure Outputs::Bastion: $BASTION_IP | Master: $MASTER_IP | Workers: $WORKER1_IP, $WORKER2_IP"
+          echo "::notice title=Infrastructure Outputs::Bastion: $BASTION_IP | Master: $MASTER_IP | Workers: $WORKER1_IP, $WORKER2_IP | Lambda: $LAMBDA_ARN"
         env:
           PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}

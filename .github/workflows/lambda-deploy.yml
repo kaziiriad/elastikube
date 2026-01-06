@@ -1,0 +1,214 @@
+name: Deploy Lambda Autoscaler
+
+on:
+  push:
+    branches:
+      - master
+      - feature/lambda-autoscaler
+    paths:
+      - 'lambda/**'
+      - '.github/workflows/lambda-deploy.yml'
+
+  workflow_run:
+    workflows: ["Deploy Infrastructure"]
+    types:
+      - completed
+    branches:
+      - master
+
+  workflow_dispatch:
+
+jobs:
+  deploy-lambda:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-southeast-1
+
+      - name: Get infrastructure details
+        id: get_infra
+        run: |
+          # Lambda role (created by Pulumi)
+          LAMBDA_ROLE_NAME="k3s-autoscaler-lambda-role"
+          LAMBDA_ROLE_ARN=$(aws iam get-role --role-name "$LAMBDA_ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || echo "")
+
+          if [ -z "$LAMBDA_ROLE_ARN" ]; then
+            echo "::warning::Lambda role not found. Run infrastructure deployment first."
+            exit 1
+          fi
+
+          # DynamoDB tables (created by Pulumi)
+          STATE_TABLE=$(aws dynamodb list-tables --query "TableNames[?contains(@, 'cluster-state')]" --output text 2>/dev/null || echo "k3s-cluster-state")
+          WAL_TABLE=$(aws dynamodb list-tables --query "TableNames[?contains(@, 'scaling-wal')]" --output text 2>/dev/null || echo "k3s-scaling-wal")
+
+          # S3 bucket (created by Pulumi)
+          S3_BUCKET=$(aws s3api list-buckets --query "Buckets[?contains(Name, 'k3s-config')].Name | [0]" --output text 2>/dev/null || echo "")
+
+          # Get Prometheus URL (try bastion first, then master)
+          BASTION_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=k3s-bastion" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$BASTION_IP" ] && [ "$BASTION_IP" != "None" ]; then
+            PROMETHEUS_URL="http://$BASTION_IP:30900"
+          else
+            MASTER_IP=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=k3s-master" "Name=instance-state-name,Values=running" \
+              --query "Reservations[0].Instances[0].PublicIpAddress" \
+              --output text 2>/dev/null || echo "")
+            PROMETHEUS_URL="http://$MASTER_IP:30900"
+          fi
+
+          # EventBridge rule
+          RULE_NAME="k3s-autoscaler-schedule"
+          RULE_ARN=$(aws events list-rules --query "Rules[?Name=='$RULE_NAME'].Arn | [0]" --output text)
+
+          echo "LAMBDA_ROLE_ARN=$LAMBDA_ROLE_ARN" >> $GITHUB_ENV
+          echo "STATE_TABLE=$STATE_TABLE" >> $GITHUB_ENV
+          echo "WAL_TABLE=$WAL_TABLE" >> $GITHUB_ENV
+          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
+          echo "PROMETHEUS_URL=$PROMETHEUS_URL" >> $GITHUB_ENV
+          echo "RULE_ARN=$RULE_ARN" >> $GITHUB_ENV
+
+          echo "::notice title=Infrastructure Details::Role: $LAMBDA_ROLE_ARN | Prometheus: $PROMETHEUS_URL"
+
+      - name: Install build dependencies
+        run: |
+          pip install uv
+
+      - name: Build Lambda package
+        run: |
+          cd lambda
+          chmod +x build.sh
+          ./build.sh
+          ls -lh build/
+
+      - name: Create or Update Lambda function
+        run: |
+          FUNCTION_NAME="k3s-autoscaler-function"
+
+          # Check if function exists
+          if aws lambda get-function --function-name "$FUNCTION_NAME" --region ap-southeast-1 2>/dev/null; then
+            echo "Updating existing Lambda function..."
+
+            # Update code
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --zip-file fileb://fileb://lambda/build/lambda.zip \
+              --region ap-southeast-1
+
+            # Wait for update to complete
+            echo "Waiting for function update to complete..."
+            sleep 5
+
+            # Update configuration
+            aws lambda update-function-configuration \
+              --function-name "$FUNCTION_NAME" \
+              --environment Variables="{\
+                CLUSTER_NAME=production-k3s,\
+                PROMETHEUS_URL=${{ env.PROMETHEUS_URL }},\
+                STATE_TABLE_NAME=${{ env.STATE_TABLE }},\
+                WAL_TABLE_NAME=${{ env.WAL_TABLE }},\
+                S3_BUCKET=${{ env.S3_BUCKET }},\
+                MIN_NODES=2,\
+                MAX_NODES=10,\
+                SCALE_UP_THRESHOLD=70,\
+                SCALE_DOWN_THRESHOLD=30,\
+                SCALE_UP_COOLDOWN=300,\
+                SCALE_DOWN_COOLDOWN=900,\
+                DRY_RUN=false\
+              }" \
+              --region ap-southeast-1
+
+            echo "::notice title=Lambda Updated::Function $FUNCTION_NAME code updated"
+          else
+            echo "Creating new Lambda function..."
+
+            aws lambda create-function \
+              --function-name "$FUNCTION_NAME" \
+              --runtime python3.11 \
+              --role "${{ env.LAMBDA_ROLE_ARN }}" \
+              --handler main.lambda_handler \
+              --zip-file fileb://fileb://lambda/build/lambda.zip \
+              --timeout 300 \
+              --memory-size 256 \
+              --environment Variables="{\
+                CLUSTER_NAME=production-k3s,\
+                PROMETHEUS_URL=${{ env.PROMETHEUS_URL }},\
+                STATE_TABLE_NAME=${{ env.STATE_TABLE }},\
+                WAL_TABLE_NAME=${{ env.WAL_TABLE }},\
+                S3_BUCKET=${{ env.S3_BUCKET }},\
+                MIN_NODES=2,\
+                MAX_NODES=10,\
+                SCALE_UP_THRESHOLD=70,\
+                SCALE_DOWN_THRESHOLD=30,\
+                SCALE_UP_COOLDOWN=300,\
+                SCALE_DOWN_COOLDOWN=900,\
+                DRY_RUN=false\
+              }" \
+              --tags Name=k3s-autoscaler,Project=production-k3s \
+              --region ap-southeast-1
+
+            echo "::notice title=Lambda Created::Function $FUNCTION_NAME created"
+          fi
+
+      - name: Configure EventBridge trigger
+        run: |
+          FUNCTION_NAME="k3s-autoscaler-function"
+          FUNCTION_ARN=$(aws lambda get-function --function-name "$FUNCTION_NAME" --query 'Configuration.FunctionArn' --output text --region ap-southeast-1)
+
+          # Add Lambda permission for EventBridge
+          aws lambda add-permission \
+            --function-name "$FUNCTION_NAME" \
+            --statement-id "k3s-autoscaler-schedule-invoke" \
+            --action lambda:InvokeFunction \
+            --principal events.amazonaws.com \
+            --source-arn "${{ env.RULE_ARN }}" \
+            --region ap-southeast-1 2>/dev/null && echo "Permission added" || echo "Permission already exists"
+
+          # Add Lambda as target to EventBridge rule
+          aws events put-targets \
+            --rule "k3s-autoscaler-schedule" \
+            --targets "Id=1,Arn=$FUNCTION_ARN" \
+            --region ap-southeast-1
+
+          echo "::notice title=EventBridge Configured::Lambda added to schedule rule"
+
+      - name: Verify Lambda deployment
+        run: |
+          FUNCTION_NAME="k3s-autoscaler-function"
+          echo "Lambda Function Details:"
+          aws lambda get-function --function-name "$FUNCTION_NAME" --region ap-southeast-1 --query 'Configuration.{FunctionName:FunctionName,Runtime:Runtime,Handler:Handler,MemorySize:MemorySize,Timeout:Timeout,State:State}' --output table
+
+          echo ""
+          echo "Environment Variables:"
+          aws lambda get-function-configuration --function-name "$FUNCTION_NAME" --region ap-southeast-1 --query 'Environment.Variables' --output table
+
+      - name: Test Lambda invocation
+        run: |
+          FUNCTION_NAME="k3s-autoscaler-function"
+          echo "Invoking Lambda for testing..."
+          OUTPUT=$(aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --region ap-southeast-1 \
+            --payload '{"dry_run": true}' \
+            --cli-binary-format raw-in-base64-out \
+            response.json)
+
+          echo "Lambda Response:"
+          cat response.json | head -20

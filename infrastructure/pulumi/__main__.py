@@ -594,53 +594,52 @@ lambda_log_group = aws.cloudwatch.LogGroup(
     tags={**common_tags, "Name": "k3s-autoscaler-logs"}
 )
 
-# Lambda deployment package (assume it's built locally)
-# Build the Lambda package first: cd ../../lambda && ./build.sh
-# TODO: Create separate workflow for Lambda deployment
-# lambda_archive = pulumi.FileArchive(f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/lambda/build/lambda.zip")
+# Lambda deployment package
+# Build the Lambda package first: cd lambda && ./build.sh
+lambda_archive = pulumi.FileArchive(f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/lambda/build/lambda.zip")
 
 # Lambda Function
-# lambda_function = lambda_.Function(
-#     "k3s-autoscaler-function",
-#     runtime="python3.11",
-#     handler="main.lambda_handler",
-#     role=lambda_role.arn,
-#     timeout=300,  # 5 minutes (max Lambda timeout)
-#     memory_size=256,  # 256 MB
-#     environment=lambda_.FunctionEnvironmentArgs(
-#         variables={
-#             "CLUSTER_NAME": cluster_name,
-#             "PROMETHEUS_URL": "http://localhost:30900",  # TODO: Get from worker IPs
-#             "STATE_TABLE_NAME": cluster_state_table.name,
-#             "WAL_TABLE_NAME": wal_table.name,
-#             "MIN_NODES": str(min_nodes),
-#             "MAX_NODES": str(max_nodes),
-#             "SCALE_UP_THRESHOLD": str(scale_up_threshold),
-#             "SCALE_DOWN_THRESHOLD": str(scale_down_threshold),
-#             "SCALE_UP_COOLDOWN": str(scale_up_cooldown),
-#             "SCALE_DOWN_COOLDOWN": str(scale_down_cooldown),
-#             "DRY_RUN": "false",
-#         }
-#     ),
-#     code=lambda_archive,
-#     tags={**common_tags, "Name": "k3s-autoscaler"}
-# )
+lambda_function = lambda_.Function(
+    "k3s-autoscaler-function",
+    runtime="python3.11",
+    handler="main.lambda_handler",
+    role=lambda_role.arn,
+    timeout=300,  # 5 minutes (max Lambda timeout)
+    memory_size=256,  # 256 MB
+    environment=lambda_.FunctionEnvironmentArgs(
+        variables={
+            "CLUSTER_NAME": cluster_name,
+            "PROMETHEUS_URL": "http://localhost:30900",  # TODO: Get from worker IPs
+            "STATE_TABLE_NAME": cluster_state_table.name,
+            "WAL_TABLE_NAME": wal_table.name,
+            "MIN_NODES": str(min_nodes),
+            "MAX_NODES": str(max_nodes),
+            "SCALE_UP_THRESHOLD": str(scale_up_threshold),
+            "SCALE_DOWN_THRESHOLD": str(scale_down_threshold),
+            "SCALE_UP_COOLDOWN": str(scale_up_cooldown),
+            "SCALE_DOWN_COOLDOWN": str(scale_down_cooldown),
+            "DRY_RUN": "false",
+        }
+    ),
+    code=lambda_archive,
+    tags={**common_tags, "Name": "k3s-autoscaler"}
+)
 
 # Lambda Permission for EventBridge to invoke
-# lambda_permission = aws.lambda_.Permission(
-#     "k3s-autoscaler-eventbridge-permission",
-#     action="lambda:InvokeFunction",
-#     function=lambda_function.name,
-#     principal="events.amazonaws.com",
-#     source_arn=event_rule.arn,
-# )
+lambda_permission = aws.lambda_.Permission(
+    "k3s-autoscaler-eventbridge-permission",
+    action="lambda:InvokeFunction",
+    function=lambda_function.name,
+    principal="events.amazonaws.com",
+    source_arn=event_rule.arn,
+)
 
 # EventBridge Target - invokes Lambda
-# event_target = aws.cloudwatch.EventTarget(
-#     "k3s-autoscaler-target",
-#     rule=event_rule.name,
-#     arn=lambda_function.arn,
-# )
+event_target = aws.cloudwatch.EventTarget(
+    "k3s-autoscaler-target",
+    rule=event_rule.name,
+    arn=lambda_function.arn,
+)
 
 # =============================================================================
 # CloudWatch Alarms
@@ -710,9 +709,8 @@ pulumi.export("dynamodb_cluster_state_table", cluster_state_table.name)
 pulumi.export("dynamodb_wal_table", wal_table.name)
 pulumi.export("s3_config_bucket", k3s_bucket.bucket)
 pulumi.export("lambda_role_arn", lambda_role.arn)
-# TODO: Uncomment after Lambda deployment workflow is created
-# pulumi.export("lambda_function_arn", lambda_function.arn)
-# pulumi.export("lambda_function_name", lambda_function.name)
+pulumi.export("lambda_function_arn", lambda_function.arn)
+pulumi.export("lambda_function_name", lambda_function.name)
 pulumi.export("worker_instance_profile", worker_instance_profile.name)
 pulumi.export("cloudwatch_log_group", lambda_log_group.name)
 pulumi.export("event_rule_arn", event_rule.arn)
