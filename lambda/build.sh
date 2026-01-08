@@ -24,8 +24,11 @@ cp "$LAMBDA_DIR/main.py" "$BUILD_DIR/"
 echo "Installing dependencies with uv..."
 cd "$BUILD_DIR"
 
-# Initialize uv project and sync dependencies
-uv init --no-read-only || true
+# Copy pyproject.toml and uv.lock to build directory for dependency installation
+cp "$LAMBDA_DIR/pyproject.toml" .
+cp "$LAMBDA_DIR/uv.lock" .
+
+# Install dependencies
 uv sync --frozen --no-dev
 
 # Copy dependencies from .venv to root (Lambda expects flattened structure)

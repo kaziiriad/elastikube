@@ -94,46 +94,40 @@ class PrometheusClient:
         Raises:
             RuntimeError: If metrics cannot be fetched
         """
-        # Query CPU usage (average across all nodes)
+        # Query CPU usage (average across all nodes) using node-exporter metrics
+        # Matches Grafana dashboard query
         cpu_result = self.query("""
-            sum(
-                rate(container_cpu_usage_seconds_total{
-                    container_name!="POD",
-                    container!="",
-                    image!=""
-                }[5m])
-            ) by (node) / sum(machine_cpu_cores) by (node) * 100
+            avg(100 - (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
         """)
 
         cpu_percent = self._extract_average_value(cpu_result)
 
-        # Query memory usage (working set, which is what OOM uses)
+        # Query memory usage using node-exporter metrics
+        # Matches Grafana dashboard query
         memory_result = self.query("""
-            sum(container_memory_working_set_bytes{
-                container_name!="POD",
-                container!="",
-                image!=""
-            }) by (node) / sum(node_memory_MemTotal_bytes) by (node) * 100
+            avg((1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100)
         """)
 
         memory_percent = self._extract_average_value(memory_result)
 
-        # Query pending pods
+        # Query pending pods - use SUM not COUNT
+        # kube_pod_status_phase has value=1 for each pod, so we sum the values
         pending_result = self.query("""
-            count(kube_pod_status_phase{phase="Pending"})
+            sum(kube_pod_status_phase{phase="Pending"})
         """)
         pending_pods = int(self._extract_value(pending_result) or 0)
 
-        # Query node status
-        ready_nodes_result = self.query("""
-            count(kube_node_status_condition{condition="Ready", status="true"})
-        """)
-        ready_nodes = int(self._extract_value(ready_nodes_result) or 0)
-
+        # Query node status - use kube_node_info for total nodes
         total_nodes_result = self.query("""
-            count(kube_node_status_condition{condition="Ready"})
+            count(kube_node_info)
         """)
         total_nodes = int(self._extract_value(total_nodes_result) or 0)
+
+        # Query ready nodes - sum only true status
+        ready_nodes_result = self.query("""
+            sum(kube_node_status_condition{condition="Ready", status="true"})
+        """)
+        ready_nodes = int(self._extract_value(ready_nodes_result) or 0)
 
         return ClusterMetrics(
             cpu_percent=cpu_percent,

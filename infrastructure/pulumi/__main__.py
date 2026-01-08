@@ -356,6 +356,13 @@ lambda_role_policy_attachment = iam.RolePolicyAttachment(
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 )
 
+# Attach VPC execution policy for network access
+lambda_vpc_policy_attachment = iam.RolePolicyAttachment(
+    "k3s-autoscaler-lambda-vpc-execution",
+    role=lambda_role.name,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+)
+
 # Custom policy for autoscaler permissions
 autoscaler_policy = iam.RolePolicy(
     "k3s-autoscaler-lambda-policy",
@@ -599,6 +606,10 @@ lambda_function = lambda_.Function(
     role=lambda_role.arn,
     timeout=300,  # 5 minutes (max Lambda timeout)
     memory_size=256,  # 256 MB
+    vpc_config=lambda_.FunctionVpcConfigArgs(
+        subnet_ids=[private_subnet.id],
+        security_group_ids=[security_group.id],
+    ),
     environment=lambda_.FunctionEnvironmentArgs(
         variables={
             "CLUSTER_NAME": cluster_name,
@@ -615,7 +626,7 @@ lambda_function = lambda_.Function(
             # EC2 Configuration
             "SUBNET_ID": private_subnet.id,
             "SECURITY_GROUP_ID": security_group.id,
-            "IAM_INSTANCE_PROFILE": worker_role.name,
+            "IAM_INSTANCE_PROFILE": worker_instance_profile.name,
             "AMI_ID": ami_id,
             "INSTANCE_TYPE": worker_instance_type,
         }

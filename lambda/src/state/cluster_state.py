@@ -46,8 +46,8 @@ class ClusterState:
         """Create from DynamoDB format."""
         return cls(
             cluster_id=data["cluster_id"],
-            node_count=int(data["node_count"]),
-            scaling_in_progress=data["scaling_in_progress"].lower() == "true",
+            node_count=int(data.get("node_count", 0)),
+            scaling_in_progress=data.get("scaling_in_progress", "false").lower() == "true",
             last_scale_time=data.get("last_scale_time"),
             last_scale_operation=data.get("last_scale_operation"),
             ttl=int(data.get("ttl", 0)),
@@ -180,7 +180,12 @@ class StateManager:
                     scaling_in_progress=False,
                 )
 
-            return ClusterState.from_dict(response["Item"])
+            # Deserialize DynamoDB typed format to plain dict
+            from boto3.dynamodb.types import TypeDeserializer
+            deserializer = TypeDeserializer()
+            plain_data = deserializer.deserialize({"M": response["Item"]})
+
+            return ClusterState.from_dict(plain_data)
 
         except ClientError as e:
             raise RuntimeError(f"Failed to get cluster state: {e}") from e
