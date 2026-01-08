@@ -78,7 +78,13 @@ def lambda_handler(event: dict, context: Any) -> dict:
         scaling_engine = ScalingEngine()
         ec2_ops = EC2Operations(ec2_client)
 
-        # Step 1: Acquire distributed lock
+        # Step 1: Fetch cluster state (before lock to detect stuck locks)
+        logger.info("Fetching cluster state...")
+        state = state_manager.get_state()
+        logger.info(f"Cluster state: nodes={state.node_count}, "
+                   f"scaling_in_progress={state.scaling_in_progress}")
+
+        # Step 2: Acquire distributed lock
         logger.info("Acquiring distributed lock...")
         if not lock.acquire(timeout_seconds=10):
             logger.warning("Could not acquire lock - another instance is running")
@@ -89,13 +95,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
                     "action": "NO_OP",
                 }),
             }
+        logger.info("Lock acquired")
 
         try:
-            # Step 2: Fetch cluster state
-            logger.info("Fetching cluster state...")
-            state = state_manager.get_state()
-            logger.info(f"Current state: nodes={state.node_count}, "
-                       f"scaling_in_progress={state.scaling_in_progress}")
 
             # Step 3: Check for incomplete operations (crash recovery)
             incomplete = wal.get_incomplete_operations()
