@@ -14,6 +14,13 @@ Environment variables:
     SCALE_DOWN_COOLDOWN: Seconds to wait after scale-down
     NODE_READINESS_TIMEOUT: Max seconds to wait for node ready
     DRY_RUN: If true, simulate without making changes
+
+    EC2 Configuration:
+    SUBNET_ID: Subnet ID for launching worker instances
+    SECURITY_GROUP_ID: Security group ID for worker instances
+    IAM_INSTANCE_PROFILE: IAM instance profile name for workers
+    AMI_ID: AMI ID for worker instances
+    INSTANCE_TYPE: EC2 instance type for workers
 """
 
 import os
@@ -52,6 +59,13 @@ class Config:
     # Operation mode
     dry_run: bool
 
+    # EC2 configuration for worker instances
+    subnet_id: str
+    security_group_id: str
+    iam_instance_profile: str
+    ami_id: str
+    instance_type: str
+
     @classmethod
     def from_env(cls) -> "Config":
         """Load configuration from environment variables."""
@@ -78,6 +92,11 @@ class Config:
             scale_down_cooldown=int(os.getenv("SCALE_DOWN_COOLDOWN", "900")),
             node_readiness_timeout=int(os.getenv("NODE_READINESS_TIMEOUT", "300")),
             dry_run=os.getenv("DRY_RUN", "false").lower() == "true",
+            subnet_id=os.getenv("SUBNET_ID", ""),
+            security_group_id=os.getenv("SECURITY_GROUP_ID", ""),
+            iam_instance_profile=os.getenv("IAM_INSTANCE_PROFILE", ""),
+            ami_id=os.getenv("AMI_ID", ""),
+            instance_type=os.getenv("INSTANCE_TYPE", "t3.small"),
         )
 
 

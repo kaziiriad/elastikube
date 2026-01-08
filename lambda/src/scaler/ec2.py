@@ -37,6 +37,7 @@ class EC2Operations:
         iam_instance_profile: str,
         ami_id: str,
         instance_type: str,
+        user_data: Optional[str] = None,
     ) -> str:
         """Launch a new K3s worker instance.
 
@@ -46,6 +47,7 @@ class EC2Operations:
             iam_instance_profile: IAM instance profile name
             ami_id: AMI ID for the instance
             instance_type: EC2 instance type
+            user_data: Optional cloud-init user-data script for K3s join
 
         Returns:
             Instance ID of the launched instance
@@ -63,23 +65,33 @@ class EC2Operations:
         ]
 
         try:
-            # Use ClientToken for idempotency (prevents duplicate launches)
-            response = self._client.run_instances(
-                ImageId=ami_id,
-                InstanceType=instance_type,
-                MinCount=1,
-                MaxCount=1,
-                SubnetId=subnet_id,
-                SecurityGroupIds=[security_group_id],
-                IamInstanceProfile={"Name": iam_instance_profile},
-                TagSpecifications=[
+            # Build run_instances parameters
+            run_params = {
+                "ImageId": ami_id,
+                "InstanceType": instance_type,
+                "MinCount": 1,
+                "MaxCount": 1,
+                "SubnetId": subnet_id,
+                "SecurityGroupIds": [security_group_id],
+                "IamInstanceProfile": {"Name": iam_instance_profile},
+                "TagSpecifications": [
                     {
                         "ResourceType": "instance",
                         "Tags": tags,
                     }
                 ],
-                ClientToken=str(uuid.uuid4()),  # Idempotency token
-            )
+                "ClientToken": str(uuid.uuid4()),  # Idempotency token
+            }
+
+            # Add user-data if provided (must be base64-encoded)
+            if user_data:
+                import base64
+                run_params["UserData"] = base64.b64encode(
+                    user_data.encode("utf-8")
+                ).decode("utf-8")
+
+            # Use ClientToken for idempotency (prevents duplicate launches)
+            response = self._client.run_instances(**run_params)
 
             instance_id = response["Instances"][0]["InstanceId"]
             return instance_id

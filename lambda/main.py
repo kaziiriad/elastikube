@@ -34,6 +34,7 @@ from metrics.prometheus import PrometheusClient, ClusterMetrics
 from scaler.scaling import ScalingEngine, ScalingDecision, ScalingAction
 from scaler.ec2 import EC2Operations
 from state.cluster_state import StateManager, DistributedLock
+from utils.cluster_credentials import get_cluster_credentials, generate_user_data_script
 from utils.wal import WriteAheadLog, OperationType, OperationState
 
 # Configure logging
@@ -195,21 +196,52 @@ def _execute_scale_up(
     # Update state: scaling in progress
     state_manager.update_state(scaling_in_progress=True, last_scale_operation="SCALE_UP")
 
-    # TODO: Get these from environment or Pulumi stack outputs
-    subnet_id = "subnet-xxxxxx"  # TODO: Configure
-    security_group_id = "sg-xxxxxx"  # TODO: Configure
-    iam_instance_profile = "k3s-worker-instance-profile"  # TODO: Configure
-    ami_id = "ami-0f1e31d01140d0ae2"  # TODO: From config
-    instance_type = "t3.small"  # TODO: From config
+    # Fetch cluster credentials for node join
+    logger.info("Fetching cluster credentials from AWS...")
+    credentials = get_cluster_credentials()
+    if not credentials:
+        raise RuntimeError("Failed to fetch cluster credentials - ensure cluster is properly initialized")
+
+    logger.info(f"Retrieved credentials: {credentials}")
+
+    # Generate user-data script for K3s join
+    user_data_script = generate_user_data_script(credentials)
+    logger.info("Generated user-data script for K3s worker bootstrap")
+
+    # Get EC2 configuration from environment (set by Pulumi)
+    from utils.config import get_config
+    config = get_config()
+
+    subnet_id = config.subnet_id
+    security_group_id = config.security_group_id
+    iam_instance_profile = config.iam_instance_profile
+    ami_id = config.ami_id
+    instance_type = config.instance_type
+
+    # Validate required configuration
+    if not all([subnet_id, security_group_id, iam_instance_profile, ami_id]):
+        missing = [
+            name for name, val in [
+                ("SUBNET_ID", subnet_id),
+                ("SECURITY_GROUP_ID", security_group_id),
+                ("IAM_INSTANCE_PROFILE", iam_instance_profile),
+                ("AMI_ID", ami_id),
+            ] if not val
+        ]
+        raise RuntimeError(f"Missing required EC2 configuration: {', '.join(missing)}")
+
+    logger.info(f"EC2 config: subnet={subnet_id}, sg={security_group_id}, "
+                f"instance_profile={iam_instance_profile}, ami={ami_id}, type={instance_type}")
 
     try:
-        # Launch new instance
+        # Launch new instance with user-data script
         instance_id = ec2_ops.launch_worker(
             subnet_id=subnet_id,
             security_group_id=security_group_id,
             iam_instance_profile=iam_instance_profile,
             ami_id=ami_id,
             instance_type=instance_type,
+            user_data=user_data_script,
         )
         logger.info(f"Launched new instance: {instance_id}")
 

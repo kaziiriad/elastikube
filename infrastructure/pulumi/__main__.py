@@ -3,7 +3,8 @@ K3s Autoscaler Infrastructure
 
 This Pulumi program provisions AWS resources for the K3s autoscaler:
 - DynamoDB tables for state management and WAL
-- S3 bucket for K3s token storage
+- SSM Parameter Store for cluster configuration (master IP)
+- Secrets Manager for sensitive data (K3s join token)
 - Lambda function for autoscaling decisions
 - EventBridge rule for triggering
 - CloudWatch monitoring and alarms
@@ -13,14 +14,14 @@ This Pulumi program provisions AWS resources for the K3s autoscaler:
 import os
 import pulumi
 import pulumi_aws as aws
-from pulumi_aws import ec2, lambda_, dynamodb, s3, iam
+from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager
 
 # =============================================================================
 # Configuration
 # =============================================================================
 config = pulumi.Config()
 
-# Get AWS account ID for unique bucket naming
+# Get AWS account ID for resource naming
 caller_identity = aws.get_caller_identity()
 account_id = caller_identity.account_id
 
@@ -239,36 +240,6 @@ security_group = aws.ec2.SecurityGroup("k3s-secgrp",
 )
 
 # =============================================================================
-# S3 Bucket for K3s Token and Scripts
-# =============================================================================
-# Use account ID for globally unique bucket name (deterministic, works across updates)
-k3s_bucket = s3.Bucket(
-    "k3s-config-bucket",
-    bucket=pulumi.Output.concat(cluster_name, "-config-", account_id),
-    tags={**common_tags, "Name": "k3s-config-bucket"}
-)
-
-# Versioning for the bucket
-k3s_bucket_versioning = s3.BucketVersioning(
-    "k3s-config-bucket-versioning",
-    bucket=k3s_bucket.id,
-    versioning_configuration={
-        "status": "Enabled"
-    }
-)
-
-# Server-side encryption
-k3s_bucket_encryption = s3.BucketServerSideEncryptionConfiguration(
-    "k3s-config-bucket-encryption",
-    bucket=k3s_bucket.id,
-    rules=[{
-        "apply_server_side_encryption_by_default": {
-            "sse_algorithm": "AES256"
-        }
-    }]
-)
-
-# =============================================================================
 # DynamoDB Tables
 # =============================================================================
 
@@ -328,6 +299,35 @@ wal_table = dynamodb.Table(
 )
 
 # =============================================================================
+# SSM Parameter Store & Secrets Manager for Node Join
+# =============================================================================
+
+# SSM Parameter for Master IP (public configuration)
+master_ip_parameter = ssm.Parameter(
+    "k3s-master-ip",
+    name=f"/k3s/{cluster_name}/master-ip",
+    type="String",
+    value="PENDING",  # Will be populated by Ansible after cluster setup
+    description="K3s master node private IP for worker node join",
+    tags={**common_tags, "Name": "k3s-master-ip-parameter"},
+)
+
+# Secrets Manager Secret for K3s Join Token (sensitive data)
+k3s_join_token_secret = secretsmanager.Secret(
+    "k3s-join-token",
+    name=f"k3s-{cluster_name}-join-token",
+    description="K3s cluster join token for worker nodes",
+    tags={**common_tags, "Name": "k3s-join-token-secret"},
+)
+
+# Secret version (initial value, will be updated by Ansible)
+k3s_join_token_version = secretsmanager.SecretVersion(
+    "k3s-join-token-version",
+    secret_id=k3s_join_token_secret.id,
+    secret_string="PENDING",  # Will be populated by Ansible after cluster setup
+)
+
+# =============================================================================
 # IAM Roles
 # =============================================================================
 
@@ -363,7 +363,6 @@ autoscaler_policy = iam.RolePolicy(
     policy=pulumi.Output.all(
         cluster_state_arn=cluster_state_table.arn,
         wal_table_arn=wal_table.arn,
-        bucket_arn=k3s_bucket.arn,
     ).apply(lambda args: iam.get_policy_document(
         statements=[
             # EC2 Permissions
@@ -404,16 +403,16 @@ autoscaler_policy = iam.RolePolicy(
                 "resources": [args["wal_table_arn"], f"{args['wal_table_arn']}/*"],
                 "effect": "Allow",
             },
-            # S3 Permissions
-            {
-                "actions": ["s3:GetObject"],
-                "resources": [f"{args['bucket_arn']}/*"],
-                "effect": "Allow",
-            },
             # SSM Permissions
             {
                 "actions": ["ssm:GetParameter"],
                 "resources": [f"arn:aws:ssm:{region}:*:parameter/k3s/*"],
+                "effect": "Allow",
+            },
+            # Secrets Manager Permissions
+            {
+                "actions": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+                "resources": [f"arn:aws:secretsmanager:{region}:*:secret:k3s-*-*"],
                 "effect": "Allow",
             },
             # CloudWatch Logs Permissions
@@ -464,15 +463,9 @@ worker_policy = iam.RolePolicy(
     "k3s-worker-node-policy",
     role=worker_role.id,
     policy=pulumi.Output.all(
-        bucket_arn=k3s_bucket.arn,
         cluster_state_arn=cluster_state_table.arn,
     ).apply(lambda args: iam.get_policy_document(
         statements=[
-            {
-                "actions": ["s3:GetObject"],
-                "resources": [f"{args['bucket_arn']}/k3s-token"],
-                "effect": "Allow",
-            },
             {
                 "actions": [
                     "dynamodb:UpdateItem",
@@ -609,7 +602,7 @@ lambda_function = lambda_.Function(
     environment=lambda_.FunctionEnvironmentArgs(
         variables={
             "CLUSTER_NAME": cluster_name,
-            "PROMETHEUS_URL": "http://localhost:30900",  # TODO: Get from worker IPs
+            "PROMETHEUS_URL": master_instance.private_ip.apply(lambda ip: f"http://{ip}:30900"),
             "STATE_TABLE_NAME": cluster_state_table.name,
             "WAL_TABLE_NAME": wal_table.name,
             "MIN_NODES": str(min_nodes),
@@ -619,6 +612,12 @@ lambda_function = lambda_.Function(
             "SCALE_UP_COOLDOWN": str(scale_up_cooldown),
             "SCALE_DOWN_COOLDOWN": str(scale_down_cooldown),
             "DRY_RUN": "false",
+            # EC2 Configuration
+            "SUBNET_ID": private_subnet.id,
+            "SECURITY_GROUP_ID": security_group.id,
+            "IAM_INSTANCE_PROFILE": worker_role.name,
+            "AMI_ID": ami_id,
+            "INSTANCE_TYPE": worker_instance_type,
         }
     ),
     code=lambda_archive,
@@ -707,7 +706,6 @@ lock_timeout_alarm = aws.cloudwatch.MetricAlarm(
 pulumi.export("cluster_name", cluster_name)
 pulumi.export("dynamodb_cluster_state_table", cluster_state_table.name)
 pulumi.export("dynamodb_wal_table", wal_table.name)
-pulumi.export("s3_config_bucket", k3s_bucket.bucket)
 pulumi.export("lambda_role_arn", lambda_role.arn)
 pulumi.export("lambda_function_arn", lambda_function.arn)
 pulumi.export("lambda_function_name", lambda_function.name)
@@ -735,3 +733,7 @@ pulumi.export("config_scale_up_threshold", scale_up_threshold)
 pulumi.export("config_scale_down_threshold", scale_down_threshold)
 pulumi.export("config_scale_up_cooldown", scale_up_cooldown)
 pulumi.export("config_scale_down_cooldown", scale_down_cooldown)
+
+# SSM and Secrets Manager exports
+pulumi.export("ssm_master_ip_parameter_name", master_ip_parameter.name)
+pulumi.export("secrets_manager_join_token_arn", k3s_join_token_secret.arn)

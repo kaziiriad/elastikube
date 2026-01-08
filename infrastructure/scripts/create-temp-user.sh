@@ -45,6 +45,35 @@ cat > /tmp/temp-user-policy.json <<'EOF'
             "Resource": "*"
         },
         {
+            "Sid": "SSMGlobalActions",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:DescribeParameters"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "SSMParameterActions",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:GetParameters",
+                "ssm:GetParameter",
+                "ssm:GetParametersByPath"
+            ],
+            "Resource": "arn:aws:ssm:*:*:parameter/*"
+        },
+        {
+            "Sid": "SecretsManagerGlobalActions",
+            "Effect": "Allow",
+            "Action": [
+                "secretsmanager:DescribeSecret",
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:GetResourcePolicy",
+                "secretsmanager:ListSecrets"
+            ],
+            "Resource": "arn:aws:secretsmanager:*:*:secret:*"
+        },
+        {
             "Sid": "RegionalServices",
             "Effect": "Allow",
             "Action": [
@@ -53,7 +82,6 @@ cat > /tmp/temp-user-policy.json <<'EOF'
                 "events:*",
                 "cloudwatch:*",
                 "lambda:*",
-                "s3:*",
                 "logs:*",
                 "autoscaling:*",
                 "elasticloadbalancing:*",
@@ -63,7 +91,15 @@ cat > /tmp/temp-user-policy.json <<'EOF'
                 "sns:*",
                 "states:*",
                 "cloudformation:*",
-                "vpc-lattice:*"
+                "vpc-lattice:*",
+                "ssm:PutParameter",
+                "ssm:DeleteParameter",
+                "ssm:AddTagsToResource",
+                "ssm:ListTagsForResource",
+                "secretsmanager:CreateSecret",
+                "secretsmanager:DeleteSecret",
+                "secretsmanager:RestoreSecret",
+                "secretsmanager:TagResource"
             ],
             "Resource": "*",
             "Condition": {
@@ -88,7 +124,7 @@ SECRET_ACCESS_KEY=$(echo "$CREDENTIALS" | jq -r '.SecretAccessKey')
 # 4. Create auto-delete Lambda function
 log_info "Step 4/5: Creating auto-delete Lambda function..."
 
-cat > /tmp/delete-user-lambda.py <<EOF
+cat > /tmp/delete-user-lambda.py <<'EOF'
 import json
 import boto3
 import os
@@ -145,14 +181,19 @@ if aws iam get-role --role-name "$LAMBDA_ROLE_NAME" 2>/dev/null; then
 else
     aws iam create-role --role-name "$LAMBDA_ROLE_NAME" --assume-role-policy-document file:///tmp/lambda-trust-policy.json
     aws iam attach-role-policy --role-name "$LAMBDA_ROLE_NAME" --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-    aws iam put-role-policy --role-name "$LAMBDA_ROLE_NAME" --policy-name IAMDeleteUserPolicy --policy-document '{
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": ["iam:DeleteAccessKey", "iam:DeleteUserPolicy", "iam:ListAccessKeys", "iam:ListUserPolicies", "iam:DeleteUser"],
-            "Resource": ["arn:aws:iam::*:user/'$USER_NAME'"]
-        }]
-    }'
+    # Create policy document with proper quoting
+    cat > /tmp/lambda-iam-policy.json <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": ["iam:DeleteAccessKey", "iam:DeleteUserPolicy", "iam:ListAccessKeys", "iam:ListUserPolicies", "iam:DeleteUser"],
+        "Resource": ["arn:aws:iam::*:user/${USER_NAME}"]
+    }]
+}
+EOF
+
+    aws iam put-role-policy --role-name "$LAMBDA_ROLE_NAME" --policy-name IAMDeleteUserPolicy --policy-document file:///tmp/lambda-iam-policy.json
 fi
 
 LAMBDA_ROLE_ARN=$(aws iam get-role --role-name "$LAMBDA_ROLE_NAME" --query 'Role.Arn' --output text)
@@ -201,7 +242,7 @@ aws lambda add-permission \
 
 aws events put-targets \
     --rule "$RULE_NAME" \
-    --targets "Id=1,Arn=$(aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" --query 'Configuration.FunctionArn' --output text --region "$REGION)" \
+    --targets "Id=1,Arn=$(aws lambda get-function --function-name $LAMBDA_FUNCTION_NAME --query 'Configuration.FunctionArn' --output text --region $REGION)" \
     --region "$REGION"
 
 # Success!
@@ -231,3 +272,29 @@ echo ""
 echo "Then use with: export AWS_PROFILE=$USER_NAME"
 echo ""
 echo -e "${YELLOW}NOTE: After $DURATION_HOURS hours, the user and all credentials will be permanently deleted.${NC}"
+
+# Export credentials to a file that can be sourced
+EXPORT_FILE="./${USER_NAME}-credentials.sh"
+TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+cat > "$EXPORT_FILE" <<EOF
+# AWS Credentials for $USER_NAME
+# Generated: ${TIMESTAMP}
+# Auto-deletes: ${DELETION_TIME} (UTC)
+
+export AWS_ACCESS_KEY_ID="${ACCESS_KEY_ID}"
+export AWS_SECRET_ACCESS_KEY="${SECRET_ACCESS_KEY}"
+export AWS_DEFAULT_REGION="${REGION}"
+export AWS_PROFILE="${USER_NAME}"
+
+# To use these credentials:
+# 1. Source this file: source ${USER_NAME}-credentials.sh
+# 2. Or run: . ${USER_NAME}-credentials.sh
+# 3. To unset: unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION AWS_PROFILE
+EOF
+
+chmod 600 "$EXPORT_FILE"
+echo ""
+echo -e "${GREEN}✓ Credentials exported to:${NC} $EXPORT_FILE"
+echo -e "  To use: source $EXPORT_FILE"
+echo -e "  Or: . $EXPORT_FILE"
