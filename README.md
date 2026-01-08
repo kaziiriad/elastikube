@@ -97,52 +97,41 @@ cd infrastructure/scripts
 ./deploy-k3s.sh
 ```
 
-## CI/CD with GitHub Actions
+## Deployment
 
-This project uses GitHub Actions with self-hosted runners on the bastion host.
+### Manual Deployment Steps
 
-### Required GitHub Secrets
+1. **Push to Remote Origin**
+   ```bash
+   git push origin master
+   ```
 
-Configure the following secrets in your GitHub repository settings:
+2. **Deploy Infrastructure (Pulumi)**
+   ```bash
+   cd infrastructure/pulumi
+   pulumi up
+   ```
 
-| Secret Name | Description | Example |
-|-------------|-------------|---------|
-| `AWS_ACCESS_KEY_ID` | AWS access key with EC2/VPC/IAM permissions | `AKIAIOSFODNN7EXAMPLE` |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret access key | `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` |
-| `PULUMI_ACCESS_TOKEN` | Pulumi authentication token | `pulum-abc123...` |
-| `SSH_PRIVATE_KEY` | SSH key pair for EC2 instances (contents of .pem file) | `-----BEGIN RSA PRIVATE KEY-----\n...` |
-| `GIT_RUNNER_TOKEN` | GitHub Actions runner registration token | `ABCD1234...` (from repo Settings → Actions → Runners → New self-hosted runner) |
+3. **Deploy K3s Cluster (Ansible)**
+   ```bash
+   cd infrastructure/ansible
+   ansible-playbook -i inventory/hosts.ini site.yml
+   ```
 
-### Workflow Triggers
+4. **Deploy Lambda Function**
+   ```bash
+   cd lambda
+   ./build.sh
+   pulumi up  # From pulumi directory
+   ```
 
-- **Deploy Infrastructure** (`infra.yml`): Triggered on push to `master` with changes in `infrastructure/pulumi/**`
-  - Runs on GitHub-hosted `ubuntu-latest` runner
-  - Provisions VPC, bastion, and K3s EC2 instances
-
-- **Setup Bastion Runner** (`setup-bastion-runner.yml`): Triggered after successful infrastructure deployment
-  - Installs GitHub Actions self-hosted runner on bastion
-  - Installs Ansible, kubectl, Pulumi, and other tools
-
-- **Deploy K3s** (`k3s-deploy.yml`): Triggered on push to `master` with changes in `infrastructure/ansible/**`, or after runner setup
-  - Runs on **self-hosted** bastion runner
-  - Deploys K3s cluster with Ansible
-  - Has direct access to private subnet K3s nodes
-
-### Manual Deployment
-
-For local deployment, see:
-- Infrastructure: `infrastructure/pulumi/README.md`
-- K3s setup: `infrastructure/scripts/deploy-k3s.sh`
+> **Note:** GitHub Actions workflows are disabled. Use manual deployment for infrastructure and application changes.
 
 ## Directory Structure
 
 ```
 production/
-├── .github/workflows/          # GitHub Actions CI/CD
-│   ├── infra.yml               # Infrastructure deployment (Pulumi)
-│   ├── setup-bastion-runner.yml # GitHub Actions runner setup
-│   └── k3s-deploy.yml          # K3s cluster deployment (Ansible)
-├── ci/                          # CI/CD configurations
+├── .github/workflows.disabled/  # Disabled GitHub Actions workflows
 ├── infrastructure/
 │   ├── pulumi/                 # Pulumi IaC for AWS resources
 │   ├── ansible/                # Ansible playbooks for K3s setup
@@ -154,10 +143,12 @@ production/
 │   │   ├── scaler/             # Scaling decision engine
 │   │   ├── state/              # DynamoDB state management
 │   │   └── utils/              # Utilities (logging, locks, etc.)
-│   └── tests/                  # Lambda function tests
+│   ├── tests/                  # Lambda function tests
+│   └── build.sh                # Lambda deployment package builder
 ├── monitoring/
 │   ├── alarms/                 # CloudWatch alarms
 │   └── dashboards/             # CloudWatch dashboards
+├── docs/                       # Documentation
 └── scripts/                    # Deployment and utility scripts
 ```
 
