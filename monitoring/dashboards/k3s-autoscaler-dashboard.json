@@ -1,0 +1,214 @@
+{
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "width": 24,
+      "height": 2,
+      "properties": {
+        "markdown": "# K3s Autoscaler - Production Dashboard\n\n**Cluster:** k3s-cluster | **Region:** ap-southeast-1\n\n[Lambda Logs](https://console.aws.amazon.com/cloudwatch/home?region=ap-southeast-1#logsV2:log-groups=/aws/lambda) | [State Table](https://console.aws.amazon.com/dynamodb/home?region=ap-southeast-1#tables:k3s-cluster-state)"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 2,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function", {"stat": "Average"}],
+          ["AWS/Lambda", "Errors", "FunctionName", "k3s-autoscaler-function", {"stat": "Sum"}]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Lambda Performance"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 6,
+      "y": 2,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Invocations", "FunctionName", "k3s-autoscaler-function", {"stat": "Sum"}]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "ap-southeast-1",
+        "title": "Lambda Invocations (5min)"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 2,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/EC2", "CPUUtilization"]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "EC2 CPU"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 18,
+      "y": 2,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "k3s-autoscaler-function", {"stat": "Maximum"}]
+        ],
+        "period": 60,
+        "stat": "Maximum",
+        "region": "ap-southeast-1",
+        "title": "Concurrency"
+      }
+    },
+    {
+      "type": "log",
+      "x": 0,
+      "y": 8,
+      "width": 12,
+      "height": 8,
+      "properties": {
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /Metrics/\n| sort @timestamp desc\n| limit 50",
+        "region": "ap-southeast-1",
+        "title": "Cluster Metrics (from Lambda logs)"
+      }
+    },
+    {
+      "type": "log",
+      "x": 12,
+      "y": 8,
+      "width": 12,
+      "height": 8,
+      "properties": {
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /Decision/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "title": "Scaling Decisions"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 16,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function", {"stat": "Average"}],
+          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function", {"stat": "p95"}],
+          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function", {"stat": "p99"}]
+        ],
+        "period": 300,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Lambda Duration (ms)"
+      }
+    },
+    {
+      "type": "log",
+      "x": 12,
+      "y": 16,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /ERROR/ or @message like /Exception/\n| sort @timestamp desc\n| limit 10",
+        "region": "ap-southeast-1",
+        "title": "Recent Errors"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 22,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["K3sAutoscaler", "CPUUsagePercent", "Cluster", "k3s-cluster", {"stat": "Average"}],
+          ["K3sAutoscaler", "MemoryUsagePercent", "Cluster", "k3s-cluster", {"stat": "Average"}]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Cluster CPU & Memory %",
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "max": 100
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 22,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["K3sAutoscaler", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Average"}],
+          [".", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Maximum"}]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Pending Pods"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 28,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["K3sAutoscaler", "NodeCount", "Cluster", "k3s-cluster", {"stat": "Average"}],
+          ["K3sAutoscaler", "ReadyNodes", "Cluster", "k3s-cluster", {"stat": "Average"}],
+          ["K3sAutoscaler", "TotalNodes", "Cluster", "k3s-cluster", {"stat": "Average"}]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Node Count"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 28,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/DynamoDB", "ConsumedReadCapacityUnits"],
+          ["AWS/DynamoDB", "ConsumedWriteCapacityUnits"]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "ap-southeast-1",
+        "title": "DynamoDB I/O"
+      }
+    }
+  ]
+}
