@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+data:
+  scaling_rules.yml: |
+    groups:
+      - name: k3s_scaling_rules
+        rules:
+          # Alert when pods are pending
+          - alert: PodsPending
+            expr: kube_pod_status_phase{phase="Pending"} > 0
+            for: 30s
+            labels:
+              severity: warning
+              component: autoscaler
+            annotations:
+              summary: "Pods are pending scheduling"
+              description: "{{ $value }} pods are in pending state"
+
+          # Alert when pending pods exceed threshold
+          - alert: HighPendingPods
+            expr: kube_pod_status_phase{phase="Pending"} > 3
+            for: 10s
+            labels:
+              severity: critical
+              component: autoscaler
+              action: scale_up
+            annotations:
+              summary: "High number of pending pods - scaling needed"
+              description: "{{ $value }} pods are pending, consider scaling up"
+
+          # Alert when CPU utilization is high
+          - alert: HighCPUUtilization
+            expr: (100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 80
+            for: 2m
+            labels:
+              severity: warning
+              component: autoscaler
+            annotations:
+              summary: "High CPU utilization"
+              description: "CPU utilization is {{ $value }}%"
+
+          # Alert when memory utilization is high
+          - alert: HighMemoryUtilization
+            expr: (100 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100)) > 80
+            for: 2m
+            labels:
+              severity: warning
+              component: autoscaler
+            annotations:
+              summary: "High memory utilization"
+              description: "Memory utilization is {{ $value }}%"
+
+          # Alert when cluster is at capacity
+          - alert: ClusterAtCapacity
+            expr: (kube_node_status_condition{condition="Ready",status="true"} == 1) and (kube_pod_status_phase{phase="Pending"} > 0)
+            for: 30s
+            labels:
+              severity: critical
+              component: autoscaler
+              action: scale_up
+            annotations:
+              summary: "Cluster at capacity with pending pods"
+              description: "All nodes are ready but {{ $value }} pods are pending"
+
+  reconciliation_alerts.yml: |
+    groups:
+      - name: reconciliation_alerts
+        rules:
+          - alert: ReconciliationIssueDetected
+            expr: increase(autoscaler_reconciliation_issues_fixed_total[5m]) > 0
+            for: 1m
+            labels:
+              severity: info
+              component: reconciliation
+            annotations:
+              summary: "Reconciliation fixed issues"
+              description: "Reconciliation has fixed {{ $value }} issues in the last 5 minutes"
+
+          - alert: HighReconciliationDuration
+            expr: histogram_quantile(0.95, autoscaler_reconciliation_duration_seconds_bucket) > 5
+            for: 5m
+            labels:
+              severity: warning
+              component: reconciliation
+            annotations:
+              summary: "Reconciliation taking too long"
+              description: "95th percentile reconciliation duration is {{ $value }}s"

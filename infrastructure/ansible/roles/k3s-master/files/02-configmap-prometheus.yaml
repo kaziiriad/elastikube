@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - "scaling_rules.yml"
+      - "reconciliation_alerts.yml"
+
+    scrape_configs:
+      # Prometheus itself
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      # Host machine node-exporter (Docker host) - accessed via host network
+      - job_name: 'node-exporter-host'
+        static_configs:
+          - targets: ['node-exporter.kube-system.svc.cluster.local:9100']
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+            replacement: 'docker-host'
+
+      # K3s cluster nodes node-exporter (from DaemonSet) - in-cluster service discovery
+      - job_name: 'node-exporter-k3s-nodes'
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+              - kube-system
+        relabel_configs:
+          # Keep only node-exporter service endpoints
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: node-exporter
+          # Add node label from Kubernetes metadata
+          - source_labels: [__meta_kubernetes_endpoint_node_name]
+            target_label: node
+          # Set instance label to node name for clarity
+          - source_labels: [__meta_kubernetes_endpoint_node_name]
+            target_label: instance
+          # Add namespace label
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: kubernetes_namespace
+
+      # Kube-state-metrics for Kubernetes object metrics (using service discovery)
+      - job_name: 'kube-state-metrics'
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+              - kube-system
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: kube-state-metrics
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: http-metrics
+          - source_labels: [__meta_kubernetes_pod_ip]
+            target_label: __address__
+            replacement: ${1}:8080
+        scrape_interval: 30s
+
+      # Autoscaler metrics
+      - job_name: 'autoscaler'
+        static_configs:
+          - targets: ['prototype-autoscaler-1.prototype.svc.cluster.local:9091']
+        scrape_interval: 5s
+        metrics_path: /metrics

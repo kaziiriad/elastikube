@@ -90,61 +90,151 @@
     AWS_DEFAULT_REGION: "{{ aws_region | default('ap-southeast-1') }}"
   ignore_errors: true
 
-- name: Create Prometheus namespace
-  command: kubectl create namespace prometheus
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-  ignore_errors: true
+# ==========================================
+# Deploy Monitoring Stack (node-exporter + Prometheus)
+# ==========================================
 
-- name: Add Prometheus Helm repository
-  command: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-  ignore_errors: true
-
-- name: Update Helm repositories
-  command: helm repo update
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-
-# Install Prometheus with NodePort for autoscaler access
-- name: Create Prometheus values file
+- name: Copy monitoring manifests to master
   copy:
-    dest: /tmp/prometheus-values.yaml
-    content: |
-      server:
-        service:
-          type: NodePort
-          nodePort: 30900
-        global:
-          scrape_interval: 15s
+    src: files/
+    dest: /tmp/monitoring/
+    mode: '0644'
 
-- name: Install Prometheus via Helm
-  command: |
-    helm upgrade --install prometheus prometheus-community/prometheus \
-      --namespace prometheus \
-      --values /tmp/prometheus-values.yaml \
-      --set server.service.type=NodePort \
-      --set server.service.nodePort=30900 \
-      --wait --timeout 5m
+- name: Create monitoring namespace
+  command: kubectl apply -f /tmp/monitoring/00-namespace.yaml
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-  async: 300
-  poll: 0
+  changed_when: false
 
-- name: Wait for Prometheus to be ready
-  wait_for:
-    timeout: 120
-  delegate_to: localhost
-  become: false
+- name: Deploy node-exporter DaemonSet
+  command: kubectl apply -f /tmp/monitoring/00-node-exporter.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: node_exporter_deploy
+
+- name: Wait for node-exporter pods to be ready
+  command: kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=node-exporter -n kube-system --timeout=120s
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when: node_exporter_deploy.changed
+  ignore_errors: true
+
+- name: Deploy Prometheus service account
+  command: kubectl apply -f /tmp/monitoring/01-serviceaccount.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Deploy Prometheus ConfigMap with custom scrape config
+  command: kubectl apply -f /tmp/monitoring/02-configmap-prometheus.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: prometheus_config
+
+- name: Deploy Prometheus rules ConfigMap
+  command: kubectl apply -f /tmp/monitoring/02-configmap-rules.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Deploy Prometheus PVC
+  command: kubectl apply -f /tmp/monitoring/03-pvc.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Deploy Prometheus deployment
+  command: kubectl apply -f /tmp/monitoring/04-deployment.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: prometheus_deploy
+
+- name: Deploy Prometheus services (ClusterIP + NodePort 30900)
+  command: kubectl apply -f /tmp/monitoring/05-service.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Wait for Prometheus deployment to be ready
+  command: kubectl wait --for=condition=available deployment/prometheus -n monitoring --timeout=180s
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when: prometheus_deploy.changed
+  ignore_errors: true
 
 - name: Get Prometheus service status
-  command: kubectl get svc prometheus-server -n prometheus
+  command: kubectl get svc -n monitoring
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   register: prometheus_status
   changed_when: false
 
-- name: Display Prometheus status
+- name: Get node-exporter pods status
+  command: kubectl get pods -n kube-system -l app.kubernetes.io/name=node-exporter
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: node_exporter_status
+  changed_when: false
+
+- name: Display monitoring stack status
   debug:
-    var: prometheus_status.stdout_lines
+    msg:
+      - "Prometheus Services:"
+      - "{{ prometheus_status.stdout_lines }}"
+      - ""
+      - "Node Exporter Pods:"
+      - "{{ node_exporter_status.stdout_lines }}"
+
+# ==========================================
+# Deploy kube-state-metrics
+# ==========================================
+
+- name: Deploy kube-state-metrics service account
+  command: kubectl apply -f /tmp/monitoring/06-kube-state-metrics-serviceaccount.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Deploy kube-state-metrics cluster role
+  command: kubectl apply -f /tmp/monitoring/07-kube-state-metrics-cluster-role.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Deploy kube-state-metrics cluster role binding
+  command: kubectl apply -f /tmp/monitoring/08-kube-state-metrics-cluster-role-binding.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Deploy kube-state-metrics deployment
+  command: kubectl apply -f /tmp/monitoring/09-kube-state-metrics-deployment.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: ksm_deploy
+
+- name: Deploy kube-state-metrics service
+  command: kubectl apply -f /tmp/monitoring/10-kube-state-metrics-service.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Wait for kube-state-metrics deployment to be ready
+  command: kubectl wait --for=condition=available deployment/kube-state-metrics -n kube-system --timeout=120s
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when: ksm_deploy.changed
+  ignore_errors: true
+
+- name: Get kube-state-metrics status
+  command: kubectl get pods -n kube-system -l app.kubernetes.io/name=kube-state-metrics
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: ksm_status
+  changed_when: false
+
+- name: Display kube-state-metrics status
+  debug:
+    msg:
+      - "kube-state-metrics Pods:"
+      - "{{ ksm_status.stdout_lines }}"

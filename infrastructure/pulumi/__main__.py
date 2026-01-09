@@ -11,7 +11,9 @@ This Pulumi program provisions AWS resources for the K3s autoscaler:
 - VPC and networking (optional, if cluster doesn't exist)
 """
 
+import json
 import os
+import pathlib
 import pulumi
 import pulumi_aws as aws
 from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager
@@ -227,6 +229,20 @@ security_group = aws.ec2.SecurityGroup("k3s-secgrp",
             "to_port": 32767,
             "cidr_blocks": ["10.0.0.0/16"],
         },
+        # Node Exporter (for Prometheus metrics - within cluster)
+        {
+            "protocol": "tcp",
+            "from_port": 9100,
+            "to_port": 9100,
+            "self": True,  # Allow nodes to reach each other
+        },
+        # Kubelet / cAdvisor (for container metrics - within cluster)
+        {
+            "protocol": "tcp",
+            "from_port": 10250,
+            "to_port": 10250,
+            "self": True,  # Allow nodes to reach each other
+        },
     ],
     egress=[{
         "protocol": "-1",
@@ -308,6 +324,7 @@ master_ip_parameter = ssm.Parameter(
     name=f"/k3s/{cluster_name}/master-ip",
     type="String",
     value="PENDING",  # Will be populated by Ansible after cluster setup
+    overwrite=True,  # Allow overwriting existing parameter
     description="K3s master node private IP for worker node join",
     tags={**common_tags, "Name": "k3s-master-ip-parameter"},
 )
@@ -591,7 +608,7 @@ lambda_log_group = aws.cloudwatch.LogGroup(
     "k3s-autoscaler-log-group",
     name=f"/aws/lambda/k3s-autoscaler",
     retention_in_days=7,
-    tags={**common_tags, "Name": "k3s-autoscaler-logs"}
+    tags={**common_tags, "Name": "k3s-autoscaler-log-group"},
 )
 
 # Lambda deployment package
@@ -712,6 +729,38 @@ lock_timeout_alarm = aws.cloudwatch.MetricAlarm(
 )
 
 # =============================================================================
+# CloudWatch Dashboard
+# =============================================================================
+
+# Read dashboard definition from JSON file
+dashboard_path = pathlib.Path(__file__).parent.parent.parent / "monitoring" / "dashboards" / "k3s-autoscaler-dashboard.json"
+
+try:
+    with open(dashboard_path, "r") as f:
+        dashboard_body = json.dumps(json.load(f))
+except FileNotFoundError:
+    # Fallback to minimal dashboard if file not found
+    dashboard_body = json.dumps({
+        "widgets": [{
+            "type": "metric",
+            "x": 0, "y": 0, "width": 12, "height": 6,
+            "properties": {
+                "metrics": [["AWS/Lambda", "Invocations", "FunctionName", lambda_function.name]],
+                "period": 300,
+                "stat": "Sum",
+                "region": aws.config.region,
+                "title": "Lambda Invocations"
+            }
+        }]
+    })
+
+autoscaler_dashboard = aws.cloudwatch.Dashboard(
+    "k3s-autoscaler-dashboard",
+    dashboard_name="K3s-Autoscaler-Metrics",
+    dashboard_body=dashboard_body
+)
+
+# =============================================================================
 # Outputs
 # =============================================================================
 pulumi.export("cluster_name", cluster_name)
@@ -723,6 +772,7 @@ pulumi.export("lambda_function_name", lambda_function.name)
 pulumi.export("worker_instance_profile", worker_instance_profile.name)
 pulumi.export("cloudwatch_log_group", lambda_log_group.name)
 pulumi.export("event_rule_arn", event_rule.arn)
+pulumi.export("cloudwatch_dashboard", autoscaler_dashboard.dashboard_name)
 
 # Security Group IDs
 pulumi.export("security_group_id", security_group.id)
