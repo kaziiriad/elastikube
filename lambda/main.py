@@ -21,6 +21,7 @@ Environment variables required:
 import json
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,53 @@ def get_clients():
     if ec2_client is None:
         ec2_client = boto3.client("ec2")
     return dynamodb_client, ec2_client
+
+
+def _publish_cloudwatch_metrics(metrics: ClusterMetrics, node_count: int) -> None:
+    """Publish cluster metrics to CloudWatch using Embedded Metric Format.
+
+    EMF allows metrics to be extracted from logs and queried as CloudWatch metrics.
+    This provides better visualization and alerting capabilities.
+
+    Args:
+        metrics: Cluster metrics from Prometheus
+        node_count: Current node count
+    """
+    import socket
+
+    emf_metrics = {
+        "_aws": {
+            "Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": "K3sAutoscaler",
+                    "Dimensions": [["Cluster", "k3s-cluster"]],
+                    "Metrics": [
+                        {"Name": "WorkerCPU", "Unit": "Percent"},
+                        {"Name": "WorkerMemory", "Unit": "Percent"},
+                        {"Name": "MasterCPU", "Unit": "Percent"},
+                        {"Name": "MasterMemory", "Unit": "Percent"},
+                        {"Name": "PendingPods", "Unit": "Count"},
+                        {"Name": "WorkerCount", "Unit": "Count"},
+                        {"Name": "ReadyNodes", "Unit": "Count"},
+                        {"Name": "TotalNodes", "Unit": "Count"},
+                    ]
+                }
+            ],
+        },
+        "Cluster": "k3s-cluster",
+        "WorkerCPU": metrics.cpu_percent,
+        "WorkerMemory": metrics.memory_percent,
+        "MasterCPU": metrics.master_cpu_percent,
+        "MasterMemory": metrics.master_memory_percent,
+        "PendingPods": metrics.pending_pods,
+        "WorkerCount": metrics.worker_count,
+        "ReadyNodes": metrics.ready_nodes,
+        "TotalNodes": metrics.total_nodes,
+        "Hostname": socket.gethostname(),
+    }
+
+    logger.info(json.dumps(emf_metrics), extra={"aws_emf": True})
 
 
 def lambda_handler(event: dict, context: Any) -> dict:
@@ -115,10 +163,18 @@ def lambda_handler(event: dict, context: Any) -> dict:
             # Step 4: Fetch cluster metrics
             logger.info("Fetching cluster metrics from Prometheus...")
             metrics = prometheus.get_cluster_metrics()
-            logger.info(f"Metrics: CPU={metrics.cpu_percent:.1f}%, "
+
+            # Log to console
+            logger.info(f"Worker Metrics: CPU={metrics.cpu_percent:.1f}%, "
                        f"Memory={metrics.memory_percent:.1f}%, "
-                       f"Pending Pods={metrics.pending_pods}, "
-                       f"Nodes={metrics.total_nodes}")
+                       f"Count={metrics.worker_count}")
+            logger.info(f"Master Metrics: CPU={metrics.master_cpu_percent:.1f}%, "
+                       f"Memory={metrics.master_memory_percent:.1f}%")
+            logger.info(f"Cluster: Pending Pods={metrics.pending_pods}, "
+                       f"Ready Nodes={metrics.ready_nodes}/{metrics.total_nodes}")
+
+            # Publish metrics to CloudWatch using Embedded Metric Format
+            _publish_cloudwatch_metrics(metrics, state.node_count)
 
             # Step 5: Evaluate scaling decision
             logger.info("Evaluating scaling decision...")
