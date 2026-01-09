@@ -101,7 +101,8 @@ def _publish_cloudwatch_metrics(metrics: ClusterMetrics, node_count: int) -> Non
         "Hostname": socket.gethostname(),
     }
 
-    logger.info(json.dumps(emf_metrics), extra={"aws_emf": True})
+    # Pretty-print EMF metrics for readability (CloudWatch still parses it correctly)
+    # logger.info(json.dumps(emf_metrics, indent=2), extra={"aws_emf": True})
 
 
 def lambda_handler(event: dict, context: Any) -> dict:
@@ -314,7 +315,7 @@ def _execute_scale_up(
         # This requires kubectl access to the cluster
 
         # Update WAL: succeeded
-        wal.update_entry(wal_entry.operation_id, OperationState.SUCCEEDED)
+        wal.update_entry(wal_entry.operation_id, OperationState.SUCCEEDED, started_at=wal_entry.started_at)
 
         # Update state: increment node count
         new_state = state_manager.update_state(
@@ -335,6 +336,7 @@ def _execute_scale_up(
             wal_entry.operation_id,
             OperationState.FAILED,
             error_message=str(e),
+            started_at=wal_entry.started_at,
         )
         raise
 
@@ -370,6 +372,14 @@ def _execute_scale_down(
         instance = ec2_ops.get_instance_for_scale_down()
         if not instance:
             logger.warning("No eligible instance found for scale-down")
+            # Mark WAL as FAILED and clear scaling_in_progress
+            wal.update_entry(
+                wal_entry.operation_id,
+                OperationState.FAILED,
+                error_message="No eligible instance found for scale-down",
+                started_at=wal_entry.started_at,
+            )
+            state_manager.update_state(scaling_in_progress=False)
             return {"message": "No eligible instance to terminate"}
 
         instance_id = instance["InstanceId"]
@@ -383,7 +393,7 @@ def _execute_scale_down(
         logger.info(f"Terminated instance: {instance_id}")
 
         # Update WAL: succeeded
-        wal.update_entry(wal_entry.operation_id, OperationState.SUCCEEDED)
+        wal.update_entry(wal_entry.operation_id, OperationState.SUCCEEDED, started_at=wal_entry.started_at)
 
         # Update state: decrement node count
         new_state = state_manager.update_state(
@@ -404,5 +414,6 @@ def _execute_scale_down(
             wal_entry.operation_id,
             OperationState.FAILED,
             error_message=str(e),
+            started_at=wal_entry.started_at,
         )
         raise

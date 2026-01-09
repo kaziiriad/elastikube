@@ -122,6 +122,7 @@ class WriteAheadLog:
         operation_id: str,
         state: OperationState,
         error_message: Optional[str] = None,
+        started_at: Optional[str] = None,
     ) -> WalEntry:
         """Update an existing WAL entry.
 
@@ -129,12 +130,13 @@ class WriteAheadLog:
             operation_id: Operation ID to update
             state: New state
             error_message: Optional error message if FAILED
+            started_at: Required for composite key (operation_id + started_at)
 
         Returns:
             The updated WAL entry
         """
         # Get current entry
-        current = self.get_entry(operation_id)
+        current = self.get_entry(operation_id, started_at)
         if not current:
             raise ValueError(f"WAL entry {operation_id} not found")
 
@@ -153,20 +155,25 @@ class WriteAheadLog:
         except ClientError as e:
             raise RuntimeError(f"Failed to update WAL entry: {e}") from e
 
-    def get_entry(self, operation_id: str) -> Optional[WalEntry]:
+    def get_entry(self, operation_id: str, started_at: Optional[str] = None) -> Optional[WalEntry]:
         """Get a WAL entry by ID.
 
         Args:
             operation_id: Operation ID to fetch
+            started_at: Required for composite key (operation_id + started_at)
 
         Returns:
             The WAL entry or None if not found
         """
+        if not started_at:
+            raise ValueError("started_at is required to get WAL entry (composite key)")
+
         try:
             response = self._client.get_item(
                 TableName=self._table_name,
                 Key={
                     "operation_id": {"S": operation_id},
+                    "started_at": {"S": started_at},
                 },
             )
             if "Item" not in response:
