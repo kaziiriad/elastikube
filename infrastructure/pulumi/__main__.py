@@ -16,7 +16,7 @@ import os
 import pathlib
 import pulumi
 import pulumi_aws as aws
-from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager
+from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3
 
 # =============================================================================
 # Configuration
@@ -347,6 +347,22 @@ k3s_join_token_version = secretsmanager.SecretVersion(
 )
 
 # =============================================================================
+# S3 Bucket for Worker Bootstrap Scripts
+# =============================================================================
+# Stores user-data scripts that new worker instances fetch during launch
+# The actual bootstrap script is deployed via Ansible (worker-bootstrap.yml)
+#
+# Note: Bucket creation requires S3 permissions. If IAM user lacks permissions,
+# the bucket can be created manually or via Ansible before running Pulumi.
+
+# S3 Bucket for user-data scripts
+worker_userdata_bucket = s3.Bucket(
+    "k3s-worker-userdata",
+    bucket=f"k3s-userdata-{cluster_name}",
+    tags={**common_tags, "Name": "k3s-worker-userdata", "Purpose": "worker-bootstrap-scripts"}
+)
+
+# =============================================================================
 # IAM Roles
 # =============================================================================
 
@@ -539,6 +555,13 @@ worker_ssm_policy_attachment = iam.RolePolicyAttachment(
     policy_arn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 )
 
+# Attach Secrets Manager read-only policy for fetching K3s join token during bootstrap
+worker_secrets_manager_policy_attachment = iam.RolePolicyAttachment(
+    "k3s-worker-secrets-manager-policy",
+    role=worker_role.name,
+    policy_arn="arn:aws:iam::aws:policy/AWSSecretsManagerClientReadOnlyAccess"
+)
+
 # Instance Profile for worker nodes
 worker_instance_profile = iam.InstanceProfile(
     "k3s-worker-instance-profile",
@@ -560,6 +583,13 @@ master_ssm_policy_attachment = iam.RolePolicyAttachment(
     "k3s-master-ssm-policy",
     role=master_role.name,
     policy_arn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+)
+
+# Attach Secrets Manager policy for storing K3s join token
+master_secrets_manager_policy_attachment = iam.RolePolicyAttachment(
+    "k3s-master-secrets-manager-policy",
+    role=master_role.name,
+    policy_arn="arn:aws:iam::aws:policy/SecretsManagerReadWrite"  # Or create inline policy for write-only
 )
 
 # Instance Profile for master node
@@ -686,6 +716,9 @@ lambda_function = lambda_.Function(
             "IAM_INSTANCE_PROFILE": worker_instance_profile.name,
             "AMI_ID": ami_id,
             "INSTANCE_TYPE": worker_instance_type,
+            # S3 Configuration for worker bootstrap script
+            "USER_DATA_S3_BUCKET": worker_userdata_bucket.bucket,
+            "USER_DATA_S3_KEY": "user-data/worker-bootstrap.sh",
         }
     ),
     code=lambda_archive,
@@ -839,3 +872,7 @@ pulumi.export("config_scale_down_cooldown", scale_down_cooldown)
 # SSM and Secrets Manager exports
 pulumi.export("ssm_master_ip_parameter_name", master_ip_parameter.name)
 pulumi.export("secrets_manager_join_token_arn", k3s_join_token_secret.arn)
+
+# S3 bucket for worker bootstrap scripts
+pulumi.export("worker_userdata_bucket_name", worker_userdata_bucket.bucket)
+pulumi.export("worker_userdata_bucket_arn", worker_userdata_bucket.arn)

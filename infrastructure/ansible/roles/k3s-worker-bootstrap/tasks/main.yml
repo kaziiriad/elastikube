@@ -1,0 +1,55 @@
+---
+# K3s Worker Bootstrap Role Tasks
+# This role renders and deploys the worker bootstrap script to S3
+
+- name: Display deployment configuration
+  debug:
+    msg:
+      - "Cluster: {{ cluster_name }}"
+      - "Region: {{ aws_region }}"
+      - "S3 Bucket: {{ s3_bucket }}"
+      - "Join Token Suffix: {{ join_token_suffix }}"
+
+- name: Create S3 bucket for user-data scripts
+  amazon.aws.s3_bucket:
+    name: "{{ s3_bucket }}"
+    state: present
+    region: "{{ aws_region }}"
+    tags:
+      Cluster: "{{ cluster_name }}"
+      Purpose: k3s-worker-userdata
+
+- name: Render worker bootstrap user-data script
+  ansible.builtin.template:
+    src: user-data.sh.j2
+    dest: "/tmp/worker-bootstrap-{{ cluster_name }}.sh"
+    mode: '0755'
+
+- name: Upload rendered user-data to S3
+  amazon.aws.s3_object:
+    bucket: "{{ s3_bucket }}"
+    object: "{{ s3_key }}"
+    src: "/tmp/worker-bootstrap-{{ cluster_name }}.sh"
+    mode: put
+    permissions: public-read
+
+- name: Display S3 URL
+  debug:
+    msg: "User-data script uploaded to: https://{{ s3_bucket }}.s3.{{ aws_region }}.amazonaws.com/{{ s3_key }}"
+
+- name: Save configuration for Lambda/Pulumi
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/worker-bootstrap-config.json"
+    content: |
+      {
+        "cluster_name": "{{ cluster_name }}",
+        "aws_region": "{{ aws_region }}",
+        "s3_bucket": "{{ s3_bucket }}",
+        "s3_key": "{{ s3_key }}",
+        "s3_url": "https://{{ s3_bucket }}.s3.{{ aws_region }}.amazonaws.com/{{ s3_key }}"
+      }
+    mode: '0644'
+
+- name: Display configuration file location
+  debug:
+    msg: "Configuration saved to: ./worker-bootstrap-config.json"

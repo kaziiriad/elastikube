@@ -36,7 +36,6 @@ from scaler.scaling import ScalingEngine, ScalingDecision, ScalingAction
 from scaler.ec2 import EC2Operations
 from scaler.kubectl import KubectlViaSSM
 from state.cluster_state import StateManager, DistributedLock
-from utils.cluster_credentials import get_cluster_credentials, generate_user_data_script
 from utils.wal import WriteAheadLog, OperationType, OperationState
 
 # Configure logging
@@ -287,17 +286,15 @@ def _execute_scale_up(
     # Update state: scaling in progress
     state_manager.update_state(scaling_in_progress=True, last_scale_operation="SCALE_UP")
 
-    # Fetch cluster credentials for node join
-    logger.info("Fetching cluster credentials from AWS...")
-    credentials = get_cluster_credentials()
-    if not credentials:
-        raise RuntimeError("Failed to fetch cluster credentials - ensure cluster is properly initialized")
-
-    logger.info(f"Retrieved credentials: {credentials}")
-
-    # Generate user-data script for K3s join
-    user_data_script = generate_user_data_script(credentials)
-    logger.info("Generated user-data script for K3s worker bootstrap")
+    # Fetch user-data script from S3 (deployed by Ansible worker-bootstrap.yml)
+    logger.info("Fetching user-data script from S3...")
+    user_data_script = ec2_ops.fetch_user_data_from_s3()
+    if not user_data_script:
+        raise RuntimeError(
+            "Failed to fetch user-data script from S3. "
+            "Ensure the worker-bootstrap.yml playbook has been run."
+        )
+    logger.info("Successfully fetched user-data script for K3s worker bootstrap")
 
     # Get EC2 configuration from environment (set by Pulumi)
     from utils.config import get_config

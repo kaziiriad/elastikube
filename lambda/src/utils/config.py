@@ -66,6 +66,10 @@ class Config:
     ami_id: str
     instance_type: str
 
+    # S3 configuration for worker bootstrap script
+    user_data_s3_bucket: str  # S3 bucket containing bootstrap script
+    user_data_s3_key: str     # S3 object key for bootstrap script
+
     @classmethod
     def from_env(cls) -> "Config":
         """Load configuration from environment variables."""
@@ -97,6 +101,8 @@ class Config:
             iam_instance_profile=os.getenv("IAM_INSTANCE_PROFILE", ""),
             ami_id=os.getenv("AMI_ID", ""),
             instance_type=os.getenv("INSTANCE_TYPE", "t3.small"),
+            user_data_s3_bucket=os.getenv("USER_DATA_S3_BUCKET", "k3s-userdata-production-k3s"),
+            user_data_s3_key=os.getenv("USER_DATA_S3_KEY", "user-data/worker-bootstrap.sh"),
         )
 
 

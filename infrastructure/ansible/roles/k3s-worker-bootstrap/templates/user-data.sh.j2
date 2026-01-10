@@ -1,0 +1,139 @@
+#!/bin/bash
+# K3s Worker Node Bootstrap Script
+# This script automatically joins new EC2 instances to the K3s cluster
+
+set -e
+
+CLUSTER_NAME="{{ cluster_name }}"
+AWS_REGION="{{ aws_region }}"
+SECRET_NAME="k3s-${CLUSTER_NAME}-join-token-{{ join_token_suffix }}"
+SSM_MASTER_IP="/k3s/${CLUSTER_NAME}/master-ip"
+
+echo "=== K3s Worker Node Bootstrap ==="
+echo "Cluster: $CLUSTER_NAME"
+echo "Region: $AWS_REGION"
+
+# Install dependencies
+echo "[1/6] Installing dependencies..."
+apt-get update -qq
+apt-get install -y awscli curl jq ca-certificates
+
+# Wait for networking to be ready
+echo "[2/6] Waiting for network connectivity..."
+until ping -c 1 8.8.8.8 &>/dev/null; do
+    echo "  Network not ready, waiting..."
+    sleep 2
+done
+echo "  Network ready!"
+
+# Get instance metadata from IMDSv2
+echo "[3/6] Getting instance metadata..."
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds:21600" -s)
+INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id -s)
+LOCAL_IP=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 -s)
+AZ=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone -s)
+echo "  Instance: $INSTANCE_ID"
+echo "  IP: $LOCAL_IP"
+echo "  AZ: $AZ"
+
+# Get master IP from SSM Parameter Store
+echo "[4/6] Fetching master IP from SSM Parameter..."
+MAX_RETRIES=5
+RETRY_COUNT=0
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    MASTER_IP=$(
+        aws ssm get-parameter \
+            --name "$SSM_MASTER_IP" \
+            --region "$AWS_REGION" \
+            --query "Parameter.Value" \
+            --output text 2>&1
+    )
+
+    if [ $? -eq 0 ] && [ -n "$MASTER_IP" ]; then
+        echo "  Master IP: $MASTER_IP"
+        break
+    fi
+
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    echo "  Retry $RETRY_COUNT/$MAX_RETRIES: Failed to get master IP"
+    sleep 10
+done
+
+if [ -z "$MASTER_IP" ]; then
+    echo "ERROR: Failed to get master IP from SSM after $MAX_RETRIES attempts"
+    exit 1
+fi
+
+# Get K3s join token from Secrets Manager
+echo "[5/6] Fetching K3s join token from Secrets Manager..."
+RETRY_COUNT=0
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    JOIN_TOKEN=$(
+        aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_NAME" \
+            --region "$AWS_REGION" \
+            --query "SecretString" \
+            --output text 2>&1
+    )
+
+    if [ $? -eq 0 ] && [ -n "$JOIN_TOKEN" ]; then
+        echo "  Token retrieved: ${JOIN_TOKEN:0:20}..."
+        break
+    fi
+
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    echo "  Retry $RETRY_COUNT/$MAX_RETRIES: Failed to get join token"
+    sleep 10
+done
+
+if [ -z "$JOIN_TOKEN" ]; then
+    echo "ERROR: Failed to get join token from Secrets Manager after $MAX_RETRIES attempts"
+    exit 1
+fi
+
+# Install K3s agent
+echo "[6/6] Installing K3s agent..."
+curl -sfL https://get.k3s.io | \
+    K3S_URL="https://$MASTER_IP:6443" \
+    K3S_TOKEN="$JOIN_TOKEN" \
+    INSTALL_K3S_EXEC="agent --node-ip=$LOCAL_IP --node-name=ip-$LOCAL_IP --tls-san $LOCAL_IP" \
+    sh -
+
+# Wait for K3s agent to start
+echo "Waiting for K3s agent to start..."
+sleep 10
+
+# Check if K3s agent is running
+if systemctl is-active --quiet k3s-agent; then
+    echo "✓ K3s agent is running"
+
+    # Tag the instance with cluster metadata
+    aws ec2 create-tags \
+        --resources "$INSTANCE_ID" \
+        --tags \
+            "Key=ClusterName,Value=$CLUSTER_NAME" \
+            "Key=NodeRole,Value=worker" \
+            "Key=JoinStatus,Value=success" \
+            "Key=JoinedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --region "$AWS_REGION" 2>/dev/null || true
+
+    echo "=== Bootstrap Complete ==="
+    echo "Worker node successfully joined cluster '$CLUSTER_NAME'!"
+else
+    echo "✗ K3s agent failed to start"
+    echo "Checking logs:"
+    journalctl -u k3s-agent -n 20 --no-pager || true
+
+    # Tag as failed
+    aws ec2 create-tags \
+        --resources "$INSTANCE_ID" \
+        --tags \
+            "Key=ClusterName,Value=$CLUSTER_NAME" \
+            "Key=NodeRole,Value=worker" \
+            "Key=JoinStatus,Value=failed" \
+            "Key=FailedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --region "$AWS_REGION" 2>/dev/null || true
+    exit 1
+fi

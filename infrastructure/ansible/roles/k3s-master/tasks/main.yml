@@ -72,6 +72,25 @@
   debug:
     msg: "Master IP: {{ master_ip.stdout }}, Token: {{ k3s_token.stdout[:20] }}..."
 
+- name: Store K3s join token to Secrets Manager
+  shell: |
+    SECRET_NAME="k3s-production-k3s-join-token-IdOHFA"
+    TOKEN="{{ k3s_token.stdout }}"
+
+    # Store token in Secrets Manager
+    aws secretsmanager put-secret-value \
+      --secret-id "$SECRET_NAME" \
+      --secret-string "$TOKEN" \
+      --region "{{ aws_region }}" \
+      2>&1 | grep -v "^$"
+  changed_when: true
+  register: secret_store_result
+  ignore_errors: true
+
+- name: Show Secrets Manager storage result
+  debug:
+    msg: "Token stored to Secrets Manager: {{ 'Success' if secret_store_result.rc == 0 else 'Failed (may need permissions)' }}"
+
 - name: Set master IP as fact for workers
   set_fact:
     master_node_ip: "{{ master_ip.stdout }}"

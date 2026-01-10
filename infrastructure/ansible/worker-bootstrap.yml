@@ -1,0 +1,15 @@
+---
+# Deploy K3s Worker Bootstrap Script to S3
+# Usage: CLUSTER_NAME=production-k3s AWS_REGION=ap-southeast-1 ansible-playbook worker-bootstrap.yml
+
+- hosts: localhost
+  gather_facts: false
+  vars:
+    cluster_name: "{{ lookup('env', 'CLUSTER_NAME') | default('production-k3s', true) }}"
+    aws_region: "{{ lookup('env', 'AWS_REGION') | default('ap-southeast-1', true) }}"
+    join_token_suffix: "{{ lookup('env', 'JOIN_TOKEN_SUFFIX') | default('IdOHFA', true) }}"
+    s3_bucket: "k3s-userdata-{{ cluster_name }}"
+    s3_key: "user-data/worker-bootstrap.sh"
+
+  roles:
+    - role: k3s-worker-bootstrap

@@ -5,8 +5,10 @@ Handles:
 - Terminating instances
 - Tagging for identification
 - LIFO scaling (respecting permanent workers)
+- Fetching bootstrap scripts from S3
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -17,18 +19,58 @@ from botocore.exceptions import ClientError
 from utils.config import get_config
 from utils.wal import WalEntry, OperationType, OperationState
 
+logger = logging.getLogger(__name__)
+
 
 class EC2Operations:
     """Manages EC2 instances for K3s worker nodes."""
 
-    def __init__(self, ec2_client=None):
+    def __init__(self, ec2_client=None, s3_client=None):
         """Initialize EC2 operations.
 
         Args:
             ec2_client: Optional boto3 EC2 client
+            s3_client: Optional boto3 S3 client
         """
         self._client = ec2_client or boto3.client("ec2")
+        self._s3_client = s3_client or boto3.client("s3")
         self._config = get_config()
+
+    def fetch_user_data_from_s3(self) -> Optional[str]:
+        """Fetch worker bootstrap user-data script from S3.
+
+        The user-data script is deployed by Ansible and contains the
+        K3s agent installation and cluster join logic.
+
+        Returns:
+            User-data script as string, or None if fetch fails
+
+        Raises:
+            RuntimeError: If S3 fetch fails
+        """
+        try:
+            logger.info(
+                f"Fetching user-data from S3: "
+                f"s3://{self._config.user_data_s3_bucket}/{self._config.user_data_s3_key}"
+            )
+            response = self._s3_client.get_object(
+                Bucket=self._config.user_data_s3_bucket,
+                Key=self._config.user_data_s3_key
+            )
+            user_data = response["Body"].read().decode("utf-8")
+            logger.info(f"Successfully fetched user-data script ({len(user_data)} bytes)")
+            return user_data
+
+        except self._s3_client.exceptions.NoSuchKey:
+            logger.error(
+                f"User-data script not found in S3: "
+                f"s3://{self._config.user_data_s3_bucket}/{self._config.user_data_s3_key}"
+            )
+            logger.error("Has the worker-bootstrap.yml playbook been run?")
+            return None
+
+        except ClientError as e:
+            raise RuntimeError(f"Failed to fetch user-data from S3: {e}") from e
 
     def launch_worker(
         self,
