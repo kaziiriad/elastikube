@@ -435,6 +435,15 @@ autoscaler_policy = iam.RolePolicy(
                 "resources": [f"arn:aws:ssm:{region}:*:parameter/k3s/*"],
                 "effect": "Allow",
             },
+            # SSM Run Command Permissions (for kubectl drain via master)
+            {
+                "actions": ["ssm:SendCommand", "ssm:GetCommandInvocation"],
+                "resources": [
+                    f"arn:aws:ssm:{region}:*:document/AWS-RunShellScript",
+                    f"arn:aws:ec2:{region}:*:instance/*",
+                ],
+                "effect": "Allow",
+            },
             # Secrets Manager Permissions
             {
                 "actions": [

@@ -1,5 +1,46 @@
 ---
+# ==========================================
+# Install AWS SSM Agent (required for kubectl drain via Lambda)
+# ==========================================
+
+- name: Create /tmp/ssm directory
+  file:
+    path: /tmp/ssm
+    state: directory
+    mode: '0755'
+
+- name: Download SSM Agent installer
+  shell: |
+    curl -o /tmp/ssm/amazon-ssm-agent.deb \
+      "https://s3.ap-southeast-1.amazonaws.com/amazon-ssm-ap-southeast-1/latest/debian_amd64/amazon-ssm-agent.deb"
+  args:
+    creates: /tmp/ssm/amazon-ssm-agent.deb
+  ignore_errors: true
+
+- name: Install SSM Agent
+  shell: dpkg -i /tmp/ssm/amazon-ssm-agent.deb || apt-get install -f -y
+  ignore_errors: true
+
+- name: Ensure SSM Agent is enabled and running
+  systemd:
+    name: amazon-ssm-agent
+    state: started
+    enabled: true
+  ignore_errors: true
+
+- name: Display SSM Agent status
+  shell: systemctl status amazon-ssm-agent || echo "SSM Agent not running"
+  register: ssm_status
+  changed_when: false
+
+- name: Show SSM Agent status
+  debug:
+    msg: "{{ ssm_status.stdout_lines }}"
+
+# ==========================================
 # K3s Master node setup
+# ==========================================
+
 - name: Download and install k3s server
   shell: |
     curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --node-ip={{ ansible_default_ipv4.address }} --tls-san {{ ansible_default_ipv4.address }}" sh -

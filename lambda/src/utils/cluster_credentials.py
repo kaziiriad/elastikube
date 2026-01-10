@@ -177,3 +177,4 @@ done
 echo "Bootstrap completed at $(date)" | tee -a "$LOG_FILE"
 """
     return script
+
