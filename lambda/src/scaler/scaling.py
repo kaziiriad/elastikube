@@ -88,8 +88,8 @@ class ScalingEngine:
                 reason=f"In scale-up cooldown ({self._config.scale_up_cooldown}s)",
                 current_nodes=current_nodes,
                 target_nodes=current_nodes,
-                cpu_percent=metrics.cpu_percent,
-                memory_percent=metrics.memory_percent,
+                cpu_percent=metrics.worker_cpu_percent_avg,
+                memory_percent=metrics.worker_memory_percent_avg,
                 pending_pods=metrics.pending_pods,
             )
 
@@ -99,50 +99,48 @@ class ScalingEngine:
                 reason=f"In scale-down cooldown ({self._config.scale_down_cooldown}s)",
                 current_nodes=current_nodes,
                 target_nodes=current_nodes,
-                cpu_percent=metrics.cpu_percent,
-                memory_percent=metrics.memory_percent,
+                cpu_percent=metrics.worker_cpu_percent_avg,
+                memory_percent=metrics.worker_memory_percent_avg,
                 pending_pods=metrics.pending_pods,
             )
 
-        # Check scale-up conditions
-        scale_up_trigger = (
-            metrics.cpu_percent >= self._config.scale_up_threshold
-            or metrics.pending_pods >= 1
-        )
+        # Check scale-up conditions (using worker metrics only)
+        cpu_trigger = metrics.worker_cpu_percent_avg >= self._config.scale_up_threshold
+        pods_trigger = metrics.pending_pods >= 1
 
-        if scale_up_trigger and current_nodes < self._config.max_nodes:
+        if (cpu_trigger or pods_trigger) and current_nodes < self._config.max_nodes:
+            # Build reason string based on actual trigger
+            if pods_trigger:
+                reason = f"Pending pods ({metrics.pending_pods}) >= 1"
+            else:
+                reason = f"Worker CPU ({metrics.worker_cpu_percent_avg:.1f}%) >= threshold ({self._config.scale_up_threshold}%)"
+
             return ScalingDecision(
                 action=ScalingAction.SCALE_UP,
-                reason=(
-                    f"CPU ({metrics.cpu_percent:.1f}%) >= threshold "
-                    f"({self._config.scale_up_threshold}%) "
-                    f"OR pending pods ({metrics.pending_pods}) >= 1"
-                ),
+                reason=reason,
                 current_nodes=current_nodes,
                 target_nodes=current_nodes + 1,
-                cpu_percent=metrics.cpu_percent,
-                memory_percent=metrics.memory_percent,
+                cpu_percent=metrics.worker_cpu_percent_avg,
+                memory_percent=metrics.worker_memory_percent_avg,
                 pending_pods=metrics.pending_pods,
             )
 
-        # Check scale-down conditions
-        scale_down_trigger = (
-            metrics.cpu_percent < self._config.scale_down_threshold
-            and metrics.memory_percent < 50  # Memory threshold for scale-down
-        )
+        # Check scale-down conditions (using worker metrics only)
+        cpu_low = metrics.worker_cpu_percent_avg < self._config.scale_down_threshold
+        memory_low = metrics.worker_memory_percent_avg < 50  # Memory threshold for scale-down
 
-        if scale_down_trigger and current_nodes > self._config.min_nodes:
+        if cpu_low and memory_low and current_nodes > self._config.min_nodes:
             return ScalingDecision(
                 action=ScalingAction.SCALE_DOWN,
                 reason=(
-                    f"CPU ({metrics.cpu_percent:.1f}%) < threshold "
+                    f"Worker CPU ({metrics.worker_cpu_percent_avg:.1f}%) < threshold "
                     f"({self._config.scale_down_threshold}%) "
-                    f"AND memory ({metrics.memory_percent:.1f}%) < 50%"
+                    f"AND memory ({metrics.worker_memory_percent_avg:.1f}%) < 50%"
                 ),
                 current_nodes=current_nodes,
                 target_nodes=current_nodes - 1,
-                cpu_percent=metrics.cpu_percent,
-                memory_percent=metrics.memory_percent,
+                cpu_percent=metrics.worker_cpu_percent_avg,
+                memory_percent=metrics.worker_memory_percent_avg,
                 pending_pods=metrics.pending_pods,
             )
 
@@ -153,8 +151,8 @@ class ScalingEngine:
                 reason=f"At maximum node count ({self._config.max_nodes})",
                 current_nodes=current_nodes,
                 target_nodes=current_nodes,
-                cpu_percent=metrics.cpu_percent,
-                memory_percent=metrics.memory_percent,
+                cpu_percent=metrics.worker_cpu_percent_avg,
+                memory_percent=metrics.worker_memory_percent_avg,
                 pending_pods=metrics.pending_pods,
             )
 
@@ -164,8 +162,8 @@ class ScalingEngine:
                 reason=f"At minimum node count ({self._config.min_nodes})",
                 current_nodes=current_nodes,
                 target_nodes=current_nodes,
-                cpu_percent=metrics.cpu_percent,
-                memory_percent=metrics.memory_percent,
+                cpu_percent=metrics.worker_cpu_percent_avg,
+                memory_percent=metrics.worker_memory_percent_avg,
                 pending_pods=metrics.pending_pods,
             )
 
@@ -174,7 +172,7 @@ class ScalingEngine:
             reason="Within normal operating parameters",
             current_nodes=current_nodes,
             target_nodes=current_nodes,
-            cpu_percent=metrics.cpu_percent,
-            memory_percent=metrics.memory_percent,
+            cpu_percent=metrics.worker_cpu_percent_avg,
+            memory_percent=metrics.worker_memory_percent_avg,
             pending_pods=metrics.pending_pods,
         )

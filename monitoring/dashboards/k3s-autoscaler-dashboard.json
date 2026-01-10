@@ -18,8 +18,8 @@
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function", {"stat": "Average"}],
-          ["AWS/Lambda", "Errors", "FunctionName", "k3s-autoscaler-function", {"stat": "Sum"}]
+          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Average"}],
+          ["AWS/Lambda", "Errors", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Sum"}]
         ],
         "period": 60,
         "stat": "Average",
@@ -35,7 +35,7 @@
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/Lambda", "Invocations", "FunctionName", "k3s-autoscaler-function", {"stat": "Sum"}]
+          ["AWS/Lambda", "Invocations", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Sum"}]
         ],
         "period": 300,
         "stat": "Sum",
@@ -67,7 +67,7 @@
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "k3s-autoscaler-function", {"stat": "Maximum"}]
+          ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Maximum"}]
         ],
         "period": 60,
         "stat": "Maximum",
@@ -82,9 +82,9 @@
       "width": 12,
       "height": 8,
       "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function",
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function-64ea403",
         "view": "table",
-        "query": "fields @timestamp, @message\n| filter @message like /Metrics/\n| sort @timestamp desc\n| limit 50",
+        "query": "fields @timestamp, @message\n| filter @message like /Worker Metrics/ or @message like /Master Metrics/\n| sort @timestamp desc\n| limit 50",
         "region": "ap-southeast-1",
         "title": "Cluster Metrics (from Lambda logs)"
       }
@@ -96,7 +96,7 @@
       "width": 12,
       "height": 8,
       "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function",
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function-64ea403",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /Decision/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
@@ -111,9 +111,9 @@
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function", {"stat": "Average"}],
-          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function", {"stat": "p95"}],
-          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function", {"stat": "p99"}]
+          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Average"}],
+          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "p95"}],
+          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "p99"}]
         ],
         "period": 300,
         "stat": "Average",
@@ -128,7 +128,7 @@
       "width": 12,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function",
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function-64ea403",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /ERROR/ or @message like /Exception/\n| sort @timestamp desc\n| limit 10",
         "region": "ap-southeast-1",
@@ -143,13 +143,13 @@
       "height": 6,
       "properties": {
         "metrics": [
-          ["K3sAutoscaler", "CPUUsagePercent", "Cluster", "k3s-cluster", {"stat": "Average"}],
-          ["K3sAutoscaler", "MemoryUsagePercent", "Cluster", "k3s-cluster", {"stat": "Average"}]
+          ["K3sAutoscaler", "WorkerCPU", "Cluster", "k3s-cluster", {"stat": "Average"}],
+          ["K3sAutoscaler", "MasterCPU", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
         "period": 60,
         "stat": "Average",
         "region": "ap-southeast-1",
-        "title": "Cluster CPU & Memory %",
+        "title": "CPU % (Worker vs Master)",
         "yAxis": {
           "left": {
             "min": 0,
@@ -166,6 +166,29 @@
       "height": 6,
       "properties": {
         "metrics": [
+          ["K3sAutoscaler", "WorkerMemory", "Cluster", "k3s-cluster", {"stat": "Average"}],
+          ["K3sAutoscaler", "MasterMemory", "Cluster", "k3s-cluster", {"stat": "Average"}]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Memory % (Worker vs Master)",
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "max": 100
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 28,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
           ["K3sAutoscaler", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Average"}],
           [".", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Maximum"}]
         ],
@@ -177,13 +200,13 @@
     },
     {
       "type": "metric",
-      "x": 0,
+      "x": 12,
       "y": 28,
       "width": 12,
       "height": 6,
       "properties": {
         "metrics": [
-          ["K3sAutoscaler", "NodeCount", "Cluster", "k3s-cluster", {"stat": "Average"}],
+          ["K3sAutoscaler", "WorkerCount", "Cluster", "k3s-cluster", {"stat": "Average"}],
           ["K3sAutoscaler", "ReadyNodes", "Cluster", "k3s-cluster", {"stat": "Average"}],
           ["K3sAutoscaler", "TotalNodes", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
@@ -195,8 +218,8 @@
     },
     {
       "type": "metric",
-      "x": 12,
-      "y": 28,
+      "x": 0,
+      "y": 34,
       "width": 12,
       "height": 6,
       "properties": {

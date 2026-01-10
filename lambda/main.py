@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from metrics.prometheus import PrometheusClient, ClusterMetrics
 from scaler.scaling import ScalingEngine, ScalingDecision, ScalingAction
 from scaler.ec2 import EC2Operations
+from scaler.kubectl import KubectlViaSSM
 from state.cluster_state import StateManager, DistributedLock
 from utils.cluster_credentials import get_cluster_credentials, generate_user_data_script
 from utils.wal import WriteAheadLog, OperationType, OperationState
@@ -58,51 +59,82 @@ def get_clients():
 
 
 def _publish_cloudwatch_metrics(metrics: ClusterMetrics, node_count: int) -> None:
-    """Publish cluster metrics to CloudWatch using Embedded Metric Format.
+    """Publish cluster metrics to CloudWatch using PutMetricData API.
 
-    EMF allows metrics to be extracted from logs and queried as CloudWatch metrics.
-    This provides better visualization and alerting capabilities.
+    This sends metrics directly to CloudWatch without embedding in logs.
 
     Args:
         metrics: Cluster metrics from Prometheus
         node_count: Current node count
     """
-    import socket
+    import boto3
 
-    emf_metrics = {
-        "_aws": {
-            "Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-            "CloudWatchMetrics": [
-                {
-                    "Namespace": "K3sAutoscaler",
-                    "Dimensions": [["Cluster", "k3s-cluster"]],
-                    "Metrics": [
-                        {"Name": "WorkerCPU", "Unit": "Percent"},
-                        {"Name": "WorkerMemory", "Unit": "Percent"},
-                        {"Name": "MasterCPU", "Unit": "Percent"},
-                        {"Name": "MasterMemory", "Unit": "Percent"},
-                        {"Name": "PendingPods", "Unit": "Count"},
-                        {"Name": "WorkerCount", "Unit": "Count"},
-                        {"Name": "ReadyNodes", "Unit": "Count"},
-                        {"Name": "TotalNodes", "Unit": "Count"},
-                    ]
-                }
-            ],
+    cloudwatch = boto3.client("cloudwatch")
+
+    # Build metric data list
+    metric_data = [
+        # Worker metrics
+        {
+            "MetricName": "WorkerCPU",
+            "Value": metrics.worker_cpu_percent_avg,
+            "Unit": "Percent",
+            "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
         },
-        "Cluster": "k3s-cluster",
-        "WorkerCPU": metrics.cpu_percent,
-        "WorkerMemory": metrics.memory_percent,
-        "MasterCPU": metrics.master_cpu_percent,
-        "MasterMemory": metrics.master_memory_percent,
-        "PendingPods": metrics.pending_pods,
-        "WorkerCount": metrics.worker_count,
-        "ReadyNodes": metrics.ready_nodes,
-        "TotalNodes": metrics.total_nodes,
-        "Hostname": socket.gethostname(),
-    }
+        {
+            "MetricName": "WorkerMemory",
+            "Value": metrics.worker_memory_percent_avg,
+            "Unit": "Percent",
+            "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+        },
+        # Master metrics
+        {
+            "MetricName": "MasterCPU",
+            "Value": metrics.master_cpu_percent,
+            "Unit": "Percent",
+            "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+        },
+        {
+            "MetricName": "MasterMemory",
+            "Value": metrics.master_memory_percent,
+            "Unit": "Percent",
+            "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+        },
+        # Pod metrics
+        {
+            "MetricName": "PendingPods",
+            "Value": metrics.pending_pods,
+            "Unit": "Count",
+            "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+        },
+        # Node metrics
+        {
+            "MetricName": "WorkerCount",
+            "Value": metrics.worker_count,
+            "Unit": "Count",
+            "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+        },
+        {
+            "MetricName": "ReadyNodes",
+            "Value": metrics.ready_nodes,
+            "Unit": "Count",
+            "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+        },
+        {
+            "MetricName": "TotalNodes",
+            "Value": metrics.total_nodes,
+            "Unit": "Count",
+            "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+        },
+    ]
 
-    # Pretty-print EMF metrics for readability (CloudWatch still parses it correctly)
-    # logger.info(json.dumps(emf_metrics, indent=2), extra={"aws_emf": True})
+    try:
+        cloudwatch.put_metric_data(
+            Namespace="K3sAutoscaler",
+            MetricData=metric_data,
+        )
+        logger.debug(f"Published {len(metric_data)} metrics to CloudWatch")
+    except Exception as e:
+        logger.warning(f"Failed to publish CloudWatch metrics: {e}")
 
 
 def lambda_handler(event: dict, context: Any) -> dict:
@@ -166,8 +198,8 @@ def lambda_handler(event: dict, context: Any) -> dict:
             metrics = prometheus.get_cluster_metrics()
 
             # Log to console
-            logger.info(f"Worker Metrics: CPU={metrics.cpu_percent:.1f}%, "
-                       f"Memory={metrics.memory_percent:.1f}%, "
+            logger.info(f"Worker Metrics: CPU={metrics.worker_cpu_percent_avg:.1f}%, "
+                       f"Memory={metrics.worker_memory_percent_avg:.1f}%, "
                        f"Count={metrics.worker_count}")
             logger.info(f"Master Metrics: CPU={metrics.master_cpu_percent:.1f}%, "
                        f"Memory={metrics.master_memory_percent:.1f}%")
@@ -186,7 +218,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
             if decision.action == ScalingAction.SCALE_UP:
                 result = _execute_scale_up(ec2_ops, wal, state_manager, decision, metrics)
             elif decision.action == ScalingAction.SCALE_DOWN:
-                result = _execute_scale_down(ec2_ops, wal, state_manager, decision)
+                result = _execute_scale_down(ec2_ops, wal, state_manager, decision, ec2_client)
             else:
                 result = {"message": decision.reason}
 
@@ -346,6 +378,7 @@ def _execute_scale_down(
     wal: WriteAheadLog,
     state_manager: StateManager,
     decision: ScalingDecision,
+    ec2_client,
 ) -> dict:
     """Execute scale-down operation.
 
@@ -354,6 +387,7 @@ def _execute_scale_down(
         wal: Write-ahead log
         state_manager: State manager
         decision: Scaling decision
+        ec2_client: EC2 client for kubectl operations
 
     Returns:
         Result dictionary
@@ -385,8 +419,28 @@ def _execute_scale_down(
         instance_id = instance["InstanceId"]
         logger.info(f"Selected instance for termination: {instance_id}")
 
-        # TODO: Execute kubectl drain before termination
-        # This requires kubectl access to the cluster
+        # Execute kubectl drain before termination via SSM
+        kubectl = KubectlViaSSM(ec2_client=ec2_client)
+        node_name = kubectl.get_node_name_from_instance_id(instance_id)
+
+        if node_name:
+            logger.info(f"Draining Kubernetes node: {node_name}")
+            drain_result = kubectl.drain_node(node_name, timeout=120, delete_node=True)
+
+            if drain_result["status"] == "Success":
+                logger.info(f"Successfully drained node {node_name}")
+            else:
+                logger.warning(
+                    f"Node drain had issues: {drain_result.get('status', 'Unknown')}. "
+                    f"Continuing with termination."
+                )
+                if drain_result.get("stderr"):
+                    logger.warning(f"Drain stderr: {drain_result['stderr']}")
+        else:
+            logger.warning(
+                f"Could not determine node name for instance {instance_id}, "
+                f"skipping drain and proceeding with termination"
+            )
 
         # Terminate instance
         ec2_ops.terminate_instance(instance_id)

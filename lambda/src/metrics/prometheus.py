@@ -31,6 +31,8 @@ class ClusterMetrics:
     ready_nodes: int  # Number of Ready nodes (all nodes)
     total_nodes: int  # Total number of nodes (all nodes)
     worker_count: int  # Number of worker nodes only
+    worker_cpu_percent_avg: float  # Worker node CPU usage
+    worker_memory_percent_avg: float  # Worker node memory usage
     master_cpu_percent: float  # Master node CPU usage
     master_memory_percent: float  # Master node memory usage
     timestamp: str  # ISO timestamp of metrics collection
@@ -44,6 +46,8 @@ class ClusterMetrics:
             "ready_nodes": self.ready_nodes,
             "total_nodes": self.total_nodes,
             "worker_count": self.worker_count,
+            "worker_cpu_percent_avg": self.worker_cpu_percent_avg,
+            "worker_memory_percent_avg": self.worker_memory_percent_avg,
             "master_cpu_percent": self.master_cpu_percent,
             "master_memory_percent": self.master_memory_percent,
             "timestamp": self.timestamp,
@@ -219,6 +223,8 @@ class PrometheusClient:
             ready_nodes=ready_nodes,
             total_nodes=total_nodes,
             worker_count=worker_count,
+            worker_cpu_percent_avg=worker_cpu_percent,
+            worker_memory_percent_avg=worker_memory_percent,
             master_cpu_percent=master_cpu_percent,
             master_memory_percent=master_memory_percent,
             timestamp=datetime.now(timezone.utc).isoformat(),

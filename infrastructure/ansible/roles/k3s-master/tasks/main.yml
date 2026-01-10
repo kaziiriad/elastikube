@@ -40,56 +40,6 @@
   loop: "{{ groups['workers'] }}"
   run_once: true
 
-# Store cluster info in S3 for autoscaler Lambda
-- name: Upload k3s token to S3 for autoscaler
-  aws_s3:
-    bucket: "{{ s3_bucket_name }}"
-    object: /k3s-token
-    content: "{{ k3s_token.stdout }}"
-    mode: put
-  environment:
-    AWS_ACCESS_KEY_ID: "{{ aws_access_key | default(omit) }}"
-    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key | default(omit) }}"
-    AWS_DEFAULT_REGION: "{{ aws_region | default('ap-southeast-1') }}"
-  ignore_errors: true  # May fail if no AWS creds on instance
-
-- name: Upload master IP to S3 for autoscaler
-  aws_s3:
-    bucket: "{{ s3_bucket_name }}"
-    object: /master-ip
-    content: "{{ master_ip.stdout }}"
-    mode: put
-  environment:
-    AWS_ACCESS_KEY_ID: "{{ aws_access_key | default(omit) }}"
-    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key | default(omit) }}"
-    AWS_DEFAULT_REGION: "{{ aws_region | default('ap-southeast-1') }}"
-  ignore_errors: true
-
-# Store cluster info in SSM Parameter Store and Secrets Manager
-- name: Store master IP in SSM Parameter Store
-  aws_ssm_parameter_store:
-    name: "/k3s/production-k3s/master-ip"
-    value: "{{ master_ip.stdout }}"
-    string_type: "String"
-    region: "{{ aws_region | default('ap-southeast-1') }}"
-  environment:
-    AWS_ACCESS_KEY_ID: "{{ aws_access_key | default(omit) }}"
-    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key | default(omit) }}"
-    AWS_DEFAULT_REGION: "{{ aws_region | default('ap-southeast-1') }}"
-  ignore_errors: true
-
-- name: Store k3s join token in Secrets Manager
-  aws_secret:
-    name: "k3s-production-k3s-join-token"
-    secret: "{{ k3s_token.stdout }}"
-    region: "{{ aws_region | default('ap-southeast-1') }}"
-    state: present
-  environment:
-    AWS_ACCESS_KEY_ID: "{{ aws_access_key | default(omit) }}"
-    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key | default(omit) }}"
-    AWS_DEFAULT_REGION: "{{ aws_region | default('ap-southeast-1') }}"
-  ignore_errors: true
-
 # ==========================================
 # Deploy Monitoring Stack (node-exporter + Prometheus)
 # ==========================================

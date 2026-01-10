@@ -45,16 +45,16 @@ class ClusterCredentials:
 
 
 def get_cluster_credentials(
-    ssm_client: Optional[boto3.client] = None,
+    ec2_client: Optional[boto3.client] = None,
     secrets_client: Optional[boto3.client] = None,
 ) -> Optional[ClusterCredentials]:
     """Fetch K3s cluster credentials from AWS services.
 
-    Retrieves the master IP from SSM Parameter Store and join token from
-    Secrets Manager. These are populated by Ansible during initial cluster setup.
+    Retrieves the master IP from EC2 (by tag) and join token from
+    Secrets Manager. The join token is populated by Ansible during setup.
 
     Args:
-        ssm_client: Optional boto3 SSM client
+        ec2_client: Optional boto3 EC2 client
         secrets_client: Optional boto3 Secrets Manager client
 
     Returns:
@@ -66,25 +66,32 @@ def get_cluster_credentials(
     config = get_config()
 
     # Initialize clients if not provided
-    if ssm_client is None:
-        ssm_client = boto3.client("ssm")
+    if ec2_client is None:
+        ec2_client = boto3.client("ec2")
     if secrets_client is None:
         secrets_client = boto3.client("secretsmanager")
 
     try:
-        # Fetch master IP from SSM Parameter Store
-        parameter_name = f"/k3s/{config.cluster_name}/master-ip"
-        logger.info(f"Fetching master IP from SSM: {parameter_name}")
+        # Fetch master IP from EC2 by tag
+        logger.info("Fetching master IP from EC2 (by tag: k3s-master)")
 
-        ssm_response = ssm_client.get_parameter(
-            Name=parameter_name,
-            WithDecryption=False,  # Not encrypted, just plaintext
+        ec2_response = ec2_client.describe_instances(
+            Filters=[
+                {"Name": "tag:Name", "Values": ["k3s-master"]},
+                {"Name": "instance-state-name", "Values": ["running"]},
+            ]
         )
 
-        master_ip = ssm_response["Parameter"]["Value"]
+        reservations = ec2_response.get("Reservations", [])
+        if not reservations or not reservations[0].get("Instances"):
+            logger.error("No running master instance found with tag 'k3s-master'")
+            return None
 
-        if master_ip == "PENDING":
-            logger.warning("Master IP parameter is PENDING - cluster may not be fully setup")
+        master_instance = reservations[0]["Instances"][0]
+        master_ip = master_instance.get("PrivateIpAddress")
+
+        if not master_ip:
+            logger.error("Master instance has no private IP")
             return None
 
         logger.info(f"Retrieved master IP: {master_ip}")
@@ -115,9 +122,6 @@ def get_cluster_credentials(
             join_token=join_token,
         )
 
-    except ssm_client.exceptions.ParameterNotFound:
-        logger.error(f"SSM parameter not found: {parameter_name}")
-        return None
     except secrets_client.exceptions.ResourceNotFoundException:
         logger.error(f"Secrets Manager secret not found: {secret_name}")
         return None

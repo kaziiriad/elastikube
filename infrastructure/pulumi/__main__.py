@@ -330,11 +330,13 @@ master_ip_parameter = ssm.Parameter(
 )
 
 # Secrets Manager Secret for K3s Join Token (sensitive data)
+# Note: recovery_window_in_days=0 for immediate cleanup during pulumi destroy
 k3s_join_token_secret = secretsmanager.Secret(
     "k3s-join-token",
     name=f"k3s-{cluster_name}-join-token",
     description="K3s cluster join token for worker nodes",
     tags={**common_tags, "Name": "k3s-join-token-secret"},
+    recovery_window_in_days=0,  # Immediate deletion, no recovery window (dev/test)
 )
 
 # Secret version (initial value, will be updated by Ansible)
@@ -435,7 +437,12 @@ autoscaler_policy = iam.RolePolicy(
             },
             # Secrets Manager Permissions
             {
-                "actions": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+                "actions": [
+                    "secretsmanager:GetSecretValue",
+                    "secretsmanager:DescribeSecret",
+                    "secretsmanager:DeleteSecret",
+                    "secretsmanager:UpdateSecretVersionStage",
+                ],
                 "resources": [f"arn:aws:secretsmanager:{region}:*:secret:k3s-*-*"],
                 "effect": "Allow",
             },

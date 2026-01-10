@@ -20,6 +20,14 @@
       - python3-pip
     state: present
 
+- name: Install boto3 for AWS integration
+  pip:
+    name:
+      - boto3
+      - botocore
+    executable: pip3
+    state: present
+
 - name: Install Helm
   shell: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
   changed_when: false
