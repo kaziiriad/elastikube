@@ -538,6 +538,29 @@ worker_instance_profile = iam.InstanceProfile(
 )
 
 # =============================================================================
+# Master Node IAM Role (for SSM access - kubectl drain)
+# =============================================================================
+master_role = iam.Role(
+    "k3s-master-node-role",
+    assume_role_policy=ec2_assume_role.json,
+    tags={**common_tags, "Name": "k3s-master-node-role"}
+)
+
+# Attach SSM managed policy for Session Manager (kubectl drain via SSM)
+master_ssm_policy_attachment = iam.RolePolicyAttachment(
+    "k3s-master-ssm-policy",
+    role=master_role.name,
+    policy_arn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+)
+
+# Instance Profile for master node
+master_instance_profile = iam.InstanceProfile(
+    "k3s-master-instance-profile",
+    role=master_role.name,
+    tags={**common_tags, "Name": "k3s-master-instance-profile"}
+)
+
+# =============================================================================
 # EC2 Instances
 # =============================================================================
 # Note: These are initial seed instances. The autoscaler Lambda will
@@ -567,6 +590,7 @@ master_instance = ec2.Instance(
     subnet_id=private_subnet.id,  # Private subnet for security
     vpc_security_group_ids=[security_group.id],
     associate_public_ip_address=False,  # No public IP
+    iam_instance_profile=master_instance_profile.name,  # SSM access for kubectl drain
     key_name=existing_key_name,
     tags={**common_tags, 'Name': 'k3s-master', 'NodeRole': 'master'}
 )
@@ -777,6 +801,7 @@ pulumi.export("lambda_role_arn", lambda_role.arn)
 pulumi.export("lambda_function_arn", lambda_function.arn)
 pulumi.export("lambda_function_name", lambda_function.name)
 pulumi.export("worker_instance_profile", worker_instance_profile.name)
+pulumi.export("master_instance_profile", master_instance_profile.name)
 pulumi.export("cloudwatch_log_group", lambda_log_group.name)
 pulumi.export("event_rule_arn", event_rule.arn)
 pulumi.export("cloudwatch_dashboard", autoscaler_dashboard.dashboard_name)
