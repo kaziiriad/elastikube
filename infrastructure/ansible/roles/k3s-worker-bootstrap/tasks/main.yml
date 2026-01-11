@@ -1,6 +1,7 @@
 ---
 # K3s Worker Bootstrap Role Tasks
 # This role renders and deploys the worker bootstrap script to S3
+# Uses AWS CLI instead of boto3 modules for broader compatibility
 
 - name: Display deployment configuration
   debug:
@@ -8,16 +9,20 @@
       - "Cluster: {{ cluster_name }}"
       - "Region: {{ aws_region }}"
       - "S3 Bucket: {{ s3_bucket }}"
-      - "Join Token Suffix: {{ join_token_suffix }}"
+      - "S3 Key: {{ s3_key }}"
+      - "Secret Name: k3s-{{ cluster_name }}-join-token"
 
-- name: Create S3 bucket for user-data scripts
-  amazon.aws.s3_bucket:
-    name: "{{ s3_bucket }}"
-    state: present
-    region: "{{ aws_region }}"
-    tags:
-      Cluster: "{{ cluster_name }}"
-      Purpose: k3s-worker-userdata
+- name: Check if S3 bucket exists (created by Pulumi)
+  ansible.builtin.command:
+    cmd: aws s3 ls s3://{{ s3_bucket }} --region {{ aws_region }}
+  register: bucket_check
+  changed_when: false
+  ignore_errors: true
+
+- name: Fail if bucket doesn't exist
+  ansible.builtin.fail:
+    msg: "S3 bucket {{ s3_bucket }} does not exist. Run pulumi up first."
+  when: bucket_check.rc != 0
 
 - name: Render worker bootstrap user-data script
   ansible.builtin.template:
@@ -26,18 +31,15 @@
     mode: '0755'
 
 - name: Upload rendered user-data to S3
-  amazon.aws.s3_object:
-    bucket: "{{ s3_bucket }}"
-    object: "{{ s3_key }}"
-    src: "/tmp/worker-bootstrap-{{ cluster_name }}.sh"
-    mode: put
-    permissions: public-read
+  ansible.builtin.command:
+    cmd: aws s3 cp /tmp/worker-bootstrap-{{ cluster_name }}.sh s3://{{ s3_bucket }}/{{ s3_key }} --region {{ aws_region }}
+  register: upload_result
 
 - name: Display S3 URL
   debug:
     msg: "User-data script uploaded to: https://{{ s3_bucket }}.s3.{{ aws_region }}.amazonaws.com/{{ s3_key }}"
 
-- name: Save configuration for Lambda/Pulumi
+- name: Save configuration for reference
   ansible.builtin.copy:
     dest: "{{ playbook_dir }}/worker-bootstrap-config.json"
     content: |

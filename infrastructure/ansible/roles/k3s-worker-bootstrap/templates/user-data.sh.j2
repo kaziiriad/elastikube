@@ -6,7 +6,7 @@ set -e
 
 CLUSTER_NAME="{{ cluster_name }}"
 AWS_REGION="{{ aws_region }}"
-SECRET_NAME="k3s-${CLUSTER_NAME}-join-token-{{ join_token_suffix }}"
+SECRET_NAME="k3s-${CLUSTER_NAME}-join-token"
 SSM_MASTER_IP="/k3s/${CLUSTER_NAME}/master-ip"
 
 echo "=== K3s Worker Node Bootstrap ==="
