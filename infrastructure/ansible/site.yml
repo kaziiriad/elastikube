@@ -16,6 +16,9 @@
   gather_facts: true
   roles:
     - k3s-master
+  vars:
+    cluster_name: production-k3s
+    aws_region: ap-southeast-1
 
 - hosts: workers
   become: true

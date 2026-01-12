@@ -82,6 +82,7 @@ class ScalingEngine:
         current_nodes = metrics.total_nodes
 
         # Check cooldown periods
+        # Scale-up cooldown blocks ALL scale-up operations
         if state.is_in_cooldown(self._config.scale_up_cooldown):
             return ScalingDecision(
                 action=ScalingAction.NO_OP,
@@ -93,18 +94,8 @@ class ScalingEngine:
                 pending_pods=metrics.pending_pods,
             )
 
-        if state.is_in_cooldown(self._config.scale_down_cooldown):
-            return ScalingDecision(
-                action=ScalingAction.NO_OP,
-                reason=f"In scale-down cooldown ({self._config.scale_down_cooldown}s)",
-                current_nodes=current_nodes,
-                target_nodes=current_nodes,
-                cpu_percent=metrics.worker_cpu_percent_avg,
-                memory_percent=metrics.worker_memory_percent_avg,
-                pending_pods=metrics.pending_pods,
-            )
-
-        # Check scale-up conditions (using worker metrics only)
+        # Check scale-up conditions FIRST (before scale-down cooldown)
+        # Pending pods should ALWAYS trigger scale-up, regardless of scale-down cooldown
         cpu_trigger = metrics.worker_cpu_percent_avg >= self._config.scale_up_threshold
         pods_trigger = metrics.pending_pods >= 1
 
@@ -120,6 +111,18 @@ class ScalingEngine:
                 reason=reason,
                 current_nodes=current_nodes,
                 target_nodes=current_nodes + 1,
+                cpu_percent=metrics.worker_cpu_percent_avg,
+                memory_percent=metrics.worker_memory_percent_avg,
+                pending_pods=metrics.pending_pods,
+            )
+
+        # Check scale-down cooldown (only blocks scale-down, not scale-up)
+        if state.is_in_cooldown(self._config.scale_down_cooldown):
+            return ScalingDecision(
+                action=ScalingAction.NO_OP,
+                reason=f"In scale-down cooldown ({self._config.scale_down_cooldown}s)",
+                current_nodes=current_nodes,
+                target_nodes=current_nodes,
                 cpu_percent=metrics.worker_cpu_percent_avg,
                 memory_percent=metrics.worker_memory_percent_avg,
                 pending_pods=metrics.pending_pods,

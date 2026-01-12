@@ -1,41 +1,4 @@
 ---
-# ==========================================
-# Install AWS SSM Agent (required for kubectl drain via Lambda)
-# ==========================================
-
-- name: Create /tmp/ssm directory
-  file:
-    path: /tmp/ssm
-    state: directory
-    mode: '0755'
-
-- name: Download SSM Agent installer
-  shell: |
-    curl -o /tmp/ssm/amazon-ssm-agent.deb \
-      "https://s3.ap-southeast-1.amazonaws.com/amazon-ssm-ap-southeast-1/latest/debian_amd64/amazon-ssm-agent.deb"
-  args:
-    creates: /tmp/ssm/amazon-ssm-agent.deb
-  ignore_errors: true
-
-- name: Install SSM Agent
-  shell: dpkg -i /tmp/ssm/amazon-ssm-agent.deb || apt-get install -f -y
-  ignore_errors: true
-
-- name: Ensure SSM Agent is enabled and running
-  systemd:
-    name: amazon-ssm-agent
-    state: started
-    enabled: true
-  ignore_errors: true
-
-- name: Display SSM Agent status
-  shell: systemctl status amazon-ssm-agent || echo "SSM Agent not running"
-  register: ssm_status
-  changed_when: false
-
-- name: Show SSM Agent status
-  debug:
-    msg: "{{ ssm_status.stdout_lines }}"
 
 # ==========================================
 # K3s Master node setup
@@ -74,7 +37,7 @@
 
 - name: Store K3s join token to Secrets Manager
   shell: |
-    SECRET_NAME="k3s-production-k3s-join-token-IdOHFA"
+    SECRET_NAME="k3s-${CLUSTER_NAME}-join-token"
     TOKEN="{{ k3s_token.stdout }}"
 
     # Store token in Secrets Manager
@@ -86,10 +49,35 @@
   changed_when: true
   register: secret_store_result
   ignore_errors: true
+  environment:
+    CLUSTER_NAME: "{{ cluster_name | default('production-k3s') }}"
 
 - name: Show Secrets Manager storage result
   debug:
     msg: "Token stored to Secrets Manager: {{ 'Success' if secret_store_result.rc == 0 else 'Failed (may need permissions)' }}"
+
+- name: Store master IP to SSM Parameter Store
+  shell: |
+    SSM_PARAM="/k3s/${CLUSTER_NAME}/master-ip"
+    MASTER_IP="{{ master_ip.stdout }}"
+
+    # Store master IP in SSM Parameter Store
+    aws ssm put-parameter \
+      --name "$SSM_PARAM" \
+      --value "$MASTER_IP" \
+      --type String \
+      --overwrite \
+      --region "{{ aws_region }}" \
+      2>&1 | grep -v "^$"
+  changed_when: true
+  register: ssm_store_result
+  ignore_errors: true
+  environment:
+    CLUSTER_NAME: "{{ cluster_name | default('production-k3s') }}"
+
+- name: Show SSM Parameter storage result
+  debug:
+    msg: "Master IP stored to SSM: {{ 'Success' if ssm_store_result.rc == 0 else 'Failed (may need permissions)' }}"
 
 - name: Set master IP as fact for workers
   set_fact:
@@ -248,3 +236,68 @@
     msg:
       - "kube-state-metrics Pods:"
       - "{{ ksm_status.stdout_lines }}"
+
+# ==========================================
+# Install AWS SSM Agent (required for kubectl drain via Lambda)
+# ==========================================
+
+- name: Check if SSM Agent is installed
+  shell: |
+    if snap list amazon-ssm-agent 2>/dev/null | grep -q amazon-ssm-agent; then
+      echo "snap"
+    elif dpkg -l | grep -q amazon-ssm-agent; then
+      echo "apt"
+    else
+      echo "not_installed"
+    fi
+  register: ssm_check
+  changed_when: false
+
+- name: Install SSM Agent via apt if not installed
+  block:
+    - name: Creating SSM directory in tmp
+      file:
+        path: /tmp/ssm
+        state: directory
+        mode: '0755'
+
+    - name: Install deb file for Debian family 32/64-bit
+      apt:
+        deb: https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/debian_amd64/amazon-ssm-agent.deb
+        state: present
+  when: ssm_check.stdout == "not_installed"
+
+- name: Ensure SSM Agent is running
+  systemd:
+    name: amazon-ssm-agent
+    state: started
+    enabled: yes
+  ignore_errors: true
+  register: ssm_service
+
+- name: Check SSM Agent status
+  shell: |
+    if systemctl is-active amazon-ssm-agent >/dev/null 2>&1; then
+      echo "SSM Agent is running via systemd"
+      systemctl status amazon-ssm-agent --no-pager | head -3
+    elif snap list amazon-ssm-agent 2>/dev/null | grep -q amazon-ssm-agent; then
+      echo "SSM Agent installed via snap, checking process..."
+      if pgrep -f "amazon-ssm-agent" >/dev/null; then
+        echo "SSM Agent process is running"
+        ps aux | grep "[a]mazon-ssm-agent" | head -2
+      else
+        echo "Starting SSM Agent via snap..."
+        snap start amazon-ssm-agent || true
+        sleep 2
+        systemctl start snap.amazon-ssm-agent.amazon-ssm-agent || true
+      fi
+    else
+      echo "SSM Agent not found"
+      exit 1
+    fi
+  register: ssm_status
+  changed_when: false
+
+- name: Display SSM Agent status
+  debug:
+    msg: "{{ ssm_status.stdout_lines }}"

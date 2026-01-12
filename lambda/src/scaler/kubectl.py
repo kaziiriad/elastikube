@@ -318,3 +318,110 @@ class KubectlViaSSM:
         except ClientError as e:
             logger.error(f"Failed to describe instance {instance_id}: {e}")
             return None
+
+    def wait_for_node_ready(
+        self,
+        instance_id: str,
+        timeout: int = 300,
+        poll_interval: int = 10,
+    ) -> dict:
+        """Wait for a new worker node to join the cluster and become Ready.
+
+        Polls Kubernetes via SSM to check if the node has joined and is Ready.
+        The node name is derived from the instance's private IP.
+
+        Args:
+            instance_id: EC2 instance ID of the new worker
+            timeout: Maximum time to wait in seconds (default: 5 minutes)
+            poll_interval: Seconds between polls (default: 10 seconds)
+
+        Returns:
+            Dict with status ("Success", "TimedOut", "Failed"), node_name, and details
+        """
+        start_time = time.time()
+
+        # First, get the expected node name from the instance ID
+        node_name = self.get_node_name_from_instance_id(instance_id)
+        if not node_name:
+            return {
+                "status": "Failed",
+                "error": f"Could not determine node name for instance {instance_id}"
+            }
+
+        logger.info(f"Waiting for node {node_name} (instance {instance_id}) to join and be Ready...")
+
+        while time.time() - start_time < timeout:
+            try:
+                # Check if node exists and is Ready via kubectl
+                master_instance_id = self._get_master_instance_id()
+                if not master_instance_id:
+                    return {"status": "Failed", "error": "Could not find k3s-master instance"}
+
+                # kubectl command to check node status
+                check_cmd = (
+                    f"#!/bin/bash\n"
+                    f"sudo kubectl get node {node_name} -o json 2>/dev/null || echo 'NODE_NOT_FOUND'"
+                )
+
+                response = self._ssm_client.send_command(
+                    InstanceIds=[master_instance_id],
+                    DocumentName="AWS-RunShellScript",
+                    Parameters={"commands": [check_cmd]},
+                    TimeoutSeconds=30,
+                )
+
+                command_id = response["Command"]["CommandId"]
+                result = self._wait_for_command(
+                    command_id=command_id,
+                    instance_id=master_instance_id,
+                    timeout=30,
+                )
+
+                if result["status"] == "Success":
+                    stdout = result.get("stdout", "")
+
+                    # Check if node was found
+                    if "NODE_NOT_FOUND" in stdout:
+                        logger.info(f"Node {node_name} not yet joined cluster (elapsed: {int(time.time() - start_time)}s)")
+                    else:
+                        # Parse JSON to check node status
+                        try:
+                            import json
+                            node_data = json.loads(stdout)
+
+                            # Check for Ready condition
+                            for condition in node_data.get("status", {}).get("conditions", []):
+                                if condition.get("type") == "Ready":
+                                    is_ready = condition.get("status") == "True"
+                                    if is_ready:
+                                        logger.info(f"✓ Node {node_name} is Ready!")
+                                        return {
+                                            "status": "Success",
+                                            "node_name": node_name,
+                                            "instance_id": instance_id,
+                                            "elapsed_seconds": int(time.time() - start_time),
+                                        }
+                                    else:
+                                        logger.info(f"Node {node_name} exists but not Ready yet "
+                                                  f"(reason: {condition.get('reason', 'unknown')})")
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse kubectl output as JSON")
+
+                elif result["status"] == "Failed":
+                    logger.warning(f"kubectl command failed: {result.get('stderr', result)}")
+
+            except ClientError as e:
+                logger.error(f"Failed to check node status: {e}")
+
+            time.sleep(poll_interval)
+
+        # Timeout reached
+        elapsed = int(time.time() - start_time)
+        logger.error(f"Node {node_name} did not become Ready within {timeout}s (elapsed: {elapsed}s)")
+        return {
+            "status": "TimedOut",
+            "node_name": node_name,
+            "instance_id": instance_id,
+            "elapsed_seconds": elapsed,
+            "error": f"Node did not join cluster within {timeout}s",
+        }

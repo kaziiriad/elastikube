@@ -183,14 +183,36 @@ def lambda_handler(event: dict, context: Any) -> dict:
             incomplete = wal.get_incomplete_operations()
             if incomplete:
                 logger.warning(f"Found {len(incomplete)} incomplete operations")
-                # TODO: Implement crash recovery logic
-                return {
-                    "statusCode": 200,
-                    "body": json.dumps({
-                        "message": "Incomplete operations found, skipping new scaling",
-                        "incomplete_count": len(incomplete),
-                    }),
-                }
+                for entry in incomplete:
+                    started_at = datetime.fromisoformat(entry.started_at)
+                    # Add UTC timezone if not present
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    age_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+                    logger.warning(f"  - Operation: {entry.operation_id}, Type: {entry.operation_type.value}, "
+                                 f"Age: {age_seconds:.0f}s, Started: {entry.started_at}")
+                    # Mark stale operations (older than 10 minutes) as FAILED
+                    if age_seconds > 600:  # 10 minutes
+                        logger.info(f"Marking stale operation {entry.operation_id} as FAILED")
+                        wal.update_entry(
+                            entry.operation_id,
+                            OperationState.FAILED,
+                            error_message=f"Crash recovery: operation stalled for {age_seconds:.0f}s",
+                            started_at=entry.started_at,
+                        )
+                # Re-check incomplete operations after cleanup
+                incomplete = wal.get_incomplete_operations()
+                if incomplete:
+                    logger.warning(f"Still have {len(incomplete)} incomplete operations (may be recent)")
+                    # Only return if incomplete operations are still recent (< 10 minutes)
+                    return {
+                        "statusCode": 200,
+                        "body": json.dumps({
+                            "message": "Recent incomplete operations found, skipping new scaling",
+                            "incomplete_count": len(incomplete),
+                        }),
+                    }
+                logger.info("All stale incomplete operations cleaned up, proceeding with scaling")
 
             # Step 4: Fetch cluster metrics
             logger.info("Fetching cluster metrics from Prometheus...")
@@ -216,16 +238,20 @@ def lambda_handler(event: dict, context: Any) -> dict:
             # Step 6: Execute scaling action
             if decision.action == ScalingAction.SCALE_UP:
                 result = _execute_scale_up(ec2_ops, wal, state_manager, decision, metrics)
+                # State is already updated inside _execute_scale_up with new_node_count
             elif decision.action == ScalingAction.SCALE_DOWN:
+                # Create EC2 and SSM clients for scale-down (kubectl drain via SSM)
+                import boto3
+                ec2_client = boto3.client("ec2")
                 result = _execute_scale_down(ec2_ops, wal, state_manager, decision, ec2_client)
+                # State is already updated inside _execute_scale_down with new_node_count
             else:
                 result = {"message": decision.reason}
-
-            # Step 7: Update cluster state
-            updated_state = state_manager.update_state(
-                node_count=metrics.total_nodes,
-                scaling_in_progress=False,
-            )
+                # For NO_OP, update state to clear scaling_in_progress and sync node count
+                updated_state = state_manager.update_state(
+                    node_count=metrics.total_nodes,
+                    scaling_in_progress=False,
+                )
 
             return {
                 "statusCode": 200,
@@ -340,8 +366,29 @@ def _execute_scale_up(
         else:
             logger.warning(f"Instance {instance_id} readiness timeout")
 
-        # TODO: Wait for K3s node to join and be Ready
-        # This requires kubectl access to the cluster
+        # Wait for K3s node to join and be Ready
+        import boto3
+        from scaler.kubectl import KubectlViaSSM
+
+        # Create new SSM client for kubectl operations
+        ssm_client = boto3.client("ssm")
+        ec2_client = boto3.client("ec2")
+        kubectl = KubectlViaSSM(ec2_client=ec2_client, ssm_client=ssm_client)
+
+        logger.info(f"Waiting for K3s node to join cluster...")
+        node_ready_result = kubectl.wait_for_node_ready(instance_id, timeout=300)
+
+        if node_ready_result["status"] == "Success":
+            logger.info(f"✓ Node {node_ready_result['node_name']} joined and Ready "
+                       f"in {node_ready_result['elapsed_seconds']}s")
+        elif node_ready_result["status"] == "TimedOut":
+            logger.error(f"Node did not become Ready in time: {node_ready_result.get('error')}")
+            # Still mark as succeeded - EC2 launched successfully, node join may complete later
+            logger.warning(f"Proceeding with scale-up completion (node may join asynchronously)")
+        else:  # Failed
+            logger.error(f"Failed to wait for node ready: {node_ready_result.get('error')}")
+            # Still mark as succeeded - EC2 launched successfully
+            logger.warning(f"Proceeding with scale-up completion (node status check failed)")
 
         # Update WAL: succeeded
         wal.update_entry(wal_entry.operation_id, OperationState.SUCCEEDED, started_at=wal_entry.started_at)
@@ -352,6 +399,7 @@ def _execute_scale_up(
             scaling_in_progress=False,
             last_scale_operation="SCALE_UP",
         )
+        logger.info(f"✓ State updated: node_count={new_state.node_count} (was {decision.current_nodes})")
 
         return {
             "instance_id": instance_id,
