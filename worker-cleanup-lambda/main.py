@@ -38,6 +38,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
             - 'drain': Drain a worker node (kubectl drain via SSM)
             - 'terminate': Terminate a worker instance
             - 'scale_down': Select and terminate a non-permanent worker (LIFO)
+            - 'clean_stale_nodes': Remove NotReady nodes from Kubernetes cluster
         context: Lambda context
 
     Returns:
@@ -77,6 +78,8 @@ def lambda_handler(event: dict, context: Any) -> dict:
             return _terminate_worker(instance_id)
         elif action == "scale_down":
             return _scale_down()
+        elif action == "clean_stale_nodes":
+            return _clean_stale_nodes()
         else:
             return {
                 "statusCode": 400,
@@ -321,6 +324,109 @@ def _drain_worker(instance_id: str) -> dict:
         }
 
 
+def _uninstall_k3s_worker(instance_id: str) -> dict:
+    """Uninstall K3s agent from worker before termination.
+
+    This runs k3s-agent-uninstall.sh on the worker to ensure clean
+    removal from the Kubernetes cluster.
+    """
+    logger.info(f"Uninstalling K3s agent from: {instance_id}")
+
+    ssm_client = boto3.client("ssm")
+
+    uninstall_command = "sudo /usr/local/bin/k3s-agent-uninstall.sh"
+
+    logger.info(f"Executing uninstall script via SSM on worker")
+    try:
+        ssm_response = ssm_client.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [uninstall_command]},
+            TimeoutSeconds=60,
+        )
+
+        command_id = ssm_response["Command"]["CommandId"]
+        logger.info(f"SSM Command ID: {command_id}")
+
+        # Wait for command to complete
+        import time
+        time.sleep(5)  # Initial wait
+
+        max_attempts = 12  # 1 minute (5 second intervals)
+        for attempt in range(max_attempts):
+            try:
+                result = ssm_client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=instance_id,
+                )
+
+                status = result["Status"]
+                logger.info(f"Uninstall attempt {attempt + 1}/{max_attempts}: status={status}")
+
+                if status in ["Success", "Failed", "TimedOut", "Cancelled"]:
+                    break
+
+                time.sleep(5)
+            except ClientError as e:
+                logger.warning(f"Uninstall attempt {attempt + 1}/{max_attempts}: SSM error - {e}")
+                time.sleep(5)
+
+        # Get final result
+        try:
+            result = ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id,
+            )
+
+            stdout = result.get("StandardOutputContent", "")
+            stderr = result.get("StandardErrorContent", "")
+            status = result["Status"]
+
+            logger.info(f"Uninstall command status: {status}")
+
+            if status == "Success":
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({
+                        "message": f"K3s agent uninstalled successfully",
+                        "instance_id": instance_id,
+                        "status": status,
+                        "output": stdout[-500:] if len(stdout) > 500 else stdout,
+                    }),
+                }
+            else:
+                # Log warning but don't fail - instance will still be terminated
+                logger.warning(f"Uninstall failed with status: {status}, stderr: {stderr[-200:]}")
+                return {
+                    "statusCode": 200,  # Don't fail termination
+                    "body": json.dumps({
+                        "message": f"Uninstall completed with status: {status}",
+                        "instance_id": instance_id,
+                        "status": status,
+                        "note": "Proceeding with termination",
+                    }),
+                }
+        except ClientError as e:
+            logger.warning(f"Failed to get uninstall result: {e}, proceeding with termination")
+            return {
+                "statusCode": 200,  # Don't fail termination
+                "body": json.dumps({
+                    "message": "Could not verify uninstall, proceeding with termination",
+                    "instance_id": instance_id,
+                }),
+            }
+
+    except ClientError as e:
+        logger.warning(f"Failed to send uninstall command: {e}, proceeding with termination")
+        return {
+            "statusCode": 200,  # Don't fail termination
+            "body": json.dumps({
+                "message": "Could not run uninstall, proceeding with termination",
+                "instance_id": instance_id,
+            }),
+        }
+
+
 def _terminate_worker(instance_id: str) -> dict:
     """Terminate a worker instance."""
     logger.info(f"Terminating worker: {instance_id}")
@@ -328,6 +434,12 @@ def _terminate_worker(instance_id: str) -> dict:
     ec2_client = boto3.client("ec2")
 
     try:
+        # First, uninstall K3s agent for clean cluster removal
+        uninstall_result = _uninstall_k3s_worker(instance_id)
+        uninstall_data = json.loads(uninstall_result["body"])
+        logger.info(f"Uninstall result: {uninstall_data.get('message')}")
+
+        # Then terminate the instance
         ec2_client.terminate_instances(InstanceIds=[instance_id])
         logger.info(f"Terminated instance: {instance_id}")
 
@@ -437,5 +549,158 @@ def _scale_down() -> dict:
                 "message": "Scale-down aborted due to drain failure",
                 "instance_id": instance_id,
                 "drain_error": drain_data,
+            }),
+        }
+
+
+def _clean_stale_nodes() -> dict:
+    """Remove NotReady nodes from the Kubernetes cluster.
+
+    This identifies nodes that are NotReady (terminated instances but not
+    removed from Kubernetes) and deletes them via kubectl on the master.
+    """
+    logger.info("Executing CLEAN_STALE_NODES operation")
+
+    cluster_name = _get_cluster_name()
+    ssm_client = boto3.client("ssm")
+
+    try:
+        # Get master IP from SSM
+        master_ip_response = ssm_client.get_parameter(
+            Name=f"/k3s/{cluster_name}/master-ip"
+        )
+        master_ip = master_ip_response["Parameter"]["Value"]
+        logger.info(f"Master IP: {master_ip}")
+    except ClientError as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": f"Failed to get master IP from SSM: {e}",
+            }),
+        }
+
+    # Look up master instance ID from master IP
+    ec2_client = boto3.client("ec2")
+    try:
+        master_response = ec2_client.describe_instances(
+            Filters=[{"Name": "private-ip-address", "Values": [master_ip]}]
+        )
+        master_instance_id = master_response["Reservations"][0]["Instances"][0]["InstanceId"]
+        logger.info(f"Master instance ID: {master_instance_id}")
+    except (ClientError, IndexError, KeyError) as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": f"Failed to find master instance for IP {master_ip}: {e}",
+            }),
+        }
+
+    # Command to find and delete NotReady nodes (without jq)
+    cleanup_command = """
+    # Get NotReady nodes - column 2 is STATUS, column 3 is ROLES
+    # Only delete nodes that are NotReady, regardless of SchedulingDisabled state
+    # Skip control-plane nodes (column 3 contains "control-plane")
+    STALE_NODES=$(kubectl get nodes --no-headers | \
+        awk '$3 !~ /control-plane/ && $2 ~ /NotReady/ {print $1}')
+
+    if [ -z "$STALE_NODES" ]; then
+        echo "No stale nodes found"
+        exit 0
+    fi
+
+    echo "Found stale nodes:"
+    echo "$STALE_NODES"
+
+    # Delete each stale node
+    for node in $STALE_NODES; do
+        echo "Deleting node: $node"
+        kubectl delete node "$node" --ignore-not-found=true
+    done
+
+    echo "Cleanup completed"
+    """
+
+    logger.info("Executing cleanup command via SSM on master")
+    try:
+        ssm_response = ssm_client.send_command(
+            InstanceIds=[master_instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [cleanup_command]},
+            TimeoutSeconds=60,
+        )
+
+        command_id = ssm_response["Command"]["CommandId"]
+        logger.info(f"SSM Command ID: {command_id}")
+
+        # Wait for command to complete
+        import time
+        time.sleep(5)
+
+        max_attempts = 12  # 1 minute
+        for attempt in range(max_attempts):
+            try:
+                result = ssm_client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=master_instance_id,
+                )
+
+                status = result["Status"]
+                logger.info(f"Cleanup attempt {attempt + 1}/{max_attempts}: status={status}")
+
+                if status in ["Success", "Failed", "TimedOut", "Cancelled"]:
+                    break
+
+                time.sleep(5)
+            except ClientError as e:
+                logger.warning(f"Cleanup attempt {attempt + 1}/{max_attempts}: SSM error - {e}")
+                time.sleep(5)
+
+        # Get final result
+        try:
+            result = ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=master_instance_id,
+            )
+
+            stdout = result.get("StandardOutputContent", "")
+            stderr = result.get("StandardErrorContent", "")
+            status = result["Status"]
+
+            logger.info(f"Cleanup command status: {status}")
+
+            if status == "Success":
+                # Parse how many nodes were deleted
+                deleted_count = stdout.count("Deleting node:")
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({
+                        "message": f"Stale node cleanup completed",
+                        "status": status,
+                        "nodes_deleted": deleted_count,
+                        "output": stdout[-500:] if len(stdout) > 500 else stdout,
+                    }),
+                }
+            else:
+                return {
+                    "statusCode": 500,
+                    "body": json.dumps({
+                        "message": f"Cleanup failed with status: {status}",
+                        "status": status,
+                        "stderr": stderr[-500:] if len(stderr) > 500 else stderr,
+                    }),
+                }
+        except ClientError as e:
+            return {
+                "statusCode": 500,
+                "body": json.dumps({
+                    "error": f"Failed to get command result: {e}",
+                }),
+            }
+
+    except ClientError as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": f"Failed to send SSM command: {e}",
             }),
         }
