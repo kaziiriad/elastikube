@@ -1,0 +1,1 @@
+{"statusCode": 200, "body": "{\"action\": \"NO_OP\", \"reason\": \"In scale-down cooldown (900s)\", \"current_nodes\": 3, \"target_nodes\": 3, \"metrics\": {\"cpu_percent\": 1.099999999999767, \"memory_percent\": 26.002972831509563, \"pending_pods\": 0}, \"result\": {\"message\": \"In scale-down cooldown (900s)\"}}"}

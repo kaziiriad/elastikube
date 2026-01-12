@@ -406,6 +406,7 @@ autoscaler_policy = iam.RolePolicy(
     policy=pulumi.Output.all(
         cluster_state_arn=cluster_state_table.arn,
         wal_table_arn=wal_table.arn,
+        userdata_bucket_arn=worker_userdata_bucket.arn,
     ).apply(lambda args: iam.get_policy_document(
         statements=[
             # EC2 Permissions
@@ -454,11 +455,17 @@ autoscaler_policy = iam.RolePolicy(
             },
             # SSM Run Command Permissions (for kubectl drain via master)
             {
-                "actions": ["ssm:SendCommand", "ssm:GetCommandInvocation"],
+                "actions": ["ssm:SendCommand"],
                 "resources": [
                     f"arn:aws:ssm:{region}:*:document/AWS-RunShellScript",
                     f"arn:aws:ec2:{region}:*:instance/*",
                 ],
+                "effect": "Allow",
+            },
+            # SSM GetCommandInvocation requires wildcard resource
+            {
+                "actions": ["ssm:GetCommandInvocation"],
+                "resources": ["*"],
                 "effect": "Allow",
             },
             # Secrets Manager Permissions
@@ -490,6 +497,12 @@ autoscaler_policy = iam.RolePolicy(
                     "cloudwatch:ListMetrics",
                 ],
                 "resources": ["*"],
+                "effect": "Allow",
+            },
+            # S3 Permissions - Read user-data scripts for worker bootstrap
+            {
+                "actions": ["s3:GetObject"],
+                "resources": [f"{args['userdata_bucket_arn']}/*"],
                 "effect": "Allow",
             },
         ],
@@ -568,6 +581,20 @@ worker_instance_profile = iam.InstanceProfile(
     "k3s-worker-instance-profile",
     role=worker_role.name,
     tags={**common_tags, "Name": "k3s-worker-instance-profile"}
+)
+
+# IAM PassRole permission for Lambda to launch EC2 instances with instance profile
+lambda_pass_role_policy = iam.RolePolicy(
+    "k3s-autoscaler-lambda-pass-role",
+    role=lambda_role.id,
+    policy=iam.get_policy_document(
+        statements=[{
+            "actions": ["iam:PassRole"],
+            "resources": [worker_role.arn],
+            "effect": "Allow",
+        }],
+        version="2012-10-17",
+    ).json
 )
 
 # =============================================================================
@@ -756,6 +783,101 @@ event_target = aws.cloudwatch.EventTarget(
 )
 
 # =============================================================================
+# Bootstrap Test Lambda (for testing worker bootstrap script)
+# =============================================================================
+# NOTE: Reuses the existing autoscaler Lambda IAM role to avoid iam:CreateRole permission issues
+# The existing role already has EC2, S3, and CloudWatch permissions needed for bootstrap testing
+
+# Bootstrap Test Lambda Log Group
+bootstrap_test_log_group = aws.cloudwatch.LogGroup(
+    "bootstrap-test-log-group",
+    name="/aws/lambda/bootstrap-test-lambda",
+    retention_in_days=3,  # Shorter retention for test function
+    tags={**common_tags, "Name": "bootstrap-test-log-group"},
+)
+
+# Reuse existing autoscaler Lambda IAM role (already has required permissions)
+# The autoscaler_policy includes EC2, S3, and IAM PassRole permissions needed for testing
+
+# Bootstrap Test Lambda deployment package
+# Build first: cd bootstrap-test-lambda && ./build.sh
+bootstrap_test_archive = pulumi.FileArchive(
+    f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/bootstrap-test-lambda/build/lambda.zip"
+)
+
+# Bootstrap Test Lambda Function
+bootstrap_test_lambda = lambda_.Function(
+    "bootstrap-test-lambda",
+    runtime="python3.11",
+    handler="main.lambda_handler",
+    role=lambda_role.arn,  # Reuse existing autoscaler Lambda role
+    timeout=300,  # 5 minutes
+    memory_size=256,  # 256 MB
+    vpc_config=lambda_.FunctionVpcConfigArgs(
+        subnet_ids=[private_subnet.id],
+        security_group_ids=[security_group.id],
+    ),
+    environment=lambda_.FunctionEnvironmentArgs(
+        variables={
+            # EC2 Configuration
+            "SUBNET_ID": private_subnet.id,
+            "SECURITY_GROUP_ID": security_group.id,
+            "IAM_INSTANCE_PROFILE": worker_instance_profile.name,
+            "AMI_ID": ami_id,
+            "INSTANCE_TYPE": worker_instance_type,
+            # S3 Configuration for bootstrap script
+            "USER_DATA_S3_BUCKET": worker_userdata_bucket.bucket,
+            "USER_DATA_S3_KEY": "user-data/worker-bootstrap.sh",
+        }
+    ),
+    code=bootstrap_test_archive,
+    tags={**common_tags, "Name": "bootstrap-test-lambda", "Purpose": "testing"}
+)
+
+# =============================================================================
+# Worker Cleanup Lambda (for drain, cleanup, and scale-down operations)
+# =============================================================================
+
+# Worker Cleanup Lambda Log Group
+worker_cleanup_log_group = aws.cloudwatch.LogGroup(
+    "worker-cleanup-log-group",
+    name="/aws/lambda/worker-cleanup-lambda",
+    retention_in_days=3,
+    tags={**common_tags, "Name": "worker-cleanup-log-group"},
+)
+
+# Reuse existing autoscaler Lambda IAM role
+# The autoscaler_policy includes EC2, SSM, and CloudWatch permissions needed for cleanup
+
+# Worker Cleanup Lambda deployment package
+# Build first: cd worker-cleanup-lambda && ./build.sh
+worker_cleanup_archive = pulumi.FileArchive(
+    f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/worker-cleanup-lambda/build/lambda.zip"
+)
+
+# Worker Cleanup Lambda Function
+worker_cleanup_lambda = lambda_.Function(
+    "worker-cleanup-lambda",
+    runtime="python3.11",
+    handler="main.lambda_handler",
+    role=lambda_role.arn,  # Reuse existing autoscaler Lambda role
+    timeout=300,  # 5 minutes
+    memory_size=256,  # 256 MB
+    vpc_config=lambda_.FunctionVpcConfigArgs(
+        subnet_ids=[private_subnet.id],
+        security_group_ids=[security_group.id],
+    ),
+    environment=lambda_.FunctionEnvironmentArgs(
+        variables={
+            # Cluster Configuration
+            "CLUSTER_NAME": cluster_name,
+        }
+    ),
+    code=worker_cleanup_archive,
+    tags={**common_tags, "Name": "worker-cleanup-lambda", "Purpose": "worker-management"}
+)
+
+# =============================================================================
 # CloudWatch Alarms
 # =============================================================================
 
@@ -890,6 +1012,16 @@ pulumi.export("secrets_manager_join_token_arn", k3s_join_token_secret.arn)
 # S3 bucket for worker bootstrap scripts
 pulumi.export("worker_userdata_bucket_name", worker_userdata_bucket.bucket)
 pulumi.export("worker_userdata_bucket_arn", worker_userdata_bucket.arn)
+
+# Bootstrap Test Lambda
+pulumi.export("bootstrap_test_lambda_name", bootstrap_test_lambda.name)
+pulumi.export("bootstrap_test_lambda_arn", bootstrap_test_lambda.arn)
+pulumi.export("bootstrap_test_lambda_log_group", bootstrap_test_log_group.name)
+
+# Worker Cleanup Lambda
+pulumi.export("worker_cleanup_lambda_name", worker_cleanup_lambda.name)
+pulumi.export("worker_cleanup_lambda_arn", worker_cleanup_lambda.arn)
+pulumi.export("worker_cleanup_lambda_log_group", worker_cleanup_log_group.name)
 
 
 # =============================================================================

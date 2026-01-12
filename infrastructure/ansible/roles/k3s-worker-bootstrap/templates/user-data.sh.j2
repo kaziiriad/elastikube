@@ -14,12 +14,41 @@ echo "Cluster: $CLUSTER_NAME"
 echo "Region: $AWS_REGION"
 
 # Install dependencies
-echo "[1/6] Installing dependencies..."
+echo "[1/7] Installing dependencies..."
 apt-get update -qq
 apt-get install -y awscli curl jq ca-certificates
 
+# Install AWS SSM Agent (required for kubectl operations via Lambda)
+echo "[2/7] Installing AWS SSM Agent..."
+if snap list amazon-ssm-agent 2>/dev/null | grep -q amazon-ssm-agent; then
+    echo "  SSM Agent already installed via snap"
+    snap start amazon-ssm-agent 2>/dev/null || true
+else
+    echo "  Installing SSM Agent via apt..."
+    # Create temp directory
+    mkdir -p /tmp/ssm
+    # Download SSM Agent
+    curl -o /tmp/ssm/amazon-ssm-agent.deb \
+        "https://s3.$AWS_REGION.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/debian_amd64/amazon-ssm-agent.deb"
+    # Install SSM Agent
+    dpkg -i /tmp/ssm/amazon-ssm-agent.deb || apt-get install -f -y
+    # Start SSM Agent
+    systemctl enable amazon-ssm-agent 2>/dev/null || true
+    systemctl start amazon-ssm-agent 2>/dev/null || true
+fi
+
+# Wait for SSM Agent to be ready
+echo "  Waiting for SSM Agent to be ready..."
+for i in {1..30}; do
+    if systemctl is-active --quiet amazon-ssm-agent || pgrep -f "amazon-ssm-agent" >/dev/null; then
+        echo "  SSM Agent is running"
+        break
+    fi
+    sleep 2
+done
+
 # Wait for networking to be ready
-echo "[2/6] Waiting for network connectivity..."
+echo "[3/7] Waiting for network connectivity..."
 until ping -c 1 8.8.8.8 &>/dev/null; do
     echo "  Network not ready, waiting..."
     sleep 2
@@ -27,7 +56,7 @@ done
 echo "  Network ready!"
 
 # Get instance metadata from IMDSv2
-echo "[3/6] Getting instance metadata..."
+echo "[4/7] Getting instance metadata..."
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds:21600" -s)
 INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id -s)
 LOCAL_IP=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 -s)
@@ -37,7 +66,7 @@ echo "  IP: $LOCAL_IP"
 echo "  AZ: $AZ"
 
 # Get master IP from SSM Parameter Store
-echo "[4/6] Fetching master IP from SSM Parameter..."
+echo "[5/7] Fetching master IP from SSM Parameter..."
 MAX_RETRIES=5
 RETRY_COUNT=0
 
@@ -66,7 +95,7 @@ if [ -z "$MASTER_IP" ]; then
 fi
 
 # Get K3s join token from Secrets Manager
-echo "[5/6] Fetching K3s join token from Secrets Manager..."
+echo "[6/7] Fetching K3s join token from Secrets Manager..."
 RETRY_COUNT=0
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
@@ -94,11 +123,10 @@ if [ -z "$JOIN_TOKEN" ]; then
 fi
 
 # Install K3s agent
-echo "[6/6] Installing K3s agent..."
+echo "[7/7] Installing K3s agent..."
 curl -sfL https://get.k3s.io | \
     K3S_URL="https://$MASTER_IP:6443" \
-    K3S_TOKEN="$JOIN_TOKEN" \
-    INSTALL_K3S_EXEC="agent --node-ip=$LOCAL_IP --node-name=ip-$LOCAL_IP --tls-san $LOCAL_IP" \
+    K3S_TOKEN="$JOIN_TOKEN" INSTALL_K3S_EXEC="agent --node-ip=$LOCAL_IP --node-name=ip-$LOCAL_IP" \
     sh -
 
 # Wait for K3s agent to start

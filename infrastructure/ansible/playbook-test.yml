@@ -1,0 +1,7 @@
+---
+- name: Test SSH connectivity
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Ping
+      ping:
