@@ -209,10 +209,10 @@ def _fetch_bootstrap_script(s3_client, bucket: str, key: str) -> str:
     logger.info(f"Fetched bootstrap script ({len(script)} bytes)")
 
     # Log the bootstrap script content for verification
-    logger.info("=" * 60)
-    logger.info("BOOTSTRAP SCRIPT CONTENT:")
-    logger.info(script)
-    logger.info("=" * 60)
+    # logger.info("=" * 60)
+    # logger.info("BOOTSTRAP SCRIPT CONTENT:")
+    # logger.info(script)
+    # logger.info("=" * 60)
 
     return script
 

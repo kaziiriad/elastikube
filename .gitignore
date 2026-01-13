@@ -24,10 +24,18 @@ wheels/
 *.egg
 
 # Lambda
-lambda/.terraform/
-lambda/.terragrunt-cache/
-lambda/lambda_function_payload.zip
-lambda/lambda_function_payload/
+decision-lambda/.terraform/
+decision-lambda/.terragrunt-cache/
+decision-lambda/lambda_function_payload.zip
+decision-lambda/lambda_function_payload/
+scale-up-lambda/.terraform/
+scale-up-lambda/.terragrunt-cache/
+scale-up-lambda/lambda_function_payload.zip
+scale-up-lambda/lambda_function_payload/
+scale-down-lambda/.terraform/
+scale-down-lambda/.terragrunt-cache/
+scale-down-lambda/lambda_function_payload.zip
+scale-down-lambda/lambda_function_payload/
 
 # Terraform
 *.tfstate
@@ -71,3 +79,5 @@ tmp/
 temp/
 *.tmp
 .venv
+.claude
+.qodo

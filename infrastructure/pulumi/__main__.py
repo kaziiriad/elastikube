@@ -16,6 +16,8 @@ import json
 import os
 import pathlib
 import pulumi
+import pulumi_command as command
+from pulumi_command import local
 import pulumi_aws as aws
 from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3
 
@@ -741,17 +743,19 @@ event_rule = aws.cloudwatch.EventRule(
 # Lambda Function
 # =============================================================================
 
-# Lambda Log Group
-lambda_log_group = aws.cloudwatch.LogGroup(
-    "k3s-autoscaler-log-group",
-    name=f"/aws/lambda/k3s-autoscaler",
-    retention_in_days=7,
-    tags={**common_tags, "Name": "k3s-autoscaler-log-group"},
+# =============================================================================
+# Build Decision Lambda Package
+# =============================================================================
+base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+decision_lambda_build = local.Command(
+    "decision-lambda-build",
+    create=f"cd {base_dir}/decision-lambda && ./build.sh",
+    delete=f"rm -rf {base_dir}/decision-lambda/build",
+    triggers=[pulumi.FileAsset(f"{base_dir}/decision-lambda/main.py").path],
 )
 
-# Lambda deployment package
-# Build the Lambda package first: cd lambda && ./build.sh
-lambda_archive = pulumi.FileArchive(f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/lambda/build/lambda.zip")
+# Lambda deployment package (built by the command above)
+lambda_archive = pulumi.FileArchive(f"{base_dir}/decision-lambda/build/lambda.zip")
 
 # Lambda Function
 lambda_function = lambda_.Function(
@@ -817,18 +821,25 @@ event_target = aws.cloudwatch.EventTarget(
 # The existing role already has EC2, S3, and CloudWatch permissions needed for bootstrap testing
 
 # Reuse existing autoscaler Lambda IAM role (already has required permissions)
-# The autoscaler_policy includes EC2, S3, and IAM PassRole permissions needed for testing
+# The autoscaler_policy includes EC2, S3, and IAM PassRole permissions needed for scaling
 
-# Bootstrap Test Lambda deployment package
-# Build first: cd bootstrap-test-lambda && ./build.sh
-bootstrap_test_archive = pulumi.FileArchive(
-    f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/bootstrap-test-lambda/build/lambda.zip"
+# Build Scale-Up Lambda Package
+scale_up_lambda_build = local.Command(
+    "scale-up-lambda-build",
+    create=f"cd {base_dir}/scale-up-lambda && ./build.sh",
+    delete=f"rm -rf {base_dir}/scale-up-lambda/build",
+    triggers=[pulumi.FileAsset(f"{base_dir}/scale-up-lambda/main.py").path],
 )
 
-# Bootstrap Test Lambda Function
+# Scale-Up Lambda deployment package (built by the command above)
+scale_up_archive = pulumi.FileArchive(
+    f"{base_dir}/scale-up-lambda/build/lambda.zip"
+)
+
+# Scale-Up Lambda Function
 # Note: CloudWatch will automatically create a log group with the Lambda's name
-bootstrap_test_lambda = lambda_.Function(
-    "bootstrap-test-lambda",
+scale_up_lambda = lambda_.Function(
+    "scale-up-lambda",
     runtime="python3.11",
     handler="main.lambda_handler",
     role=lambda_role.arn,  # Reuse existing autoscaler Lambda role
@@ -855,27 +866,34 @@ bootstrap_test_lambda = lambda_.Function(
             "USER_DATA_S3_KEY": "user-data/worker-bootstrap.sh",
         }
     ),
-    code=bootstrap_test_archive,
-    tags={**common_tags, "Name": "bootstrap-test-lambda", "Purpose": "testing"}
+    code=scale_up_archive,
+    tags={**common_tags, "Name": "scale-up-lambda", "Purpose": "worker-scaling"}
 )
 
 # =============================================================================
-# Worker Cleanup Lambda (for drain, cleanup, and scale-down operations)
+# Scale-Down Lambda (for drain and scale-down operations)
 # =============================================================================
 
 # Reuse existing autoscaler Lambda IAM role
-# The autoscaler_policy includes EC2, SSM, and CloudWatch permissions needed for cleanup
+# The autoscaler_policy includes EC2, SSM, and CloudWatch permissions needed for scale-down
 
-# Worker Cleanup Lambda deployment package
-# Build first: cd worker-cleanup-lambda && ./build.sh
-worker_cleanup_archive = pulumi.FileArchive(
-    f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/worker-cleanup-lambda/build/lambda.zip"
+# Build Scale-Down Lambda Package
+scale_down_lambda_build = local.Command(
+    "scale-down-lambda-build",
+    create=f"cd {base_dir}/scale-down-lambda && ./build.sh",
+    delete=f"rm -rf {base_dir}/scale-down-lambda/build",
+    triggers=[pulumi.FileAsset(f"{base_dir}/scale-down-lambda/main.py").path],
 )
 
-# Worker Cleanup Lambda Function
+# Scale-Down Lambda deployment package (built by the command above)
+scale_down_archive = pulumi.FileArchive(
+    f"{base_dir}/scale-down-lambda/build/lambda.zip"
+)
+
+# Scale-Down Lambda Function
 # Note: CloudWatch will automatically create a log group with the Lambda's name
-worker_cleanup_lambda = lambda_.Function(
-    "worker-cleanup-lambda",
+scale_down_lambda = lambda_.Function(
+    "scale-down-lambda",
     runtime="python3.11",
     handler="main.lambda_handler",
     role=lambda_role.arn,  # Reuse existing autoscaler Lambda role
@@ -892,15 +910,15 @@ worker_cleanup_lambda = lambda_.Function(
             "STATE_TABLE_NAME": cluster_state_table.name,
         }
     ),
-    code=worker_cleanup_archive,
-    tags={**common_tags, "Name": "worker-cleanup-lambda", "Purpose": "worker-management"}
+    code=scale_down_archive,
+    tags={**common_tags, "Name": "scale-down-lambda", "Purpose": "worker-scaling"}
 )
 
 # =============================================================================
 # EventBridge Rules for Lambda Chaining
 # =============================================================================
 
-# EventBridge Rule - ScaleUp events -> bootstrap-test-lambda
+# EventBridge Rule - ScaleUp events -> scale-up-lambda
 scale_up_rule = aws.cloudwatch.EventRule(
     "k3s-scale-up-rule",
     name_prefix="k3s-scale-up-",
@@ -911,23 +929,23 @@ scale_up_rule = aws.cloudwatch.EventRule(
     tags={**common_tags, "Name": "k3s-scale-up-rule"}
 )
 
-# EventBridge Target - bootstrap-test-lambda for scale-up
+# EventBridge Target - scale-up-lambda for scale-up
 scale_up_target = aws.cloudwatch.EventTarget(
     "k3s-scale-up-target",
     rule=scale_up_rule.name,
-    arn=bootstrap_test_lambda.arn,
+    arn=scale_up_lambda.arn,
 )
 
-# Lambda Permission - Allow EventBridge to invoke bootstrap-test-lambda
-bootstrap_test_scale_up_permission = aws.lambda_.Permission(
-    "bootstrap-test-scale-up-permission",
+# Lambda Permission - Allow EventBridge to invoke scale-up-lambda
+scale_up_lambda_permission = aws.lambda_.Permission(
+    "scale-up-lambda-permission",
     action="lambda:InvokeFunction",
-    function=bootstrap_test_lambda.name,
+    function=scale_up_lambda.name,
     principal="events.amazonaws.com",
     source_arn=scale_up_rule.arn,
 )
 
-# EventBridge Rule - ScaleDown events -> worker-cleanup-lambda
+# EventBridge Rule - ScaleDown events -> scale-down-lambda
 scale_down_rule = aws.cloudwatch.EventRule(
     "k3s-scale-down-rule",
     name_prefix="k3s-scale-down-",
@@ -938,18 +956,18 @@ scale_down_rule = aws.cloudwatch.EventRule(
     tags={**common_tags, "Name": "k3s-scale-down-rule"}
 )
 
-# EventBridge Target - worker-cleanup-lambda for scale-down
+# EventBridge Target - scale-down-lambda for scale-down
 scale_down_target = aws.cloudwatch.EventTarget(
     "k3s-scale-down-target",
     rule=scale_down_rule.name,
-    arn=worker_cleanup_lambda.arn,
+    arn=scale_down_lambda.arn,
 )
 
-# Lambda Permission - Allow EventBridge to invoke worker-cleanup-lambda
-worker_cleanup_scale_down_permission = aws.lambda_.Permission(
-    "worker-cleanup-scale-down-permission",
+# Lambda Permission - Allow EventBridge to invoke scale-down-lambda
+scale_down_lambda_permission = aws.lambda_.Permission(
+    "scale-down-lambda-permission",
     action="lambda:InvokeFunction",
-    function=worker_cleanup_lambda.name,
+    function=scale_down_lambda.name,
     principal="events.amazonaws.com",
     source_arn=scale_down_rule.arn,
 )
@@ -1058,9 +1076,11 @@ pulumi.export("lambda_function_name", lambda_function.name)
 pulumi.export("autoscaler_lambda_logs_command", lambda_function.name.apply(
     lambda name: f"aws logs tail /aws/lambda/{name} --follow"
 ))
+pulumi.export("decision_lambda_log_group", lambda_function.name.apply(
+    lambda name: f"/aws/lambda/{name}"
+))
 pulumi.export("worker_instance_profile", worker_instance_profile.name)
 pulumi.export("master_instance_profile", master_instance_profile.name)
-pulumi.export("cloudwatch_log_group", lambda_log_group.name)
 pulumi.export("event_rule_arn", event_rule.arn)
 pulumi.export("cloudwatch_dashboard", autoscaler_dashboard.dashboard_name)
 
@@ -1093,23 +1113,23 @@ pulumi.export("secrets_manager_join_token_arn", k3s_join_token_secret.arn)
 pulumi.export("worker_userdata_bucket_name", worker_userdata_bucket.bucket)
 pulumi.export("worker_userdata_bucket_arn", worker_userdata_bucket.arn)
 
-# Bootstrap Test Lambda
-pulumi.export("bootstrap_test_lambda_name", bootstrap_test_lambda.name)
-pulumi.export("bootstrap_test_lambda_arn", bootstrap_test_lambda.arn)
-pulumi.export("bootstrap_test_lambda_log_group", bootstrap_test_lambda.name.apply(
+# Scale-Up Lambda
+pulumi.export("scale_up_lambda_name", scale_up_lambda.name)
+pulumi.export("scale_up_lambda_arn", scale_up_lambda.arn)
+pulumi.export("scale_up_lambda_log_group", scale_up_lambda.name.apply(
     lambda name: f"/aws/lambda/{name}"
 ))
-pulumi.export("bootstrap_test_lambda_logs_command", bootstrap_test_lambda.name.apply(
+pulumi.export("scale_up_lambda_logs_command", scale_up_lambda.name.apply(
     lambda name: f"aws logs tail /aws/lambda/{name} --follow"
 ))
 
-# Worker Cleanup Lambda
-pulumi.export("worker_cleanup_lambda_name", worker_cleanup_lambda.name)
-pulumi.export("worker_cleanup_lambda_arn", worker_cleanup_lambda.arn)
-pulumi.export("worker_cleanup_lambda_log_group", worker_cleanup_lambda.name.apply(
+# Scale-Down Lambda
+pulumi.export("scale_down_lambda_name", scale_down_lambda.name)
+pulumi.export("scale_down_lambda_arn", scale_down_lambda.arn)
+pulumi.export("scale_down_lambda_log_group", scale_down_lambda.name.apply(
     lambda name: f"/aws/lambda/{name}"
 ))
-pulumi.export("worker_cleanup_lambda_logs_command", worker_cleanup_lambda.name.apply(
+pulumi.export("scale_down_lambda_logs_command", scale_down_lambda.name.apply(
     lambda name: f"aws logs tail /aws/lambda/{name} --follow"
 ))
 
