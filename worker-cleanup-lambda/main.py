@@ -32,13 +32,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
     """Lambda entry point for worker cleanup operations.
 
     Args:
-        event: Lambda event (can contain 'action' key)
-            - 'list': List all worker instances
-            - 'describe': Describe a specific instance
-            - 'drain': Drain a worker node (kubectl drain via SSM)
-            - 'terminate': Terminate a worker instance
-            - 'scale_down': Select and terminate a non-permanent worker (LIFO)
-            - 'clean_stale_nodes': Remove NotReady nodes from Kubernetes cluster
+        event: Lambda event
+            - EventBridge format: {"detail-type": "ScaleDown", "detail": {...}}
+            - Direct format: {"action": "...", ...} for manual operations
         context: Lambda context
 
     Returns:
@@ -48,6 +44,22 @@ def lambda_handler(event: dict, context: Any) -> dict:
     logger.info(f"Event: {json.dumps(event)}")
 
     try:
+        # Handle EventBridge events
+        detail_type = event.get("detail-type")
+
+        if detail_type == "ScaleDown":
+            # EventBridge event from main autoscaler
+            detail = event.get("detail", {})
+            logger.info(f"Scale-down event: {detail.get('reason')}")
+            return _handle_scale_down(detail)
+        elif detail_type:
+            # Unknown EventBridge event
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": f"Unknown event type: {detail_type}"}),
+            }
+
+        # Handle direct invocation (for manual operations)
         action = event.get("action", "list")
 
         if action == "list":
@@ -100,6 +112,68 @@ def _get_cluster_name() -> str:
     """Get cluster name from environment."""
     cluster_name = os.environ.get("CLUSTER_NAME", "production-k3s")
     return cluster_name
+
+
+def _get_state_table_name() -> str:
+    """Get DynamoDB state table name from environment."""
+    return os.environ.get("STATE_TABLE_NAME")
+
+
+def _handle_scale_down(detail: dict) -> dict:
+    """Handle scale-down event from EventBridge.
+
+    Executes scale-down operation and updates DynamoDB state.
+
+    Args:
+        detail: Event detail containing scaling decision
+
+    Returns:
+        Response with operation status
+    """
+    current_nodes = detail.get("current_nodes", 0)
+    target_nodes = detail.get("target_nodes", current_nodes - 1)
+    reason = detail.get("reason", "")
+
+    logger.info(f"Scale-down: {current_nodes} -> {target_nodes} nodes ({reason})")
+
+    # Execute scale-down (drain + terminate)
+    scale_result = _scale_down()
+
+    if scale_result["statusCode"] == 200:
+        # Update DynamoDB state with new node count
+        state_table_name = _get_state_table_name()
+        if state_table_name:
+            try:
+                dynamodb = boto3.client("dynamodb")
+                new_node_count = current_nodes - 1
+
+                dynamodb.update_item(
+                    TableName=state_table_name,
+                    Key={"cluster_id": {"S": _get_cluster_name()}},
+                    UpdateExpression=(
+                        "SET node_count = :node_count, "
+                        "scaling_in_progress = :false, "
+                        "last_scale_operation = :op, "
+                        "last_scale_time = :time"
+                    ),
+                    ExpressionAttributeValues={
+                        ":node_count": {"N": str(new_node_count)},
+                        ":false": {"S": "false"},
+                        ":op": {"S": "SCALE_DOWN"},
+                        ":time": {"S": datetime.now(timezone.utc).isoformat()},
+                    },
+                )
+
+                logger.info(f"✓ State updated: node_count={new_node_count}")
+
+            except ClientError as e:
+                logger.error(f"Failed to update DynamoDB state: {e}")
+                # Don't fail the operation - scale-down succeeded
+
+        return scale_result
+    else:
+        logger.error(f"Scale-down operation failed: {scale_result}")
+        return scale_result
 
 
 def _list_workers() -> dict:
@@ -602,6 +676,7 @@ def _clean_stale_nodes() -> dict:
     # Skip control-plane nodes (column 3 contains "control-plane")
     STALE_NODES=$(kubectl get nodes --no-headers | \
         awk '$3 !~ /control-plane/ && $2 ~ /NotReady/ {print $1}')
+
 
     if [ -z "$STALE_NODES" ]; then
         echo "No stale nodes found"

@@ -188,7 +188,7 @@ class StateManager:
             return ClusterState.from_dict(plain_data)
 
         except ClientError as e:
-            raise RuntimeError(f"Failed to get cluster state: {e}") from e
+            raise RuntimeError(f"Failed to get cluster state: {e}")
 
     def update_state(
         self,
@@ -204,31 +204,53 @@ class StateManager:
             last_scale_operation: Last operation type (SCALE_UP/SCALE_DOWN)
 
         Returns:
-            Updated cluster state
+            Updated cluster state from DynamoDB
         """
-        current = self.get_state()
+        # Build update expression
+        update_expressions = []
+        expression_values = {}
 
         if node_count is not None:
-            current.node_count = node_count
+            update_expressions.append("node_count = :node_count")
+            expression_values[":node_count"] = {"N": str(node_count)}
+
         if scaling_in_progress is not None:
-            current.scaling_in_progress = scaling_in_progress
+            update_expressions.append("scaling_in_progress = :scaling_in_progress")
+            expression_values[":scaling_in_progress"] = {
+                "S": "true" if scaling_in_progress else "false"
+            }
+
         if last_scale_operation is not None:
-            current.last_scale_operation = last_scale_operation
-            current.last_scale_time = datetime.utcnow().isoformat()
+            update_expressions.append("last_scale_operation = :last_scale_operation")
+            expression_values[":last_scale_operation"] = {"S": last_scale_operation}
+            update_expressions.append("last_scale_time = :last_scale_time")
+            from datetime import timezone
+            expression_values[":last_scale_time"] = {
+                "S": datetime.now(timezone.utc).isoformat()
+            }
+
+        if not update_expressions:
+            # No updates requested, return current state
+            return self.get_state()
 
         try:
-            self._client.put_item(
+            result = self._client.update_item(
                 TableName=self._table_name,
-                Item={
-                    "cluster_id": {"S": current.cluster_id},
-                    "node_count": {"N": str(current.node_count)},
-                    "scaling_in_progress": {"S": "true" if current.scaling_in_progress else "false"},
-                    "last_scale_time": {"S": current.last_scale_time or ""},
-                    "last_scale_operation": {"S": current.last_scale_operation or ""},
-                    "ttl": {"N": str(current.ttl)},
-                },
+                Key={"cluster_id": {"S": self._cluster_id}},
+                UpdateExpression="SET " + ", ".join(update_expressions),
+                ExpressionAttributeValues=expression_values,
+                ReturnValues="ALL_NEW",
             )
-            return current
+
+            # Parse and return the updated state from DynamoDB
+            attributes = result["Attributes"]
+            return ClusterState(
+                cluster_id=attributes["cluster_id"]["S"],
+                node_count=int(attributes["node_count"]["N"]),
+                scaling_in_progress=attributes["scaling_in_progress"]["S"] == "true",
+                last_scale_time=attributes.get("last_scale_time", {}).get("S", ""),
+                last_scale_operation=attributes.get("last_scale_operation", {}).get("S", ""),
+            )
 
         except ClientError as e:
             raise RuntimeError(f"Failed to update cluster state: {e}") from e

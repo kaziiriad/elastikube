@@ -1,17 +1,18 @@
 """K3s Autoscaler Lambda handler.
 
-Orchestrates the autoscaling workflow:
+Orchestrates the autoscaling workflow using Lambda chaining:
 1. Acquire distributed lock
 2. Query Prometheus for cluster metrics
 3. Evaluate scaling decision
-4. Execute scale-up or scale-down operations
-5. Update cluster state and release lock
+4. Publish scaling event to EventBridge (triggers execution Lambda)
+5. Release lock
 
 Environment variables required:
     CLUSTER_NAME: Name of the K3s cluster
     PROMETHEUS_URL: Prometheus NodePort URL (http://<worker-ip>:30900)
     STATE_TABLE_NAME: DynamoDB table for cluster state
     WAL_TABLE_NAME: DynamoDB table for write-ahead log
+    EVENT_BUS_NAME: EventBridge event bus name (default: default)
     MIN_NODES / MAX_NODES: Scaling limits
     SCALE_UP_THRESHOLD / SCALE_DOWN_THRESHOLD: CPU thresholds
     SCALE_UP_COOLDOWN / SCALE_DOWN_COOLDOWN: Cooldown periods
@@ -21,7 +22,6 @@ Environment variables required:
 import json
 import logging
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,8 +33,6 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from metrics.prometheus import PrometheusClient, ClusterMetrics
 from scaler.scaling import ScalingEngine, ScalingDecision, ScalingAction
-from scaler.ec2 import EC2Operations
-from scaler.kubectl import KubectlViaSSM
 from state.cluster_state import StateManager, DistributedLock
 from utils.wal import WriteAheadLog, OperationType, OperationState
 
@@ -156,7 +154,6 @@ def lambda_handler(event: dict, context: Any) -> dict:
         wal = WriteAheadLog(dynamodb_client)
         prometheus = PrometheusClient()
         scaling_engine = ScalingEngine()
-        ec2_ops = EC2Operations(ec2_client)
 
         # Step 1: Fetch cluster state (before lock to detect stuck locks)
         logger.info("Fetching cluster state...")
@@ -235,16 +232,13 @@ def lambda_handler(event: dict, context: Any) -> dict:
             decision = scaling_engine.evaluate(metrics, state)
             logger.info(f"Decision: {decision.action.value} - {decision.reason}")
 
-            # Step 6: Execute scaling action
+            # Step 6: Execute scaling action via EventBridge
             if decision.action == ScalingAction.SCALE_UP:
-                result = _execute_scale_up(ec2_ops, wal, state_manager, decision, metrics)
-                # State is already updated inside _execute_scale_up with new_node_count
+                result = _publish_scale_up_event(decision)
+                # State will be updated by scale-up Lambda
             elif decision.action == ScalingAction.SCALE_DOWN:
-                # Create EC2 and SSM clients for scale-down (kubectl drain via SSM)
-                import boto3
-                ec2_client = boto3.client("ec2")
-                result = _execute_scale_down(ec2_ops, wal, state_manager, decision, ec2_client)
-                # State is already updated inside _execute_scale_down with new_node_count
+                result = _publish_scale_down_event(decision)
+                # State will be updated by scale-down Lambda
             else:
                 result = {"message": decision.reason}
                 # For NO_OP, update state to clear scaling_in_progress and sync node count
@@ -284,235 +278,130 @@ def lambda_handler(event: dict, context: Any) -> dict:
         }
 
 
-def _execute_scale_up(
-    ec2_ops: EC2Operations,
-    wal: WriteAheadLog,
-    state_manager: StateManager,
-    decision: ScalingDecision,
-    metrics: ClusterMetrics,
-) -> dict:
-    """Execute scale-up operation.
+def _publish_scale_up_event(decision: ScalingDecision) -> dict:
+    """Publish scale-up event to EventBridge.
+
+    EventBridge will route this to the scale-up Lambda with built-in retry and DLQ.
 
     Args:
-        ec2_ops: EC2 operations client
-        wal: Write-ahead log
-        state_manager: State manager
-        decision: Scaling decision
-        metrics: Cluster metrics
+        decision: Scaling decision containing context
 
     Returns:
-        Result dictionary
+        Result dictionary with publication status
     """
-    logger.info("Executing SCALE_UP operation")
+    import os
+    import boto3
 
-    # Create WAL entry
-    wal_entry = wal.create_entry(OperationType.SCALE_UP)
-    logger.info(f"Created WAL entry: {wal_entry.operation_id}")
+    events_client = boto3.client("events")
+    event_bus_name = os.environ.get("EVENT_BUS_NAME", "default")
+    cluster_name = os.environ.get("CLUSTER_NAME", "production-k3s")
 
-    # Update state: scaling in progress
-    state_manager.update_state(scaling_in_progress=True, last_scale_operation="SCALE_UP")
-
-    # Fetch user-data script from S3 (deployed by Ansible worker-bootstrap.yml)
-    logger.info("Fetching user-data script from S3...")
-    user_data_script = ec2_ops.fetch_user_data_from_s3()
-    if not user_data_script:
-        raise RuntimeError(
-            "Failed to fetch user-data script from S3. "
-            "Ensure the worker-bootstrap.yml playbook has been run."
-        )
-    logger.info("Successfully fetched user-data script for K3s worker bootstrap")
-
-    # Get EC2 configuration from environment (set by Pulumi)
-    from utils.config import get_config
-    config = get_config()
-
-    subnet_id = config.subnet_id
-    security_group_id = config.security_group_id
-    iam_instance_profile = config.iam_instance_profile
-    ami_id = config.ami_id
-    instance_type = config.instance_type
-
-    # Validate required configuration
-    if not all([subnet_id, security_group_id, iam_instance_profile, ami_id]):
-        missing = [
-            name for name, val in [
-                ("SUBNET_ID", subnet_id),
-                ("SECURITY_GROUP_ID", security_group_id),
-                ("IAM_INSTANCE_PROFILE", iam_instance_profile),
-                ("AMI_ID", ami_id),
-            ] if not val
-        ]
-        raise RuntimeError(f"Missing required EC2 configuration: {', '.join(missing)}")
-
-    logger.info(f"EC2 config: subnet={subnet_id}, sg={security_group_id}, "
-                f"instance_profile={iam_instance_profile}, ami={ami_id}, type={instance_type}")
+    logger.info(f"Publishing scale-up event to EventBridge: {event_bus_name}")
 
     try:
-        # Launch new instance with user-data script
-        instance_id = ec2_ops.launch_worker(
-            subnet_id=subnet_id,
-            security_group_id=security_group_id,
-            iam_instance_profile=iam_instance_profile,
-            ami_id=ami_id,
-            instance_type=instance_type,
-            user_data=user_data_script,
+        response = events_client.put_events(
+            Entries=[
+                {
+                    "Source": "k3s.autoscaler",
+                    "DetailType": "ScaleUp",
+                    "Detail": json.dumps({
+                        "cluster_name": cluster_name,
+                        "current_nodes": decision.current_nodes,
+                        "target_nodes": decision.target_nodes,
+                        "reason": decision.reason,
+                        "cpu_percent": decision.cpu_percent,
+                        "memory_percent": decision.memory_percent,
+                        "pending_pods": decision.pending_pods,
+                    }),
+                    "EventBusName": event_bus_name,
+                }
+            ]
         )
-        logger.info(f"Launched new instance: {instance_id}")
 
-        # Wait for instance to be ready
-        # TODO: Configure timeout
-        if ec2_ops.wait_for_instance_ready(instance_id):
-            logger.info(f"Instance {instance_id} is ready")
+        # put_events returns a list of entries (one per event)
+        entry_response = response.get("Entries", [{}])[0]
+        if entry_response.get("EventId"):
+            logger.info(f"✓ Scale-up event published: {entry_response['EventId']}")
+            return {
+                "status": "published",
+                "event_id": entry_response["EventId"],
+                "event_bus": event_bus_name,
+            }
         else:
-            logger.warning(f"Instance {instance_id} readiness timeout")
-
-        # Wait for K3s node to join and be Ready
-        import boto3
-        from scaler.kubectl import KubectlViaSSM
-
-        # Create new SSM client for kubectl operations
-        ssm_client = boto3.client("ssm")
-        ec2_client = boto3.client("ec2")
-        kubectl = KubectlViaSSM(ec2_client=ec2_client, ssm_client=ssm_client)
-
-        logger.info(f"Waiting for K3s node to join cluster...")
-        node_ready_result = kubectl.wait_for_node_ready(instance_id, timeout=300)
-
-        if node_ready_result["status"] == "Success":
-            logger.info(f"✓ Node {node_ready_result['node_name']} joined and Ready "
-                       f"in {node_ready_result['elapsed_seconds']}s")
-        elif node_ready_result["status"] == "TimedOut":
-            logger.error(f"Node did not become Ready in time: {node_ready_result.get('error')}")
-            # Still mark as succeeded - EC2 launched successfully, node join may complete later
-            logger.warning(f"Proceeding with scale-up completion (node may join asynchronously)")
-        else:  # Failed
-            logger.error(f"Failed to wait for node ready: {node_ready_result.get('error')}")
-            # Still mark as succeeded - EC2 launched successfully
-            logger.warning(f"Proceeding with scale-up completion (node status check failed)")
-
-        # Update WAL: succeeded
-        wal.update_entry(wal_entry.operation_id, OperationState.SUCCEEDED, started_at=wal_entry.started_at)
-
-        # Update state: increment node count
-        new_state = state_manager.update_state(
-            node_count=decision.current_nodes + 1,
-            scaling_in_progress=False,
-            last_scale_operation="SCALE_UP",
-        )
-        logger.info(f"✓ State updated: node_count={new_state.node_count} (was {decision.current_nodes})")
-
-        return {
-            "instance_id": instance_id,
-            "wal_entry_id": wal_entry.operation_id,
-            "new_node_count": new_state.node_count,
-        }
+            logger.warning("Event published but no EventId returned")
+            return {
+                "status": "unknown",
+                "event_bus": event_bus_name,
+            }
 
     except Exception as e:
-        logger.exception(f"Scale-up failed: {e}")
-        wal.update_entry(
-            wal_entry.operation_id,
-            OperationState.FAILED,
-            error_message=str(e),
-            started_at=wal_entry.started_at,
-        )
-        raise
+        logger.exception(f"Failed to publish scale-up event: {e}")
+        return {
+            "status": "failed",
+            "error": str(e),
+            "event_bus": event_bus_name,
+        }
 
 
-def _execute_scale_down(
-    ec2_ops: EC2Operations,
-    wal: WriteAheadLog,
-    state_manager: StateManager,
-    decision: ScalingDecision,
-    ec2_client,
-) -> dict:
-    """Execute scale-down operation.
+def _publish_scale_down_event(decision: ScalingDecision) -> dict:
+    """Publish scale-down event to EventBridge.
+
+    EventBridge will route this to the scale-down Lambda with built-in retry and DLQ.
 
     Args:
-        ec2_ops: EC2 operations client
-        wal: Write-ahead log
-        state_manager: State manager
-        decision: Scaling decision
-        ec2_client: EC2 client for kubectl operations
+        decision: Scaling decision containing context
 
     Returns:
-        Result dictionary
+        Result dictionary with publication status
     """
-    logger.info("Executing SCALE_DOWN operation")
+    import os
+    import boto3
 
-    # Create WAL entry
-    wal_entry = wal.create_entry(OperationType.SCALE_DOWN)
-    logger.info(f"Created WAL entry: {wal_entry.operation_id}")
+    events_client = boto3.client("events")
+    event_bus_name = os.environ.get("EVENT_BUS_NAME", "default")
+    cluster_name = os.environ.get("CLUSTER_NAME", "production-k3s")
 
-    # Update state: scaling in progress
-    state_manager.update_state(scaling_in_progress=True, last_scale_operation="SCALE_DOWN")
+    logger.info(f"Publishing scale-down event to EventBridge: {event_bus_name}")
 
     try:
-        # Select instance to terminate (LIFO)
-        instance = ec2_ops.get_instance_for_scale_down()
-        if not instance:
-            logger.warning("No eligible instance found for scale-down")
-            # Mark WAL as FAILED and clear scaling_in_progress
-            wal.update_entry(
-                wal_entry.operation_id,
-                OperationState.FAILED,
-                error_message="No eligible instance found for scale-down",
-                started_at=wal_entry.started_at,
-            )
-            state_manager.update_state(scaling_in_progress=False)
-            return {"message": "No eligible instance to terminate"}
-
-        instance_id = instance["InstanceId"]
-        logger.info(f"Selected instance for termination: {instance_id}")
-
-        # Execute kubectl drain before termination via SSM
-        kubectl = KubectlViaSSM(ec2_client=ec2_client)
-        node_name = kubectl.get_node_name_from_instance_id(instance_id)
-
-        if node_name:
-            logger.info(f"Draining Kubernetes node: {node_name}")
-            drain_result = kubectl.drain_node(node_name, timeout=120, delete_node=True)
-
-            if drain_result["status"] == "Success":
-                logger.info(f"Successfully drained node {node_name}")
-            else:
-                logger.warning(
-                    f"Node drain had issues: {drain_result.get('status', 'Unknown')}. "
-                    f"Continuing with termination."
-                )
-                if drain_result.get("stderr"):
-                    logger.warning(f"Drain stderr: {drain_result['stderr']}")
-        else:
-            logger.warning(
-                f"Could not determine node name for instance {instance_id}, "
-                f"skipping drain and proceeding with termination"
-            )
-
-        # Terminate instance
-        ec2_ops.terminate_instance(instance_id)
-        logger.info(f"Terminated instance: {instance_id}")
-
-        # Update WAL: succeeded
-        wal.update_entry(wal_entry.operation_id, OperationState.SUCCEEDED, started_at=wal_entry.started_at)
-
-        # Update state: decrement node count
-        new_state = state_manager.update_state(
-            node_count=decision.current_nodes - 1,
-            scaling_in_progress=False,
-            last_scale_operation="SCALE_DOWN",
+        response = events_client.put_events(
+            Entries=[
+                {
+                    "Source": "k3s.autoscaler",
+                    "DetailType": "ScaleDown",
+                    "Detail": json.dumps({
+                        "cluster_name": cluster_name,
+                        "current_nodes": decision.current_nodes,
+                        "target_nodes": decision.target_nodes,
+                        "reason": decision.reason,
+                        "cpu_percent": decision.cpu_percent,
+                        "memory_percent": decision.memory_percent,
+                        "pending_pods": decision.pending_pods,
+                    }),
+                    "EventBusName": event_bus_name,
+                }
+            ]
         )
 
-        return {
-            "instance_id": instance_id,
-            "wal_entry_id": wal_entry.operation_id,
-            "new_node_count": new_state.node_count,
-        }
+        entry_response = response.get("Entries", [{}])[0]
+        if entry_response.get("EventId"):
+            logger.info(f"✓ Scale-down event published: {entry_response['EventId']}")
+            return {
+                "status": "published",
+                "event_id": entry_response["EventId"],
+                "event_bus": event_bus_name,
+            }
+        else:
+            logger.warning("Event published but no EventId returned")
+            return {
+                "status": "unknown",
+                "event_bus": event_bus_name,
+            }
 
     except Exception as e:
-        logger.exception(f"Scale-down failed: {e}")
-        wal.update_entry(
-            wal_entry.operation_id,
-            OperationState.FAILED,
-            error_message=str(e),
-            started_at=wal_entry.started_at,
-        )
-        raise
+        logger.exception(f"Failed to publish scale-down event: {e}")
+        return {
+            "status": "failed",
+            "error": str(e),
+            "event_bus": event_bus_name,
+        }

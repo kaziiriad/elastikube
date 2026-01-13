@@ -19,6 +19,8 @@ import pulumi
 import pulumi_aws as aws
 from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3
 
+# If CustomTimeouts is provider-specific (e.g., AWS, Kubernetes):
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -173,7 +175,8 @@ bastion_security_group = aws.ec2.SecurityGroup("bastion-secgrp",
     }],
     tags={
         'Name': 'bastion-secgrp',
-    }
+    },
+    # custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m"),  # Longer delete timeout for ENI cleanup
 )
 
 # Security Group for K3s cluster traffic (private subnet)
@@ -253,7 +256,8 @@ security_group = aws.ec2.SecurityGroup("k3s-secgrp",
     }],
     tags={
         'Name': 'k3s-secgrp',
-    }
+    },
+    # custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m"),  # Longer delete timeout for ENI cleanup
 )
 
 # =============================================================================
@@ -468,6 +472,29 @@ autoscaler_policy = iam.RolePolicy(
                 "resources": ["*"],
                 "effect": "Allow",
             },
+            # EventBridge Permissions (for Lambda chaining - publishing events)
+            {
+                "actions": ["events:PutEvents"],
+                "resources": [f"arn:aws:events:{region}:*:event-bus/*"],
+                "effect": "Allow",
+            },
+            # EventBridge Read Permissions (for observability and debugging)
+            {
+                "actions": [
+                    "events:DescribeRule",
+                    "events:ListRules",
+                ],
+                "resources": [f"arn:aws:events:{region}:*:rule/*"],
+                "effect": "Allow",
+            },
+            {
+                "actions": [
+                    "events:DescribeEventBus",
+                    "events:ListEventBuses",
+                ],
+                "resources": [f"arn:aws:events:{region}:*:event-bus/*"],
+                "effect": "Allow",
+            },
             # Secrets Manager Permissions
             {
                 "actions": [
@@ -601,7 +628,7 @@ lambda_pass_role_policy = iam.RolePolicy(
 # Master Node IAM Role (for SSM access - kubectl drain)
 # =============================================================================
 master_role = iam.Role(
-    "k3s-master-node-role",
+            "k3s-master-node-role",
     assume_role_policy=ec2_assume_role.json,
     tags={**common_tags, "Name": "k3s-master-node-role"}
 )
@@ -744,6 +771,7 @@ lambda_function = lambda_.Function(
             "PROMETHEUS_URL": master_instance.private_ip.apply(lambda ip: f"http://{ip}:30900"),
             "STATE_TABLE_NAME": cluster_state_table.name,
             "WAL_TABLE_NAME": wal_table.name,
+            "EVENT_BUS_NAME": "default",  # EventBridge default event bus
             "MIN_NODES": str(min_nodes),
             "MAX_NODES": str(max_nodes),
             "SCALE_UP_THRESHOLD": str(scale_up_threshold),
@@ -788,14 +816,6 @@ event_target = aws.cloudwatch.EventTarget(
 # NOTE: Reuses the existing autoscaler Lambda IAM role to avoid iam:CreateRole permission issues
 # The existing role already has EC2, S3, and CloudWatch permissions needed for bootstrap testing
 
-# Bootstrap Test Lambda Log Group
-bootstrap_test_log_group = aws.cloudwatch.LogGroup(
-    "bootstrap-test-log-group",
-    name="/aws/lambda/bootstrap-test-lambda",
-    retention_in_days=3,  # Shorter retention for test function
-    tags={**common_tags, "Name": "bootstrap-test-log-group"},
-)
-
 # Reuse existing autoscaler Lambda IAM role (already has required permissions)
 # The autoscaler_policy includes EC2, S3, and IAM PassRole permissions needed for testing
 
@@ -806,6 +826,7 @@ bootstrap_test_archive = pulumi.FileArchive(
 )
 
 # Bootstrap Test Lambda Function
+# Note: CloudWatch will automatically create a log group with the Lambda's name
 bootstrap_test_lambda = lambda_.Function(
     "bootstrap-test-lambda",
     runtime="python3.11",
@@ -819,12 +840,16 @@ bootstrap_test_lambda = lambda_.Function(
     ),
     environment=lambda_.FunctionEnvironmentArgs(
         variables={
+            # Cluster Configuration
+            "CLUSTER_NAME": cluster_name,
+            "STATE_TABLE_NAME": cluster_state_table.name,
             # EC2 Configuration
             "SUBNET_ID": private_subnet.id,
             "SECURITY_GROUP_ID": security_group.id,
             "IAM_INSTANCE_PROFILE": worker_instance_profile.name,
             "AMI_ID": ami_id,
             "INSTANCE_TYPE": worker_instance_type,
+            "KEY_NAME": existing_key_name,  # SSH key pair for debugging
             # S3 Configuration for bootstrap script
             "USER_DATA_S3_BUCKET": worker_userdata_bucket.bucket,
             "USER_DATA_S3_KEY": "user-data/worker-bootstrap.sh",
@@ -838,14 +863,6 @@ bootstrap_test_lambda = lambda_.Function(
 # Worker Cleanup Lambda (for drain, cleanup, and scale-down operations)
 # =============================================================================
 
-# Worker Cleanup Lambda Log Group
-worker_cleanup_log_group = aws.cloudwatch.LogGroup(
-    "worker-cleanup-log-group",
-    name="/aws/lambda/worker-cleanup-lambda",
-    retention_in_days=3,
-    tags={**common_tags, "Name": "worker-cleanup-log-group"},
-)
-
 # Reuse existing autoscaler Lambda IAM role
 # The autoscaler_policy includes EC2, SSM, and CloudWatch permissions needed for cleanup
 
@@ -856,6 +873,7 @@ worker_cleanup_archive = pulumi.FileArchive(
 )
 
 # Worker Cleanup Lambda Function
+# Note: CloudWatch will automatically create a log group with the Lambda's name
 worker_cleanup_lambda = lambda_.Function(
     "worker-cleanup-lambda",
     runtime="python3.11",
@@ -871,10 +889,69 @@ worker_cleanup_lambda = lambda_.Function(
         variables={
             # Cluster Configuration
             "CLUSTER_NAME": cluster_name,
+            "STATE_TABLE_NAME": cluster_state_table.name,
         }
     ),
     code=worker_cleanup_archive,
     tags={**common_tags, "Name": "worker-cleanup-lambda", "Purpose": "worker-management"}
+)
+
+# =============================================================================
+# EventBridge Rules for Lambda Chaining
+# =============================================================================
+
+# EventBridge Rule - ScaleUp events -> bootstrap-test-lambda
+scale_up_rule = aws.cloudwatch.EventRule(
+    "k3s-scale-up-rule",
+    name_prefix="k3s-scale-up-",
+    event_pattern=json.dumps({
+        "source": ["k3s.autoscaler"],
+        "detail-type": ["ScaleUp"],
+    }),
+    tags={**common_tags, "Name": "k3s-scale-up-rule"}
+)
+
+# EventBridge Target - bootstrap-test-lambda for scale-up
+scale_up_target = aws.cloudwatch.EventTarget(
+    "k3s-scale-up-target",
+    rule=scale_up_rule.name,
+    arn=bootstrap_test_lambda.arn,
+)
+
+# Lambda Permission - Allow EventBridge to invoke bootstrap-test-lambda
+bootstrap_test_scale_up_permission = aws.lambda_.Permission(
+    "bootstrap-test-scale-up-permission",
+    action="lambda:InvokeFunction",
+    function=bootstrap_test_lambda.name,
+    principal="events.amazonaws.com",
+    source_arn=scale_up_rule.arn,
+)
+
+# EventBridge Rule - ScaleDown events -> worker-cleanup-lambda
+scale_down_rule = aws.cloudwatch.EventRule(
+    "k3s-scale-down-rule",
+    name_prefix="k3s-scale-down-",
+    event_pattern=json.dumps({
+        "source": ["k3s.autoscaler"],
+        "detail-type": ["ScaleDown"],
+    }),
+    tags={**common_tags, "Name": "k3s-scale-down-rule"}
+)
+
+# EventBridge Target - worker-cleanup-lambda for scale-down
+scale_down_target = aws.cloudwatch.EventTarget(
+    "k3s-scale-down-target",
+    rule=scale_down_rule.name,
+    arn=worker_cleanup_lambda.arn,
+)
+
+# Lambda Permission - Allow EventBridge to invoke worker-cleanup-lambda
+worker_cleanup_scale_down_permission = aws.lambda_.Permission(
+    "worker-cleanup-scale-down-permission",
+    action="lambda:InvokeFunction",
+    function=worker_cleanup_lambda.name,
+    principal="events.amazonaws.com",
+    source_arn=scale_down_rule.arn,
 )
 
 # =============================================================================
@@ -978,6 +1055,9 @@ pulumi.export("dynamodb_wal_table", wal_table.name)
 pulumi.export("lambda_role_arn", lambda_role.arn)
 pulumi.export("lambda_function_arn", lambda_function.arn)
 pulumi.export("lambda_function_name", lambda_function.name)
+pulumi.export("autoscaler_lambda_logs_command", lambda_function.name.apply(
+    lambda name: f"aws logs tail /aws/lambda/{name} --follow"
+))
 pulumi.export("worker_instance_profile", worker_instance_profile.name)
 pulumi.export("master_instance_profile", master_instance_profile.name)
 pulumi.export("cloudwatch_log_group", lambda_log_group.name)
@@ -1016,12 +1096,28 @@ pulumi.export("worker_userdata_bucket_arn", worker_userdata_bucket.arn)
 # Bootstrap Test Lambda
 pulumi.export("bootstrap_test_lambda_name", bootstrap_test_lambda.name)
 pulumi.export("bootstrap_test_lambda_arn", bootstrap_test_lambda.arn)
-pulumi.export("bootstrap_test_lambda_log_group", bootstrap_test_log_group.name)
+pulumi.export("bootstrap_test_lambda_log_group", bootstrap_test_lambda.name.apply(
+    lambda name: f"/aws/lambda/{name}"
+))
+pulumi.export("bootstrap_test_lambda_logs_command", bootstrap_test_lambda.name.apply(
+    lambda name: f"aws logs tail /aws/lambda/{name} --follow"
+))
 
 # Worker Cleanup Lambda
 pulumi.export("worker_cleanup_lambda_name", worker_cleanup_lambda.name)
 pulumi.export("worker_cleanup_lambda_arn", worker_cleanup_lambda.arn)
-pulumi.export("worker_cleanup_lambda_log_group", worker_cleanup_log_group.name)
+pulumi.export("worker_cleanup_lambda_log_group", worker_cleanup_lambda.name.apply(
+    lambda name: f"/aws/lambda/{name}"
+))
+pulumi.export("worker_cleanup_lambda_logs_command", worker_cleanup_lambda.name.apply(
+    lambda name: f"aws logs tail /aws/lambda/{name} --follow"
+))
+
+# EventBridge Rules for Lambda Chaining
+pulumi.export("scale_up_rule_arn", scale_up_rule.arn)
+pulumi.export("scale_up_rule_name", scale_up_rule.name)
+pulumi.export("scale_down_rule_arn", scale_down_rule.arn)
+pulumi.export("scale_down_rule_name", scale_down_rule.name)
 
 
 # =============================================================================

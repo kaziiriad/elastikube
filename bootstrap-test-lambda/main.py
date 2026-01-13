@@ -1,11 +1,13 @@
 """Bootstrap Test Lambda handler.
 
-This Lambda is for testing the worker bootstrap script:
+This Lambda handles scale-up operations:
 1. Fetch EC2 configuration from environment
 2. Fetch bootstrap script from S3
-3. Launch a test EC2 instance with the bootstrap script
-4. Monitor instance status and console output
-5. Verify SSM Agent installation and K3s join
+3. Launch a new EC2 instance with the bootstrap script
+4. Update DynamoDB state with new node count
+
+Triggered by EventBridge when main autoscaler decides to scale up.
+Also supports direct invocation for testing.
 
 Environment variables required:
     SUBNET_ID: Subnet ID to launch instance in
@@ -15,6 +17,7 @@ Environment variables required:
     INSTANCE_TYPE: EC2 instance type
     USER_DATA_S3_BUCKET: S3 bucket containing bootstrap script
     USER_DATA_S3_KEY: S3 key for bootstrap script
+    STATE_TABLE_NAME: DynamoDB table for cluster state
 """
 
 import json
@@ -33,22 +36,37 @@ logger.setLevel(logging.INFO)
 
 
 def lambda_handler(event: dict, context: Any) -> dict:
-    """Lambda entry point for bootstrap testing.
+    """Lambda entry point for scale-up operations.
 
     Args:
-        event: Lambda event (can contain 'action' key)
-            - 'launch': Launch a new test instance (default)
-            - 'describe': Describe instance status
-            - 'terminate': Terminate test instance
+        event: Lambda event
+            - EventBridge format: {"detail-type": "ScaleUp", "detail": {...}}
+            - Direct format: {"action": "launch", ...} (for testing)
         context: Lambda context
 
     Returns:
-        Response with instance status and details
+        Response with operation status
     """
-    logger.info("Bootstrap Test Lambda invoked")
+    logger.info("Scale-up Lambda invoked")
     logger.info(f"Event: {json.dumps(event)}")
 
     try:
+        # Handle EventBridge events
+        detail_type = event.get("detail-type")
+
+        if detail_type == "ScaleUp":
+            # EventBridge event from main autoscaler
+            detail = event.get("detail", {})
+            logger.info(f"Scale-up event: {detail.get('reason')}")
+            return _handle_scale_up(detail)
+        elif detail_type:
+            # Unknown EventBridge event
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": f"Unknown event type: {detail_type}"}),
+            }
+
+        # Handle direct invocation (for testing)
         action = event.get("action", "launch")
 
         if action == "launch":
@@ -93,16 +111,94 @@ def _get_config() -> dict:
         "iam_instance_profile": os.environ.get("IAM_INSTANCE_PROFILE"),
         "ami_id": os.environ.get("AMI_ID"),
         "instance_type": os.environ.get("INSTANCE_TYPE", "t3.small"),
+        "key_name": os.environ.get("KEY_NAME"),  # SSH key pair for debugging
         "s3_bucket": os.environ.get("USER_DATA_S3_BUCKET"),
         "s3_key": os.environ.get("USER_DATA_S3_KEY"),
+        "state_table_name": os.environ.get("STATE_TABLE_NAME"),
+        "cluster_name": os.environ.get("CLUSTER_NAME", "production-k3s"),
     }
 
-    # Validate required config
-    missing = [k for k, v in config.items() if not v]
+    # Validate required config (key_name and state_table_name are optional)
+    optional_keys = ("state_table_name", "key_name")
+    missing = [k for k, v in config.items() if not v and k not in optional_keys]
     if missing:
         raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
 
     return config
+
+
+def _handle_scale_up(detail: dict) -> dict:
+    """Handle scale-up event from EventBridge.
+
+    Launches a new worker instance and updates DynamoDB state.
+
+    Args:
+        detail: Event detail containing scaling decision
+
+    Returns:
+        Response with operation status
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+
+    config = _get_config()
+    current_nodes = detail.get("current_nodes", 0)
+    target_nodes = detail.get("target_nodes", current_nodes + 1)
+    reason = detail.get("reason", "")
+
+    logger.info(f"Scale-up: {current_nodes} -> {target_nodes} nodes ({reason})")
+
+    # Launch the new worker instance
+    launch_result = _launch_test_instance()
+    launch_status = launch_result.get("statusCode", 500)
+
+    if launch_status == 200:
+        body = json.loads(launch_result.get("body", "{}"))
+        instance_id = body.get("instance_id")
+
+        logger.info(f"Launched instance {instance_id}, updating DynamoDB state")
+
+        # Update DynamoDB state with new node count
+        if config.get("state_table_name"):
+            try:
+                dynamodb = boto3.client("dynamodb")
+                new_node_count = current_nodes + 1
+
+                dynamodb.update_item(
+                    TableName=config["state_table_name"],
+                    Key={"cluster_id": {"S": config["cluster_name"]}},
+                    UpdateExpression=(
+                        "SET node_count = :node_count, "
+                        "scaling_in_progress = :false, "
+                        "last_scale_operation = :op, "
+                        "last_scale_time = :time"
+                    ),
+                    ExpressionAttributeValues={
+                        ":node_count": {"N": str(new_node_count)},
+                        ":false": {"S": "false"},
+                        ":op": {"S": "SCALE_UP"},
+                        ":time": {"S": datetime.now(timezone.utc).isoformat()},
+                    },
+                )
+
+                logger.info(f"✓ State updated: node_count={new_node_count}")
+
+            except ClientError as e:
+                logger.error(f"Failed to update DynamoDB state: {e}")
+                # Don't fail the operation - instance was launched successfully
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "status": "success",
+                "instance_id": instance_id,
+                "new_node_count": current_nodes + 1,
+                "message": f"Scale-up initiated: instance {instance_id} launched",
+            }),
+        }
+    else:
+        logger.error(f"Failed to launch instance: {launch_result}")
+        return launch_result
 
 
 def _fetch_bootstrap_script(s3_client, bucket: str, key: str) -> str:
@@ -190,6 +286,11 @@ def _launch_test_instance() -> dict:
         ],
         "ClientToken": str(uuid.uuid4()),  # Idempotency
     }
+
+    # Add SSH key pair if configured (for debugging)
+    if config.get("key_name"):
+        run_params["KeyName"] = config["key_name"]
+        logger.info(f"Using SSH key pair: {config['key_name']}")
 
     logger.info(f"Launching instance with: ami={run_params['ImageId']}, "
                 f"type={run_params['InstanceType']}, subnet={run_params['SubnetId']}")
