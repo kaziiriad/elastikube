@@ -7,139 +7,350 @@
       "width": 24,
       "height": 2,
       "properties": {
-        "markdown": "# K3s Autoscaler - Production Dashboard\n\n**Cluster:** k3s-cluster | **Region:** ap-southeast-1\n\n[Lambda Logs](https://console.aws.amazon.com/cloudwatch/home?region=ap-southeast-1#logsV2:log-groups=/aws/lambda) | [State Table](https://console.aws.amazon.com/dynamodb/home?region=ap-southeast-1#tables:k3s-cluster-state)"
+        "markdown": "# K3s Autoscaler - Production Dashboard\n\n**Cluster:** k3s-cluster | **Region:** ap-southeast-1\n\n[Lambda Logs](https://console.aws.amazon.com/cloudwatch/home?region=ap-southeast-1#logsV2:log-groups=/aws/lambda) | [State Table](https://console.aws.amazon.com/dynamodb/home?region=ap-southeast-1#tables:k3s-cluster-state) | [DLQs](https://console.aws.amazon.com/sqs/home?region=ap-southeast-1)"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 2,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Lambda Chaining Metrics - Scale-Up/Down Pipeline"
       }
     },
     {
       "type": "metric",
       "x": 0,
-      "y": 2,
+      "y": 3,
       "width": 6,
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Average"}],
-          ["AWS/Lambda", "Errors", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Sum"}]
+          ["AWS/Events", "FailedInvocations", {"stat": "Sum"}],
+          ["AWS/Events", "Invocations", {"stat": "Sum"}]
         ],
-        "period": 60,
-        "stat": "Average",
+        "period": 300,
+        "stat": "Sum",
         "region": "ap-southeast-1",
-        "title": "Lambda Performance"
+        "title": "EventBridge - Scale Events",
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        }
       }
     },
     {
       "type": "metric",
       "x": 6,
-      "y": 2,
+      "y": 3,
       "width": 6,
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/Lambda", "Invocations", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Sum"}]
+          ["AWS/Lambda", "Errors", {"label": "Scale-Up Errors"}],
+          ["AWS/Lambda", "Errors", {"label": "Scale-Down Errors"}],
+          ["AWS/Lambda", "Errors", {"label": "Decision Errors"}]
         ],
         "period": 300,
         "stat": "Sum",
         "region": "ap-southeast-1",
-        "title": "Lambda Invocations (5min)"
+        "title": "Lambda Errors (All Functions)"
       }
     },
     {
       "type": "metric",
       "x": 12,
-      "y": 2,
+      "y": 3,
       "width": 6,
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/EC2", "CPUUtilization"]
+          ["AWS/SQS", "ApproximateNumberOfMessagesVisible", {"stat": "Average"}]
         ],
         "period": 60,
         "stat": "Average",
         "region": "ap-southeast-1",
-        "title": "EC2 CPU"
+        "title": "DLQ - Failed Scale Events"
       }
     },
     {
       "type": "metric",
       "x": 18,
-      "y": 2,
+      "y": 3,
       "width": 6,
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Maximum"}]
+          ["AWS/SQS", "ApproximateAgeOfOldestMessage", {"stat": "Average"}]
         ],
         "period": 60,
-        "stat": "Maximum",
+        "stat": "Average",
         "region": "ap-southeast-1",
-        "title": "Concurrency"
+        "title": "DLQ - Oldest Failed Event (seconds)"
       }
     },
     {
-      "type": "log",
+      "type": "text",
       "x": 0,
-      "y": 8,
-      "width": 12,
-      "height": 8,
+      "y": 9,
+      "width": 24,
+      "height": 1,
       "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function-64ea403",
-        "view": "table",
-        "query": "fields @timestamp, @message\n| filter @message like /Worker Metrics/ or @message like /Master Metrics/\n| sort @timestamp desc\n| limit 50",
-        "region": "ap-southeast-1",
-        "title": "Cluster Metrics (from Lambda logs)"
-      }
-    },
-    {
-      "type": "log",
-      "x": 12,
-      "y": 8,
-      "width": 12,
-      "height": 8,
-      "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function-64ea403",
-        "view": "table",
-        "query": "fields @timestamp, @message\n| filter @message like /Decision/\n| sort @timestamp desc\n| limit 20",
-        "region": "ap-southeast-1",
-        "title": "Scaling Decisions"
+        "markdown": "## Scale-Up Lambda - Worker Provisioning"
       }
     },
     {
       "type": "metric",
       "x": 0,
-      "y": 16,
-      "width": 12,
+      "y": 10,
+      "width": 6,
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "Average"}],
-          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "p95"}],
-          ["AWS/Lambda", "Duration", "FunctionName", "k3s-autoscaler-function-64ea403", {"stat": "p99"}]
+          ["AWS/Lambda", "Invocations", {"stat": "Sum"}],
+          ["AWS/Lambda", "Errors", {"stat": "Sum"}]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "ap-southeast-1",
+        "title": "Scale-Up Lambda Calls"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 6,
+      "y": 10,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Duration", {"stat": "Average"}],
+          ["AWS/Lambda", "Duration", {"stat": "p95"}]
         ],
         "period": 300,
         "stat": "Average",
         "region": "ap-southeast-1",
-        "title": "Lambda Duration (ms)"
+        "title": "Scale-Up Duration (ms)"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 10,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/EC2", "StatusCheckFailed", {"stat": "Sum"}],
+          ["AWS/EC2", "StatusCheckFailed_Instance", {"stat": "Sum"}],
+          ["AWS/EC2", "StatusCheckFailed_System", {"stat": "Sum"}]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "ap-southeast-1",
+        "title": "EC2 Status Checks"
       }
     },
     {
       "type": "log",
-      "x": 12,
-      "y": 16,
-      "width": 12,
+      "x": 18,
+      "y": 10,
+      "width": 6,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function-64ea403",
+        "logGroupName": "/aws/lambda/scale-up-lambda-e2378cf",
         "view": "table",
-        "query": "fields @timestamp, @message\n| filter @message like /ERROR/ or @message like /Exception/\n| sort @timestamp desc\n| limit 10",
+        "query": "fields @timestamp, @message\n| filter @message like /SPOT/ or @message like /ON-DEMAND/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
-        "title": "Recent Errors"
+        "title": "Instance Type Logs"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 16,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Scale-Down Lambda - Node Drain & Termination"
       }
     },
     {
       "type": "metric",
       "x": 0,
-      "y": 22,
+      "y": 17,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Invocations", {"stat": "Sum"}],
+          ["AWS/Lambda", "Errors", {"stat": "Sum"}]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "ap-southeast-1",
+        "title": "Scale-Down Lambda Calls"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 6,
+      "y": 17,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Duration", {"stat": "Average"}],
+          ["AWS/Lambda", "Duration", {"stat": "p95"}]
+        ],
+        "period": 300,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Scale-Down Duration (ms)"
+      }
+    },
+    {
+      "type": "log",
+      "x": 12,
+      "y": 17,
       "width": 12,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/scale-down-lambda-66bdee2",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /Draining/ or @message like /Terminating/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "title": "Scale-Down Operations Log"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 23,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Decision Lambda - Scaling Logic"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 24,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Invocations", {"stat": "Sum"}],
+          ["AWS/Lambda", "Errors", {"stat": "Sum"}]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "ap-southeast-1",
+        "title": "Decision Lambda Calls"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 6,
+      "y": 24,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Duration", {"stat": "Average"}],
+          ["AWS/Lambda", "Duration", {"stat": "p95"}]
+        ],
+        "period": 300,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Decision Duration (ms)"
+      }
+    },
+    {
+      "type": "log",
+      "x": 12,
+      "y": 24,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function-7024efe",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /Decision:/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "title": "Scaling Decisions Log"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 30,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Health Check & Component Status"
+      }
+    },
+    {
+      "type": "log",
+      "x": 0,
+      "y": 31,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function-7024efe",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /health check/ or @message like /components/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "title": "Decision Lambda Health"
+      }
+    },
+    {
+      "type": "log",
+      "x": 8,
+      "y": 31,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/scale-up-lambda-e2378cf",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /health check/ or @message like /components/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "title": "Scale-Up Lambda Health"
+      }
+    },
+    {
+      "type": "log",
+      "x": 16,
+      "y": 31,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/scale-down-lambda-66bdee2",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /health check/ or @message like /components/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "title": "Scale-Down Lambda Health"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 37,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Cluster Metrics (from Prometheus)"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 38,
+      "width": 8,
       "height": 6,
       "properties": {
         "metrics": [
@@ -149,7 +360,7 @@
         "period": 60,
         "stat": "Average",
         "region": "ap-southeast-1",
-        "title": "CPU % (Worker vs Master)",
+        "title": "CPU % (from Prometheus)",
         "yAxis": {
           "left": {
             "min": 0,
@@ -160,9 +371,9 @@
     },
     {
       "type": "metric",
-      "x": 12,
-      "y": 22,
-      "width": 12,
+      "x": 8,
+      "y": 38,
+      "width": 8,
       "height": 6,
       "properties": {
         "metrics": [
@@ -172,7 +383,7 @@
         "period": 60,
         "stat": "Average",
         "region": "ap-southeast-1",
-        "title": "Memory % (Worker vs Master)",
+        "title": "Memory % (from Prometheus)",
         "yAxis": {
           "left": {
             "min": 0,
@@ -183,26 +394,9 @@
     },
     {
       "type": "metric",
-      "x": 0,
-      "y": 28,
-      "width": 12,
-      "height": 6,
-      "properties": {
-        "metrics": [
-          ["K3sAutoscaler", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Average"}],
-          [".", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Maximum"}]
-        ],
-        "period": 60,
-        "stat": "Average",
-        "region": "ap-southeast-1",
-        "title": "Pending Pods"
-      }
-    },
-    {
-      "type": "metric",
-      "x": 12,
-      "y": 28,
-      "width": 12,
+      "x": 16,
+      "y": 38,
+      "width": 8,
       "height": 6,
       "properties": {
         "metrics": [
@@ -213,24 +407,135 @@
         "period": 60,
         "stat": "Average",
         "region": "ap-southeast-1",
-        "title": "Node Count"
+        "title": "Node Counts (from Prometheus)",
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        }
       }
     },
     {
       "type": "metric",
       "x": 0,
-      "y": 34,
+      "y": 44,
       "width": 12,
       "height": 6,
       "properties": {
         "metrics": [
-          ["AWS/DynamoDB", "ConsumedReadCapacityUnits"],
-          ["AWS/DynamoDB", "ConsumedWriteCapacityUnits"]
+          ["K3sAutoscaler", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Average"}],
+          ["K3sAutoscaler", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Maximum"}]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Pending Pods (Avg vs Max)",
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 44,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["K3sAutoscaler", "ReadyNodes", "Cluster", "k3s-cluster", {"stat": "Average"}],
+          ["K3sAutoscaler", "TotalNodes", "Cluster", "k3s-cluster", {"stat": "Average"}]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "region": "ap-southeast-1",
+        "title": "Node Readiness (Ready vs Total)",
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 50,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Prometheus Query Logs"
+      }
+    },
+    {
+      "type": "log",
+      "x": 0,
+      "y": 51,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function-7024efe",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /Fetching cluster metrics/ or @message like /Prometheus/ or @message like /Worker Metrics:/ or @message like /Master Metrics:/\n| sort @timestamp desc\n| limit 50",
+        "region": "ap-southeast-1",
+        "title": "Prometheus Query Logs"
+      }
+    },
+    {
+      "type": "log",
+      "x": 12,
+      "y": 51,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/k3s-autoscaler-function-7024efe",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /ERROR/ and @message like /Prometheus/ or @message like /Failed to fetch/ or @message like /Connection error/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "title": "Prometheus Errors"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 57,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Cost & Performance Insights"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 58,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Duration", {"stat": "Average"}],
+          ["AWS/Lambda", "Duration", {"stat": "p95"}]
         ],
         "period": 300,
-        "stat": "Sum",
+        "stat": "Average",
         "region": "ap-southeast-1",
-        "title": "DynamoDB I/O"
+        "title": "Lambda Duration (All Functions)"
+      }
+    },
+    {
+      "type": "log",
+      "x": 12,
+      "y": 58,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/scale-up-lambda-e2378cf",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /70-90% cost savings/ or @message like /SPOT/ or @message like /ON-DEMAND/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "title": "Spot vs On-Demand Usage"
       }
     }
   ]

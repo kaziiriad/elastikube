@@ -21,7 +21,9 @@ Environment variables required:
 
 import json
 import logging
+import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -134,16 +136,110 @@ def _publish_cloudwatch_metrics(metrics: ClusterMetrics, node_count: int) -> Non
         logger.warning(f"Failed to publish CloudWatch metrics: {e}")
 
 
+def _handle_health_check() -> dict:
+    """Handle health check requests.
+
+    Returns the health status of all autoscaler components.
+
+    Returns:
+        Health check response with component statuses
+    """
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "components": {},
+    }
+
+    try:
+        dynamodb_client, _ = get_clients()
+
+        # Check DynamoDB connection and cluster state
+        try:
+            state_manager = StateManager(dynamodb_client)
+            state = state_manager.get_state()
+            health_status["components"]["dynamodb"] = {
+                "status": "healthy",
+                "cluster_name": state.cluster_id,
+                "node_count": state.node_count,
+            }
+        except Exception as e:
+            health_status["components"]["dynamodb"] = {
+                "status": "unhealthy",
+                "error": str(e),
+            }
+            health_status["status"] = "degraded"
+
+        # Check distributed lock
+        try:
+            lock = DistributedLock(dynamodb_client)
+            lock_info = lock.get_lock_info()
+            health_status["components"]["distributed_lock"] = {
+                "status": "healthy" if not lock_info else "locked",
+                "locked": bool(lock_info),
+                "lock_age_seconds": lock_info.get("age_seconds") if lock_info else 0,
+            }
+        except Exception as e:
+            health_status["components"]["distributed_lock"] = {
+                "status": "unhealthy",
+                "error": str(e),
+            }
+            health_status["status"] = "degraded"
+
+        # Check WAL
+        try:
+            wal = WriteAheadLog(dynamodb_client)
+            recent_operations = wal.get_recent_operations(limit=1)
+            health_status["components"]["wal"] = {
+                "status": "healthy",
+                "recent_operations": len(recent_operations),
+            }
+        except Exception as e:
+            health_status["components"]["wal"] = {
+                "status": "unhealthy",
+                "error": str(e),
+            }
+            health_status["status"] = "degraded"
+
+        # Check Prometheus connectivity
+        try:
+            prometheus = PrometheusClient()
+            health_status["components"]["prometheus"] = {
+                "status": "healthy",
+                "url": os.environ.get("PROMETHEUS_URL", "not configured"),
+            }
+        except Exception as e:
+            health_status["components"]["prometheus"] = {
+                "status": "unhealthy",
+                "error": str(e),
+            }
+            health_status["status"] = "degraded"
+
+    except Exception as e:
+        health_status["status"] = "unhealthy"
+        health_status["error"] = str(e)
+
+    return {
+        "statusCode": 200 if health_status["status"] in ("healthy", "degraded") else 503,
+        "body": json.dumps(health_status, indent=2),
+    }
+
+
 def lambda_handler(event: dict, context: Any) -> dict:
     """Lambda entry point for K3s autoscaler.
 
     Args:
-        event: Lambda event (not used for EventBridge trigger)
+        event: Lambda event
+            - {"action": "health_check"} for health check
+            - EventBridge trigger for autoscaling
         context: Lambda context
 
     Returns:
-        Response with scaling decision and status
+        Response with scaling decision, health status, or error
     """
+    # Health check endpoint
+    if event.get("action") == "health_check":
+        return _handle_health_check()
+
     logger.info("K3s Autoscaler Lambda invoked")
 
     try:
@@ -235,17 +331,22 @@ def lambda_handler(event: dict, context: Any) -> dict:
             # Step 6: Execute scaling action via EventBridge
             if decision.action == ScalingAction.SCALE_UP:
                 result = _publish_scale_up_event(decision)
-                # State will be updated by scale-up Lambda
             elif decision.action == ScalingAction.SCALE_DOWN:
                 result = _publish_scale_down_event(decision)
-                # State will be updated by scale-down Lambda
             else:
                 result = {"message": decision.reason}
-                # For NO_OP, update state to clear scaling_in_progress and sync node count
-                updated_state = state_manager.update_state(
-                    node_count=metrics.total_nodes,
-                    scaling_in_progress=False,
-                )
+
+            # Always sync node_count from actual cluster state (Prometheus/Kubernetes API)
+            # Use ready_nodes instead of total_nodes to exclude NotReady nodes from count
+            # This prevents state desync when nodes fail to join or leave unexpectedly
+            # Note: last_scale_operation and last_scale_time are set by scale-up/scale-down Lambdas
+            # after they complete their operations, not here during decision making
+            update_kwargs = {
+                "node_count": metrics.ready_nodes,
+                "scaling_in_progress": False,
+            }
+
+            _ = state_manager.update_state(**update_kwargs)
 
             return {
                 "statusCode": 200,

@@ -16,7 +16,6 @@ Environment variables required:
 import json
 import logging
 import os
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,11 +27,83 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
+def _handle_health_check() -> dict:
+    """Handle health check requests.
+
+    Returns the health status of the scale-down Lambda.
+
+    Returns:
+        Health check response with component statuses
+    """
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "lambda": "scale-down-lambda",
+        "components": {},
+    }
+
+    try:
+        ec2_client = boto3.client("ec2")
+        ssm_client = boto3.client("ssm")
+        dynamodb_client = boto3.client("dynamodb")
+
+        # Check EC2 connectivity
+        try:
+            ec2_client.describe_instances(MaxResults=1)
+            health_status["components"]["ec2"] = {"status": "healthy"}
+        except Exception as e:
+            health_status["components"]["ec2"] = {"status": "unhealthy", "error": str(e)}
+            health_status["status"] = "degraded"
+
+        # Check SSM connectivity (for kubectl drain)
+        try:
+            ssm_client.get_connection_status(NextToken="", MaxResults=1)
+            health_status["components"]["ssm"] = {"status": "healthy"}
+        except Exception as e:
+            health_status["components"]["ssm"] = {"status": "unhealthy", "error": str(e)}
+            health_status["status"] = "degraded"
+
+        # Check DynamoDB connectivity
+        try:
+            table_name = os.environ.get("STATE_TABLE_NAME")
+            if table_name:
+                dynamodb_client.describe_table(TableName=table_name)
+                health_status["components"]["dynamodb"] = {
+                    "status": "healthy",
+                    "table": table_name,
+                }
+            else:
+                health_status["components"]["dynamodb"] = {"status": "unhealthy", "error": "Table not configured"}
+                health_status["status"] = "degraded"
+        except Exception as e:
+            health_status["components"]["dynamodb"] = {"status": "unhealthy", "error": str(e)}
+            health_status["status"] = "degraded"
+
+        # Check configuration
+        cluster_name = os.environ.get("CLUSTER_NAME")
+        health_status["components"]["config"] = {
+            "status": "healthy" if cluster_name else "degraded",
+            "cluster_name": cluster_name,
+            "security_group": os.environ.get("SECURITY_GROUP_ID"),
+            "subnet_id": os.environ.get("SUBNET_ID"),
+        }
+
+    except Exception as e:
+        health_status["status"] = "unhealthy"
+        health_status["error"] = str(e)
+
+    return {
+        "statusCode": 200 if health_status["status"] in ("healthy", "degraded") else 503,
+        "body": json.dumps(health_status, indent=2),
+    }
+
+
 def lambda_handler(event: dict, context: Any) -> dict:
     """Lambda entry point for worker cleanup operations.
 
     Args:
         event: Lambda event
+            - {"action": "health_check"} for health check
             - EventBridge format: {"detail-type": "ScaleDown", "detail": {...}}
             - Direct format: {"action": "...", ...} for manual operations
         context: Lambda context
@@ -40,6 +111,10 @@ def lambda_handler(event: dict, context: Any) -> dict:
     Returns:
         Response with operation status and details
     """
+    # Health check endpoint
+    if event.get("action") == "health_check":
+        return _handle_health_check()
+
     logger.info("Worker Cleanup Lambda invoked")
     logger.info(f"Event: {json.dumps(event)}")
 
@@ -119,6 +194,72 @@ def _get_state_table_name() -> str:
     return os.environ.get("STATE_TABLE_NAME")
 
 
+def _acquire_distributed_lock(table_name: str, cluster_name: str, timeout_seconds: int = 10) -> tuple[bool, str]:
+    """Acquire distributed lock for scaling operation.
+
+    Args:
+        table_name: DynamoDB table name
+        cluster_name: Cluster identifier
+        timeout_seconds: Lock acquisition timeout
+
+    Returns:
+        Tuple of (acquired: bool, lock_id: str)
+    """
+    dynamodb = boto3.client("dynamodb")
+
+    # Current time and lock expiry
+    now = datetime.now(timezone.utc)
+    lock_id = f"scale-down-{now.isoformat()}"
+    lock_expiry = (now.timestamp() + timeout_seconds) * 1000  # Convert to milliseconds
+
+    try:
+        response = dynamodb.update_item(
+            TableName=table_name,
+            Key={"cluster_id": {"S": cluster_name}},
+            UpdateExpression="SET scaling_lock_id = :lock_id, lock_expiry = :expiry",
+            ConditionExpression="attribute_not_exists(scaling_lock_id) OR lock_expiry < :now",
+            ExpressionAttributeValues={
+                ":lock_id": {"S": lock_id},
+                ":expiry": {"N": str(lock_expiry)},
+                ":now": {"N": str(now.timestamp() * 1000)},
+            },
+            ReturnValues="UPDATED_NEW",
+        )
+        logger.info("✓ Acquired distributed lock for scale-down")
+        return True, lock_id
+    except dynamodb.exceptions.ConditionalCheckFailedException:
+        logger.warning("Could not acquire lock - another scaling operation in progress")
+        return False, ""
+    except Exception as e:
+        logger.error(f"Failed to acquire lock: {e}")
+        return False, ""
+
+
+def _release_distributed_lock(table_name: str, cluster_name: str, lock_id: str) -> None:
+    """Release distributed lock after scaling operation.
+
+    Args:
+        table_name: DynamoDB table name
+        cluster_name: Cluster identifier
+        lock_id: Lock identifier to release
+    """
+    dynamodb = boto3.client("dynamodb")
+
+    try:
+        dynamodb.update_item(
+            TableName=table_name,
+            Key={"cluster_id": {"S": cluster_name}},
+            UpdateExpression="REMOVE scaling_lock_id, lock_expiry",
+            ConditionExpression="scaling_lock_id = :lock_id",
+            ExpressionAttributeValues={
+                ":lock_id": {"S": lock_id},
+            },
+        )
+        logger.info("✓ Released distributed lock")
+    except Exception as e:
+        logger.error(f"Failed to release lock: {e}")
+
+
 def _handle_scale_down(detail: dict) -> dict:
     """Handle scale-down event from EventBridge.
 
@@ -136,44 +277,79 @@ def _handle_scale_down(detail: dict) -> dict:
 
     logger.info(f"Scale-down: {current_nodes} -> {target_nodes} nodes ({reason})")
 
-    # Execute scale-down (drain + terminate)
-    scale_result = _scale_down()
+    # Step 1: Acquire distributed lock
+    table_name = _get_state_table_name()
+    cluster_name = _get_cluster_name()
+    lock_id = ""
 
-    if scale_result["statusCode"] == 200:
-        # Update DynamoDB state with new node count
-        state_table_name = _get_state_table_name()
-        if state_table_name:
-            try:
-                dynamodb = boto3.client("dynamodb")
-                new_node_count = current_nodes - 1
+    if table_name:
+        lock_acquired, lock_id = _acquire_distributed_lock(table_name, cluster_name)
+        if not lock_acquired:
+            logger.warning("Could not acquire distributed lock - another scaling operation in progress")
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "status": "skipped",
+                    "reason": "Distributed lock not available - another scaling operation in progress",
+                }),
+            }
 
-                dynamodb.update_item(
-                    TableName=state_table_name,
-                    Key={"cluster_id": {"S": _get_cluster_name()}},
-                    UpdateExpression=(
-                        "SET node_count = :node_count, "
-                        "scaling_in_progress = :false, "
-                        "last_scale_operation = :op, "
-                        "last_scale_time = :time"
-                    ),
-                    ExpressionAttributeValues={
-                        ":node_count": {"N": str(new_node_count)},
-                        ":false": {"S": "false"},
-                        ":op": {"S": "SCALE_DOWN"},
-                        ":time": {"S": datetime.now(timezone.utc).isoformat()},
-                    },
-                )
+    # Step 2: Execute scale-down (drain + terminate)
+    try:
+        scale_result = _scale_down()
 
-                logger.info(f"✓ State updated: node_count={new_node_count}")
+        if scale_result["statusCode"] == 200:
+            # Check if scale-down was skipped (no eligible workers)
+            result_body = json.loads(scale_result.get("body", "{}"))
+            if result_body.get("status") == "skipped":
+                logger.info("Scale-down skipped (no eligible workers)")
+                return scale_result
 
-            except ClientError as e:
-                logger.error(f"Failed to update DynamoDB state: {e}")
-                # Don't fail the operation - scale-down succeeded
+            # Update DynamoDB state with new node count
+            if table_name:
+                try:
+                    dynamodb = boto3.client("dynamodb")
+                    new_node_count = current_nodes - 1
 
-        return scale_result
-    else:
-        logger.error(f"Scale-down operation failed: {scale_result}")
-        return scale_result
+                    dynamodb.update_item(
+                        TableName=table_name,
+                        Key={"cluster_id": {"S": cluster_name}},
+                        UpdateExpression=(
+                            "SET node_count = :node_count, "
+                            "scaling_in_progress = :false, "
+                            "last_scale_operation = :op, "
+                            "last_scale_time = :time"
+                        ),
+                        ExpressionAttributeValues={
+                            ":node_count": {"N": str(new_node_count)},
+                            ":false": {"S": "false"},
+                            ":op": {"S": "SCALE_DOWN"},
+                            ":time": {"S": datetime.now(timezone.utc).isoformat()},
+                        },
+                    )
+
+                    logger.info(f"✓ State updated: node_count={new_node_count}")
+
+                except ClientError as e:
+                    logger.error(f"Failed to update DynamoDB state: {e}")
+                    # Don't fail the operation - scale-down succeeded
+
+            # Final summary logging
+            logger.info("=" * 60)
+            logger.info("✓ SCALE-DOWN WORKFLOW COMPLETED")
+            logger.info(f"  Previous node count: {current_nodes}")
+            logger.info(f"  New node count: {new_node_count}")
+            logger.info(f"  Cluster: {cluster_name}")
+            logger.info("=" * 60)
+
+            return scale_result
+        else:
+            logger.error(f"Scale-down operation failed: {scale_result}")
+            return scale_result
+    finally:
+        # Step 3: Always release the lock
+        if table_name and lock_id:
+            _release_distributed_lock(table_name, cluster_name, lock_id)
 
 
 def _list_workers() -> dict:
@@ -308,15 +484,16 @@ def _drain_worker(instance_id: str) -> dict:
     node_name = f"ip-{private_ip}"
     logger.info(f"Node name: {node_name}")
 
-    # Execute kubectl drain via SSM on master
+    # Execute kubectl drain and kubectl delete via SSM on master
     drain_command = f"sudo kubectl drain {node_name} --ignore-daemonsets --delete-emptydir-data --timeout=120s"
+    delete_command = f"sudo kubectl delete node {node_name} --ignore-not-found=true"
 
-    logger.info(f"Executing drain command via SSM on master")
+    logger.info("Executing drain command via SSM on master")
     try:
         ssm_response = ssm_client.send_command(
             InstanceIds=[master_instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [drain_command]},
+            Parameters={"commands": [drain_command, delete_command]},
             TimeoutSeconds=120,
         )
 
@@ -410,7 +587,7 @@ def _uninstall_k3s_worker(instance_id: str) -> dict:
 
     uninstall_command = "sudo /usr/local/bin/k3s-agent-uninstall.sh"
 
-    logger.info(f"Executing uninstall script via SSM on worker")
+    logger.info("Executing uninstall script via SSM on worker")
     try:
         ssm_response = ssm_client.send_command(
             InstanceIds=[instance_id],
@@ -462,7 +639,7 @@ def _uninstall_k3s_worker(instance_id: str) -> dict:
                 return {
                     "statusCode": 200,
                     "body": json.dumps({
-                        "message": f"K3s agent uninstalled successfully",
+                        "message": "K3s agent uninstalled successfully",
                         "instance_id": instance_id,
                         "status": status,
                         "output": stdout[-500:] if len(stdout) > 500 else stdout,
@@ -573,10 +750,11 @@ def _scale_down() -> dict:
             })
 
     if not workers:
-        logger.warning("No eligible workers found for scale-down")
+        logger.info("No eligible workers found for scale-down (all workers are permanent)")
         return {
             "statusCode": 200,
             "body": json.dumps({
+                "status": "skipped",
                 "message": "No eligible instance found for scale-down (all workers are permanent)",
             }),
         }
@@ -600,17 +778,30 @@ def _scale_down() -> dict:
     drain_data = json.loads(drain_result["body"])
 
     if drain_result["statusCode"] == 200:
-        logger.info(f"Node drained successfully, proceeding with termination")
+        logger.info("Node drained successfully, proceeding with termination")
 
         # Terminate instance
         terminate_result = _terminate_worker(instance_id)
         terminate_data = json.loads(terminate_result["body"])
+
+        # Comprehensive success logging
+        logger.info("=" * 60)
+        logger.info("✓ SCALE-DOWN OPERATION COMPLETED SUCCESSFULLY")
+        logger.info(f"  Instance ID: {instance_id}")
+        logger.info(f"  Node Name: {drain_data.get('node_name', 'N/A')}")
+        logger.info("  Node Drained: Yes")
+        logger.info("  Node Deleted: Yes")
+        logger.info("  Instance Terminated: Yes")
+        logger.info(f"  Drain Status: {drain_data.get('status', 'N/A')}")
+        logger.info(f"  Termination Status: {terminate_data.get('status', 'N/A')}")
+        logger.info("=" * 60)
 
         return {
             "statusCode": 200,
             "body": json.dumps({
                 "message": "Scale-down completed",
                 "instance_id": instance_id,
+                "node_name": drain_data.get("node_name", "N/A"),
                 "drain_result": drain_data,
                 "terminate_result": terminate_data,
             }),
@@ -628,18 +819,20 @@ def _scale_down() -> dict:
 
 
 def _clean_stale_nodes() -> dict:
-    """Remove NotReady nodes from the Kubernetes cluster.
+    """Remove NotReady nodes from the Kubernetes cluster using SSM.
 
     This identifies nodes that are NotReady (terminated instances but not
-    removed from Kubernetes) and deletes them via kubectl on the master.
+    removed from Kubernetes) and deletes them one-by-one via kubectl on the master.
+    Each deletion uses a separate SSM command for atomicity and better logging.
     """
     logger.info("Executing CLEAN_STALE_NODES operation")
 
     cluster_name = _get_cluster_name()
     ssm_client = boto3.client("ssm")
+    ec2_client = boto3.client("ec2")
 
+    # Step 1: Get master IP and instance ID
     try:
-        # Get master IP from SSM
         master_ip_response = ssm_client.get_parameter(
             Name=f"/k3s/{cluster_name}/master-ip"
         )
@@ -653,8 +846,6 @@ def _clean_stale_nodes() -> dict:
             }),
         }
 
-    # Look up master instance ID from master IP
-    ec2_client = boto3.client("ec2")
     try:
         master_response = ec2_client.describe_instances(
             Filters=[{"Name": "private-ip-address", "Values": [master_ip]}]
@@ -669,113 +860,120 @@ def _clean_stale_nodes() -> dict:
             }),
         }
 
-    # Command to find and delete NotReady nodes (without jq)
-    cleanup_command = """
-    # Get NotReady nodes - column 2 is STATUS, column 3 is ROLES
-    # Only delete nodes that are NotReady, regardless of SchedulingDisabled state
-    # Skip control-plane nodes (column 3 contains "control-plane")
-    STALE_NODES=$(kubectl get nodes --no-headers | \
-        awk '$3 !~ /control-plane/ && $2 ~ /NotReady/ {print $1}')
+    # Step 2: Get list of NotReady nodes via SSM
+    find_stale_command = "sudo kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name,ROLE:.metadata.labels.kubernetes\\.io/role,STATUS:.status.phase | awk '$3 == \"NotReady\" {print $1}'"
 
-
-    if [ -z "$STALE_NODES" ]; then
-        echo "No stale nodes found"
-        exit 0
-    fi
-
-    echo "Found stale nodes:"
-    echo "$STALE_NODES"
-
-    # Delete each stale node
-    for node in $STALE_NODES; do
-        echo "Deleting node: $node"
-        kubectl delete node "$node" --ignore-not-found=true
-    done
-
-    echo "Cleanup completed"
-    """
-
-    logger.info("Executing cleanup command via SSM on master")
+    logger.info("Finding stale nodes via SSM on master")
     try:
         ssm_response = ssm_client.send_command(
             InstanceIds=[master_instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [cleanup_command]},
-            TimeoutSeconds=60,
+            Parameters={"commands": [find_stale_command]},
+            TimeoutSeconds=30,
         )
 
         command_id = ssm_response["Command"]["CommandId"]
-        logger.info(f"SSM Command ID: {command_id}")
 
         # Wait for command to complete
         import time
         time.sleep(5)
 
-        max_attempts = 12  # 1 minute
+        max_attempts = 6  # 30 seconds
         for attempt in range(max_attempts):
-            try:
-                result = ssm_client.get_command_invocation(
-                    CommandId=command_id,
-                    InstanceId=master_instance_id,
-                )
-
-                status = result["Status"]
-                logger.info(f"Cleanup attempt {attempt + 1}/{max_attempts}: status={status}")
-
-                if status in ["Success", "Failed", "TimedOut", "Cancelled"]:
-                    break
-
-                time.sleep(5)
-            except ClientError as e:
-                logger.warning(f"Cleanup attempt {attempt + 1}/{max_attempts}: SSM error - {e}")
-                time.sleep(5)
-
-        # Get final result
-        try:
             result = ssm_client.get_command_invocation(
                 CommandId=command_id,
                 InstanceId=master_instance_id,
             )
+            if result["Status"] in ["Success", "Failed", "TimedOut", "Cancelled"]:
+                break
+            time.sleep(5)
 
-            stdout = result.get("StandardOutputContent", "")
-            stderr = result.get("StandardErrorContent", "")
-            status = result["Status"]
+        stdout = result.get("StandardOutputContent", "")
+        stderr = result.get("StandardErrorContent", "")
 
-            logger.info(f"Cleanup command status: {status}")
-
-            if status == "Success":
-                # Parse how many nodes were deleted
-                deleted_count = stdout.count("Deleting node:")
-                return {
-                    "statusCode": 200,
-                    "body": json.dumps({
-                        "message": f"Stale node cleanup completed",
-                        "status": status,
-                        "nodes_deleted": deleted_count,
-                        "output": stdout[-500:] if len(stdout) > 500 else stdout,
-                    }),
-                }
-            else:
-                return {
-                    "statusCode": 500,
-                    "body": json.dumps({
-                        "message": f"Cleanup failed with status: {status}",
-                        "status": status,
-                        "stderr": stderr[-500:] if len(stderr) > 500 else stderr,
-                    }),
-                }
-        except ClientError as e:
+        if result["Status"] != "Success":
             return {
                 "statusCode": 500,
                 "body": json.dumps({
-                    "error": f"Failed to get command result: {e}",
+                    "error": f"Failed to find stale nodes: {stderr}",
                 }),
             }
+
+        # Parse node names from output
+        stale_nodes = [line.strip() for line in stdout.split('\n') if line.strip()]
+
+        if not stale_nodes:
+            logger.info("No stale nodes found")
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "message": "No stale nodes found",
+                    "nodes_deleted": 0,
+                }),
+            }
+
+        logger.info(f"Found {len(stale_nodes)} stale nodes: {stale_nodes}")
 
     except ClientError as e:
         return {
             "statusCode": 500,
             "body": json.dumps({
-                "error": f"Failed to send SSM command: {e}",
+                "error": f"Failed to query stale nodes: {e}",
             }),
         }
+
+    # Step 3: Delete each stale node individually via SSM
+    nodes_deleted = 0
+    failed_nodes = []
+
+    for node_name in stale_nodes:
+        logger.info(f"Deleting stale node: {node_name}")
+
+        delete_command = f"sudo kubectl delete node {node_name} --ignore-not-found=true"
+
+        try:
+            ssm_response = ssm_client.send_command(
+                InstanceIds=[master_instance_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": [delete_command]},
+                TimeoutSeconds=30,
+            )
+
+            command_id = ssm_response["Command"]["CommandId"]
+
+            # Wait for command to complete
+            time.sleep(3)
+
+            max_attempts = 6  # 30 seconds
+            for attempt in range(max_attempts):
+                result = ssm_client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=master_instance_id,
+                )
+                if result["Status"] in ["Success", "Failed", "TimedOut", "Cancelled"]:
+                    break
+                time.sleep(5)
+
+            stdout = result.get("StandardOutputContent", "")
+            stderr = result.get("StandardErrorContent", "")
+
+            if result["Status"] == "Success":
+                nodes_deleted += 1
+                logger.info(f"✓ Deleted stale node: {node_name}")
+            else:
+                failed_nodes.append(node_name)
+                logger.warning(f"✗ Failed to delete node {node_name}: {stderr}")
+
+        except ClientError as e:
+            failed_nodes.append(node_name)
+            logger.warning(f"✗ Failed to send delete command for {node_name}: {e}")
+
+    # Return summary
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": f"Stale node cleanup completed: {nodes_deleted} deleted, {len(failed_nodes)} failed",
+            "nodes_deleted": nodes_deleted,
+            "failed_nodes": failed_nodes,
+        }),
+    }

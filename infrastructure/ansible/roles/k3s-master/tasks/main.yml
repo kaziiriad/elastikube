@@ -35,49 +35,27 @@
   debug:
     msg: "Master IP: {{ master_ip.stdout }}, Token: {{ k3s_token.stdout[:20] }}..."
 
-- name: Store K3s join token to Secrets Manager
-  shell: |
-    SECRET_NAME="k3s-${CLUSTER_NAME}-join-token"
-    TOKEN="{{ k3s_token.stdout }}"
+- name: Install boto3 and botocore on master node
+  ansible.builtin.pip:
+    name:
+      - boto3
+      - botocore
+    state: present
+    executable: pip3
 
-    # Store token in Secrets Manager
-    aws secretsmanager put-secret-value \
-      --secret-id "$SECRET_NAME" \
-      --secret-string "$TOKEN" \
-      --region "{{ aws_region }}" \
-      2>&1 | grep -v "^$"
-  changed_when: true
-  register: secret_store_result
-  ignore_errors: true
-  environment:
-    CLUSTER_NAME: "{{ cluster_name | default('production-k3s') }}"
+- name: Store K3s join token to Secrets Manager
+  community.aws.secretsmanager_secret:
+    name: "k3s-{{ cluster_name | default('production-k3s') }}-join-token"
+    description: "K3s cluster join token for worker nodes"
+    secret: "{{ k3s_token.stdout }}"
+    state: present
+    overwrite: true
+    region: "{{ aws_region }}"
+  register: aws_secret_result
 
 - name: Show Secrets Manager storage result
   debug:
-    msg: "Token stored to Secrets Manager: {{ 'Success' if secret_store_result.rc == 0 else 'Failed (may need permissions)' }}"
-
-- name: Store master IP to SSM Parameter Store
-  shell: |
-    SSM_PARAM="/k3s/${CLUSTER_NAME}/master-ip"
-    MASTER_IP="{{ master_ip.stdout }}"
-
-    # Store master IP in SSM Parameter Store
-    aws ssm put-parameter \
-      --name "$SSM_PARAM" \
-      --value "$MASTER_IP" \
-      --type String \
-      --overwrite \
-      --region "{{ aws_region }}" \
-      2>&1 | grep -v "^$"
-  changed_when: true
-  register: ssm_store_result
-  ignore_errors: true
-  environment:
-    CLUSTER_NAME: "{{ cluster_name | default('production-k3s') }}"
-
-- name: Show SSM Parameter storage result
-  debug:
-    msg: "Master IP stored to SSM: {{ 'Success' if ssm_store_result.rc == 0 else 'Failed (may need permissions)' }}"
+    msg: "K3s join token successfully stored in AWS Secrets Manager"
 
 - name: Set master IP as fact for workers
   set_fact:
@@ -301,3 +279,24 @@
 - name: Display SSM Agent status
   debug:
     msg: "{{ ssm_status.stdout_lines }}"
+
+# ==========================================
+# Install check-node-by-ip script for Lambda verification
+# ==========================================
+
+- name: Copy check-node-by-ip script to master
+  copy:
+    src: files/check-node-by-ip.sh
+    dest: /usr/local/bin/check-node-by-ip.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Verify check-node-by-ip script is installed
+  command: ls -la /usr/local/bin/check-node-by-ip.sh
+  register: script_check
+  changed_when: false
+
+- name: Display script installation status
+  debug:
+    msg: "check-node-by-ip.sh installed: {{ script_check.stdout }}"

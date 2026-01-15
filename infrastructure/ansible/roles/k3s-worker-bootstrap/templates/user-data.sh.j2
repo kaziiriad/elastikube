@@ -141,7 +141,7 @@ if systemctl is-active --quiet k3s-agent; then
     aws ec2 create-tags \
         --resources "$INSTANCE_ID" \
         --tags \
-            "Key=ClusterName,Value=$CLUSTER_NAME" \
+            "Key=Cluster,Value=$CLUSTER_NAME" \
             "Key=NodeRole,Value=worker" \
             "Key=JoinStatus,Value=success" \
             "Key=JoinedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -158,7 +158,7 @@ else
     aws ec2 create-tags \
         --resources "$INSTANCE_ID" \
         --tags \
-            "Key=ClusterName,Value=$CLUSTER_NAME" \
+            "Key=Cluster,Value=$CLUSTER_NAME" \
             "Key=NodeRole,Value=worker" \
             "Key=JoinStatus,Value=failed" \
             "Key=FailedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

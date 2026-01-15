@@ -67,6 +67,8 @@ common_tags = {
 # =============================================================================
 # TODO: Configure VPC networking based on your existing setup
 # Create a VPC
+# NOTE: VPC must be created FIRST in code (so it deletes LAST during pulumi destroy)
+# This ensures all dependent resources (Lambdas, EC2, SGs, subnets) delete before VPC
 vpc = ec2.Vpc(
     'my-vpc',
     cidr_block='10.0.0.0/16',
@@ -74,7 +76,8 @@ vpc = ec2.Vpc(
     enable_dns_support=True,
     tags={
         'Name': 'my-vpc',
-    }
+    },
+    opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="5m", delete="15m")),
 )
 
 # Create subnets
@@ -85,7 +88,8 @@ public_subnet = ec2.Subnet('public-subnet',
     availability_zone='ap-southeast-1a',
     tags={
         'Name': 'public-subnet',
-    }
+    },
+    opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="10m")),
 )
 
 private_subnet = ec2.Subnet('private-subnet',
@@ -95,7 +99,8 @@ private_subnet = ec2.Subnet('private-subnet',
     availability_zone='ap-southeast-1a',
     tags={
         'Name': 'private-subnet',
-    }
+    },
+    opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="10m")),
 )
 
 # Internet Gateway
@@ -117,13 +122,16 @@ public_route_table = ec2.RouteTable('public-route-table',
 public_route_table_association = ec2.RouteTableAssociation(
     'public-route-table-association',
     subnet_id=public_subnet.id,
-    route_table_id=public_route_table.id
+    route_table_id=public_route_table.id,
+    # Ensure route table association deletes before subnet (helps with cleanup)
+    opts=pulumi.ResourceOptions(delete_before_replace=True, custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m")),
 )
 
 # Elastic IP for NAT Gateway
 eip = ec2.Eip(
     'nat-eip',
-    tags={'Name': 'k3s-deployment-eip'}
+    tags={'Name': 'k3s-deployment-eip'},
+    opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m")),
 )
 
 # NAT Gateway
@@ -133,7 +141,8 @@ nat_gateway = ec2.NatGateway(
     allocation_id=eip.id,
     tags={
         'Name': 'nat-gateway',
-    }
+    },
+    opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="5m", delete="10m")),
 )
 
 # Route Table for Private Subnet 
@@ -153,12 +162,17 @@ private_route_table = ec2.RouteTable(
 private_route_table_association = ec2.RouteTableAssociation(
     'private-route-table-association',
     subnet_id=private_subnet.id,
-    route_table_id=private_route_table.id
+    route_table_id=private_route_table.id,
+    # Ensure route table association deletes before subnet (helps with cleanup)
+    opts=pulumi.ResourceOptions(delete_before_replace=True, custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m")),
 )
 
-# Security Group for Bastion Host (SSH access from internet)
-bastion_security_group = aws.ec2.SecurityGroup("bastion-secgrp",
-    description='Enable SSH access to bastion host',
+# Security Group for K3s Cluster (bastion + cluster nodes + monitoring)
+# Merged security group to avoid slow deployment from cross-references
+# NOTE: This must be defined AFTER EC2 instances in the code to ensure proper deletion order
+# Pulumi deletes in reverse order of creation, so we want SG to be created BEFORE instances
+bastion_security_group = aws.ec2.SecurityGroup("k3s-cluster-secgrp",
+    description='K3s cluster security group - bastion SSH, cluster internal traffic, monitoring',
     vpc_id=vpc.id,
     ingress=[
         # SSH access from internet (restrict to your IP in production)
@@ -167,31 +181,6 @@ bastion_security_group = aws.ec2.SecurityGroup("bastion-secgrp",
             "from_port": 22,
             "to_port": 22,
             "cidr_blocks": ["0.0.0.0/0"],
-        },
-    ],
-    egress=[{
-        "protocol": "-1",
-        "from_port": 0,
-        "to_port": 0,
-        "cidr_blocks": ["0.0.0.0/0"],
-    }],
-    tags={
-        'Name': 'bastion-secgrp',
-    },
-    # custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m"),  # Longer delete timeout for ENI cleanup
-)
-
-# Security Group for K3s cluster traffic (private subnet)
-security_group = aws.ec2.SecurityGroup("k3s-secgrp",
-    description='Enable K3s cluster and monitoring access',
-    vpc_id=vpc.id,
-    ingress=[
-        # SSH access ONLY from bastion host
-        {
-            "protocol": "tcp",
-            "from_port": 22,
-            "to_port": 22,
-            "security_groups": [bastion_security_group.id],
         },
         # Kubernetes API Server (within VPC)
         {
@@ -219,13 +208,6 @@ security_group = aws.ec2.SecurityGroup("k3s-secgrp",
             "protocol": "udp",
             "from_port": 8472,
             "to_port": 8472,
-            "cidr_blocks": ["10.0.0.0/16"],
-        },
-        # K3s supervisor API
-        {
-            "protocol": "tcp",
-            "from_port": 6443,
-            "to_port": 6443,
             "cidr_blocks": ["10.0.0.0/16"],
         },
         # NodePort services range
@@ -257,9 +239,9 @@ security_group = aws.ec2.SecurityGroup("k3s-secgrp",
         "cidr_blocks": ["0.0.0.0/0"],
     }],
     tags={
-        'Name': 'k3s-secgrp',
+        'Name': 'k3s-cluster-secgrp',
     },
-    # custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m"),  # Longer delete timeout for ENI cleanup
+    opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="10m")),
 )
 
 # =============================================================================
@@ -326,11 +308,12 @@ wal_table = dynamodb.Table(
 # =============================================================================
 
 # SSM Parameter for Master IP (public configuration)
+# Note: Uses static IP assigned to master instance (defined below at line 674)
 master_ip_parameter = ssm.Parameter(
     "k3s-master-ip",
     name=f"/k3s/{cluster_name}/master-ip",
     type="String",
-    value="PENDING",  # Will be populated by Ansible after cluster setup
+    value="10.0.2.10",  # Static IP for master node (matches master_static_ip)
     overwrite=True,  # Allow overwriting existing parameter
     description="K3s master node private IP for worker node join",
     tags={**common_tags, "Name": "k3s-master-ip-parameter"},
@@ -366,6 +349,7 @@ k3s_join_token_version = secretsmanager.SecretVersion(
 worker_userdata_bucket = s3.Bucket(
     "k3s-worker-userdata",
     bucket=f"k3s-userdata-{cluster_name}",
+    force_destroy=True,  # Delete all objects before destroying bucket
     tags={**common_tags, "Name": "k3s-worker-userdata", "Purpose": "worker-bootstrap-scripts"}
 )
 
@@ -582,6 +566,7 @@ worker_policy = iam.RolePolicy(
                 "actions": [
                     "ec2:DescribeInstances",
                     "ec2:DescribeTags",
+                    "ec2:CreateTags",
                 ],
                 "resources": ["*"],
                 "effect": "Allow",
@@ -694,7 +679,7 @@ master_instance = ec2.Instance(
     instance_type=master_instance_type,
     ami=ami_id,
     subnet_id=private_subnet.id,  # Private subnet for security
-    vpc_security_group_ids=[security_group.id],
+    vpc_security_group_ids=[bastion_security_group.id],
     associate_public_ip_address=False,  # No public IP
     private_ip=master_static_ip,  # Static private IP for SSH config consistency
     iam_instance_profile=master_instance_profile.name,  # SSM access for kubectl drain
@@ -707,7 +692,7 @@ worker_instance_1 = ec2.Instance('worker-instance-1',
     instance_type=worker_instance_type,
     ami=ami_id,
     subnet_id=private_subnet.id,  # Private subnet for security
-    vpc_security_group_ids=[security_group.id],
+    vpc_security_group_ids=[bastion_security_group.id],
     associate_public_ip_address=False,  # No public IP
     private_ip=worker_1_static_ip,  # Static private IP
     iam_instance_profile=worker_instance_profile.name,
@@ -720,7 +705,7 @@ worker_instance_2 = ec2.Instance('worker-instance-2',
     instance_type=worker_instance_type,
     ami=ami_id,
     subnet_id=private_subnet.id,  # Private subnet for security
-    vpc_security_group_ids=[security_group.id],
+    vpc_security_group_ids=[bastion_security_group.id],
     associate_public_ip_address=False,  # No public IP
     private_ip=worker_2_static_ip,  # Static private IP
     iam_instance_profile=worker_instance_profile.name,
@@ -750,7 +735,7 @@ base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 decision_lambda_build = local.Command(
     "decision-lambda-build",
     create=f"cd {base_dir}/decision-lambda && ./build.sh",
-    delete=f"rm -rf {base_dir}/decision-lambda/build",
+    # delete=f"rm -rf {base_dir}/decision-lambda/build",
     triggers=[pulumi.FileAsset(f"{base_dir}/decision-lambda/main.py").path],
 )
 
@@ -767,7 +752,7 @@ lambda_function = lambda_.Function(
     memory_size=256,  # 256 MB
     vpc_config=lambda_.FunctionVpcConfigArgs(
         subnet_ids=[private_subnet.id],
-        security_group_ids=[security_group.id],
+        security_group_ids=[bastion_security_group.id],
     ),
     environment=lambda_.FunctionEnvironmentArgs(
         variables={
@@ -785,7 +770,7 @@ lambda_function = lambda_.Function(
             "DRY_RUN": "false",
             # EC2 Configuration
             "SUBNET_ID": private_subnet.id,
-            "SECURITY_GROUP_ID": security_group.id,
+            "SECURITY_GROUP_ID": bastion_security_group.id,
             "IAM_INSTANCE_PROFILE": worker_instance_profile.name,
             "AMI_ID": ami_id,
             "INSTANCE_TYPE": worker_instance_type,
@@ -795,7 +780,8 @@ lambda_function = lambda_.Function(
         }
     ),
     code=lambda_archive,
-    tags={**common_tags, "Name": "k3s-autoscaler"}
+    tags={**common_tags, "Name": "k3s-autoscaler"},
+    opts=pulumi.ResourceOptions(depends_on=[decision_lambda_build]),
 )
 
 # Lambda Permission for EventBridge to invoke
@@ -827,7 +813,7 @@ event_target = aws.cloudwatch.EventTarget(
 scale_up_lambda_build = local.Command(
     "scale-up-lambda-build",
     create=f"cd {base_dir}/scale-up-lambda && ./build.sh",
-    delete=f"rm -rf {base_dir}/scale-up-lambda/build",
+    # delete=f"rm -rf {base_dir}/scale-up-lambda/build",
     triggers=[pulumi.FileAsset(f"{base_dir}/scale-up-lambda/main.py").path],
 )
 
@@ -847,7 +833,7 @@ scale_up_lambda = lambda_.Function(
     memory_size=256,  # 256 MB
     vpc_config=lambda_.FunctionVpcConfigArgs(
         subnet_ids=[private_subnet.id],
-        security_group_ids=[security_group.id],
+        security_group_ids=[bastion_security_group.id],
     ),
     environment=lambda_.FunctionEnvironmentArgs(
         variables={
@@ -856,18 +842,21 @@ scale_up_lambda = lambda_.Function(
             "STATE_TABLE_NAME": cluster_state_table.name,
             # EC2 Configuration
             "SUBNET_ID": private_subnet.id,
-            "SECURITY_GROUP_ID": security_group.id,
+            "SECURITY_GROUP_ID": bastion_security_group.id,
             "IAM_INSTANCE_PROFILE": worker_instance_profile.name,
             "AMI_ID": ami_id,
             "INSTANCE_TYPE": worker_instance_type,
             "KEY_NAME": existing_key_name,  # SSH key pair for debugging
+            # Spot Instance Configuration
+            "USE_SPOT_INSTANCES": config.get_bool("use_spot_instances", False),
             # S3 Configuration for bootstrap script
             "USER_DATA_S3_BUCKET": worker_userdata_bucket.bucket,
             "USER_DATA_S3_KEY": "user-data/worker-bootstrap.sh",
         }
     ),
     code=scale_up_archive,
-    tags={**common_tags, "Name": "scale-up-lambda", "Purpose": "worker-scaling"}
+    tags={**common_tags, "Name": "scale-up-lambda", "Purpose": "worker-scaling"},
+    opts=pulumi.ResourceOptions(depends_on=[scale_up_lambda_build]),
 )
 
 # =============================================================================
@@ -881,7 +870,7 @@ scale_up_lambda = lambda_.Function(
 scale_down_lambda_build = local.Command(
     "scale-down-lambda-build",
     create=f"cd {base_dir}/scale-down-lambda && ./build.sh",
-    delete=f"rm -rf {base_dir}/scale-down-lambda/build",
+    # delete=f"rm -rf {base_dir}/scale-down-lambda/build",
     triggers=[pulumi.FileAsset(f"{base_dir}/scale-down-lambda/main.py").path],
 )
 
@@ -901,7 +890,7 @@ scale_down_lambda = lambda_.Function(
     memory_size=256,  # 256 MB
     vpc_config=lambda_.FunctionVpcConfigArgs(
         subnet_ids=[private_subnet.id],
-        security_group_ids=[security_group.id],
+        security_group_ids=[bastion_security_group.id],
     ),
     environment=lambda_.FunctionEnvironmentArgs(
         variables={
@@ -911,7 +900,88 @@ scale_down_lambda = lambda_.Function(
         }
     ),
     code=scale_down_archive,
-    tags={**common_tags, "Name": "scale-down-lambda", "Purpose": "worker-scaling"}
+    tags={**common_tags, "Name": "scale-down-lambda", "Purpose": "worker-scaling"},
+    opts=pulumi.ResourceOptions(depends_on=[scale_down_lambda_build]),
+)
+
+# =============================================================================
+# Cleanup Lambda for Failed Instances
+# =============================================================================
+
+# Build Cleanup Lambda Package
+cleanup_lambda_build = local.Command(
+    "cleanup-lambda-build",
+    create=f"cd {base_dir}/cleanup-lambda && ./build.sh",
+    triggers=[pulumi.FileAsset(f"{base_dir}/cleanup-lambda/main.py").path],
+)
+
+# Cleanup Lambda deployment package
+cleanup_archive = pulumi.FileArchive(
+    f"{base_dir}/cleanup-lambda/build/lambda.zip"
+)
+
+# Cleanup Lambda Function
+cleanup_lambda = lambda_.Function(
+    "cleanup-lambda",
+    runtime="python3.11",
+    handler="main.lambda_handler",
+    role=lambda_role.arn,  # Reuse existing autoscaler Lambda role (has EC2 permissions)
+    timeout=60,  # 1 minute
+    memory_size=128,  # 128 MB (lightweight)
+    vpc_config=lambda_.FunctionVpcConfigArgs(
+        subnet_ids=[private_subnet.id],
+        security_group_ids=[bastion_security_group.id],
+    ),
+    environment=lambda_.FunctionEnvironmentArgs(
+        variables={
+            "CLUSTER_NAME": cluster_name,
+            "MAX_INSTANCE_AGE_MINUTES": "15",  # Terminate instances that failed to join after 15 min
+        }
+    ),
+    code=cleanup_archive,
+    tags={**common_tags, "Name": "cleanup-lambda", "Purpose": "failed-instance-cleanup"},
+    opts=pulumi.ResourceOptions(depends_on=[cleanup_lambda_build]),
+)
+
+# EventBridge Rule - triggers cleanup every 5 minutes
+cleanup_event_rule = aws.cloudwatch.EventRule(
+    "k3s-cleanup-schedule",
+    schedule_expression="rate(5 minutes)",
+    tags={**common_tags, "Name": "k3s-cleanup-schedule"}
+)
+
+# Lambda Permission for EventBridge to invoke cleanup
+cleanup_lambda_permission = aws.lambda_.Permission(
+    "cleanup-lambda-eventbridge-permission",
+    action="lambda:InvokeFunction",
+    function=cleanup_lambda.name,
+    principal="events.amazonaws.com",
+    source_arn=cleanup_event_rule.arn,
+)
+
+# EventBridge Target - invokes cleanup Lambda
+cleanup_event_target = aws.cloudwatch.EventTarget(
+    "k3s-cleanup-target",
+    rule=cleanup_event_rule.name,
+    arn=cleanup_lambda.arn,
+)
+
+# =============================================================================
+# Dead-Letter Queues for Failed Events
+# =============================================================================
+
+# SQS Queue for failed scale-up events
+scale_up_dlq = aws.sqs.Queue(
+    "k3s-scale-up-dlq",
+    message_retention_seconds=1209600,  # 14 days
+    tags={**common_tags, "Name": "k3s-scale-up-dlq", "Purpose": "failed-events"},
+)
+
+# SQS Queue for failed scale-down events
+scale_down_dlq = aws.sqs.Queue(
+    "k3s-scale-down-dlq",
+    message_retention_seconds=1209600,  # 14 days
+    tags={**common_tags, "Name": "k3s-scale-down-dlq", "Purpose": "failed-events"},
 )
 
 # =============================================================================
@@ -934,6 +1004,9 @@ scale_up_target = aws.cloudwatch.EventTarget(
     "k3s-scale-up-target",
     rule=scale_up_rule.name,
     arn=scale_up_lambda.arn,
+    dead_letter_config=aws.cloudwatch.EventTargetDeadLetterConfigArgs(
+        arn=scale_up_dlq.arn,
+    ),
 )
 
 # Lambda Permission - Allow EventBridge to invoke scale-up-lambda
@@ -961,6 +1034,9 @@ scale_down_target = aws.cloudwatch.EventTarget(
     "k3s-scale-down-target",
     rule=scale_down_rule.name,
     arn=scale_down_lambda.arn,
+    dead_letter_config=aws.cloudwatch.EventTargetDeadLetterConfigArgs(
+        arn=scale_down_dlq.arn,
+    ),
 )
 
 # Lambda Permission - Allow EventBridge to invoke scale-down-lambda
@@ -1033,6 +1109,112 @@ lock_timeout_alarm = aws.cloudwatch.MetricAlarm(
 )
 
 # =============================================================================
+# EventBridge and SQS DLQ Monitoring Alarms
+# =============================================================================
+
+# EventBridge FailedInvocations Alarm for Scale-Up
+scale_up_eventbridge_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-scale-up-eventbridge-failed-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="FailedInvocations",
+    namespace="AWS/Events",
+    period=300,  # 5 minutes
+    statistic="Sum",
+    threshold=1.0,
+    alarm_description="Triggered when EventBridge fails to invoke scale-up Lambda",
+    dimensions={
+        "RuleName": scale_up_rule.name,
+    },
+    tags={**common_tags, "Name": "k3s-scale-up-eventbridge-failed-alarm", "Component": "eventbridge"}
+)
+
+# EventBridge FailedInvocations Alarm for Scale-Down
+scale_down_eventbridge_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-scale-down-eventbridge-failed-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="FailedInvocations",
+    namespace="AWS/Events",
+    period=300,  # 5 minutes
+    statistic="Sum",
+    threshold=1.0,
+    alarm_description="Triggered when EventBridge fails to invoke scale-down Lambda",
+    dimensions={
+        "RuleName": scale_down_rule.name,
+    },
+    tags={**common_tags, "Name": "k3s-scale-down-eventbridge-failed-alarm", "Component": "eventbridge"}
+)
+
+# Scale-Up DLQ Alarm - triggers when messages accumulate
+scale_up_dlq_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-scale-up-dlq-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="ApproximateNumberOfMessagesVisible",
+    namespace="AWS/SQS",
+    period=300,  # 5 minutes
+    statistic="Average",
+    threshold=1.0,
+    alarm_description="Triggered when scale-up DLQ has messages (failed Lambda invocations)",
+    dimensions={
+        "QueueName": scale_up_dlq.name,
+    },
+    tags={**common_tags, "Name": "k3s-scale-up-dlq-alarm", "Component": "sqs-dlq"}
+)
+
+# Scale-Up DLQ Age Alarm - triggers when old messages exist
+scale_up_dlq_age_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-scale-up-dlq-age-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="ApproximateAgeOfOldestMessage",
+    namespace="AWS/SQS",
+    period=300,  # 5 minutes
+    statistic="Average",
+    threshold=3600,  # 1 hour
+    alarm_description="Triggered when scale-up DLQ has messages older than 1 hour",
+    dimensions={
+        "QueueName": scale_up_dlq.name,
+    },
+    tags={**common_tags, "Name": "k3s-scale-up-dlq-age-alarm", "Component": "sqs-dlq"}
+)
+
+# Scale-Down DLQ Alarm - triggers when messages accumulate
+scale_down_dlq_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-scale-down-dlq-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="ApproximateNumberOfMessagesVisible",
+    namespace="AWS/SQS",
+    period=300,  # 5 minutes
+    statistic="Average",
+    threshold=1.0,
+    alarm_description="Triggered when scale-down DLQ has messages (failed Lambda invocations)",
+    dimensions={
+        "QueueName": scale_down_dlq.name,
+    },
+    tags={**common_tags, "Name": "k3s-scale-down-dlq-alarm", "Component": "sqs-dlq"}
+)
+
+# Scale-Down DLQ Age Alarm - triggers when old messages exist
+scale_down_dlq_age_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-scale-down-dlq-age-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="ApproximateAgeOfOldestMessage",
+    namespace="AWS/SQS",
+    period=300,  # 5 minutes
+    statistic="Average",
+    threshold=3600,  # 1 hour
+    alarm_description="Triggered when scale-down DLQ has messages older than 1 hour",
+    dimensions={
+        "QueueName": scale_down_dlq.name,
+    },
+    tags={**common_tags, "Name": "k3s-scale-down-dlq-age-alarm", "Component": "sqs-dlq"}
+)
+
+# =============================================================================
 # CloudWatch Dashboard
 # =============================================================================
 
@@ -1084,9 +1266,8 @@ pulumi.export("master_instance_profile", master_instance_profile.name)
 pulumi.export("event_rule_arn", event_rule.arn)
 pulumi.export("cloudwatch_dashboard", autoscaler_dashboard.dashboard_name)
 
-# Security Group IDs
-pulumi.export("security_group_id", security_group.id)
-pulumi.export("bastion_security_group_id", bastion_security_group.id)
+# Security Group ID (now merged - single security group for cluster)
+pulumi.export("security_group_id", bastion_security_group.id)
 
 # Bastion Host (for SSH access)
 pulumi.export("bastion_public_ip", bastion_instance.public_ip)
@@ -1133,11 +1314,27 @@ pulumi.export("scale_down_lambda_logs_command", scale_down_lambda.name.apply(
     lambda name: f"aws logs tail /aws/lambda/{name} --follow"
 ))
 
+# Cleanup Lambda
+pulumi.export("cleanup_lambda_name", cleanup_lambda.name)
+pulumi.export("cleanup_lambda_arn", cleanup_lambda.arn)
+pulumi.export("cleanup_lambda_log_group", cleanup_lambda.name.apply(
+    lambda name: f"/aws/lambda/{name}"
+))
+pulumi.export("cleanup_lambda_logs_command", cleanup_lambda.name.apply(
+    lambda name: f"aws logs tail /aws/lambda/{name} --follow"
+))
+
 # EventBridge Rules for Lambda Chaining
 pulumi.export("scale_up_rule_arn", scale_up_rule.arn)
 pulumi.export("scale_up_rule_name", scale_up_rule.name)
 pulumi.export("scale_down_rule_arn", scale_down_rule.arn)
 pulumi.export("scale_down_rule_name", scale_down_rule.name)
+
+# Dead-Letter Queues
+pulumi.export("scale_up_dlq_url", scale_up_dlq.url)
+pulumi.export("scale_up_dlq_arn", scale_up_dlq.arn)
+pulumi.export("scale_down_dlq_url", scale_down_dlq.url)
+pulumi.export("scale_down_dlq_arn", scale_down_dlq.arn)
 
 
 # =============================================================================

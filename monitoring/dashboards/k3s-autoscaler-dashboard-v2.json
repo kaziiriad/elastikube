@@ -1,0 +1,268 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 0,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["K3sAutoscaler", "WorkerCPU", {"stat": "Average", "color": "#FF7F0E"}],
+          [".", "MasterCPU", {"stat": "Average", "color": "#2CA02C"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-southeast-1",
+        "title": "CPU Utilization (%)",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "max": 100
+          }
+        },
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "Scale-Up Threshold",
+              "value": 70,
+              "fill": "above",
+              "color": "#FF0000"
+            },
+            {
+              "label": "Scale-Down Threshold",
+              "value": 30,
+              "fill": "below",
+              "color": "#00FF00"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 0,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["K3sAutoscaler", "WorkerMemory", {"stat": "Average", "color": "#1F77B4"}],
+          [".", "MasterMemory", {"stat": "Average", "color": "#9467BD"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-southeast-1",
+        "title": "Memory Utilization (%)",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "max": 100
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 6,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["K3sAutoscaler", "WorkerCount", {"stat": "Average", "color": "#D62728"}],
+          [".", "ReadyNodes", {"stat": "Average", "color": "#2CA02C"}],
+          [".", "TotalNodes", {"stat": "Average", "color": "#7F7F7F"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-southeast-1",
+        "title": "Node Count",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "Min Nodes",
+              "value": 2,
+              "color": "#FF0000"
+            },
+            {
+              "label": "Max Nodes",
+              "value": 10,
+              "color": "#FF0000"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 6,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["K3sAutoscaler", "PendingPods", {"stat": "Sum", "color": "#FF7F0E"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-southeast-1",
+        "title": "Pending Pods",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "Scale-Up Trigger",
+              "value": 1,
+              "fill": "above",
+              "color": "#FF0000"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 16,
+      "y": 6,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Invocations", {"stat": "Sum", "label": "Decision Lambda"}],
+          [".", "Errors", {"stat": "Sum", "color": "#FF0000"}],
+          [".", "Throttles", {"stat": "Sum", "color": "#D62728"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-southeast-1",
+        "title": "Lambda Invocations & Errors",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 12,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Duration", {"stat": "Average", "label": "Decision Lambda"}],
+          ["...", {"stat": "p99", "label": "p99"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-southeast-1",
+        "title": "Lambda Duration (ms)",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 12,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Events", "Invocations", {"stat": "Sum", "label": "EventBridge Triggers"}],
+          [".", "FailedInvocations", {"stat": "Sum", "color": "#FF0000"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-southeast-1",
+        "title": "EventBridge Metrics",
+        "period": 300
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 18,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/DynamoDB", "ConsumedReadCapacityUnits", {"stat": "Sum", "label": "State Table Reads"}],
+          [".", "ConsumedWriteCapacityUnits", {"stat": "Sum", "label": "State Table Writes"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-southeast-1",
+        "title": "DynamoDB Capacity",
+        "period": 300
+      }
+    },
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 18,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/SQS", "ApproximateNumberOfMessagesVisible", {"stat": "Average", "label": "Scale-Up DLQ"}],
+          ["...", {"stat": "Average", "label": "Scale-Down DLQ"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-southeast-1",
+        "title": "Dead Letter Queue Depth",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "log",
+      "x": 16,
+      "y": 18,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler-function'\n| fields @timestamp, @message\n| filter @message like /Decision:/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "stacked": false,
+        "title": "Recent Scaling Decisions",
+        "view": "table"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 24,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Autoscaler Health Status\n\n**Key Indicators:**\n- ✅ Worker CPU should be between 40-60% for optimal efficiency\n- ✅ Pending Pods should be 0 (indicates sufficient capacity)\n- ✅ Node Count should auto-adjust based on load (min: 2, max: 10)\n- ⚠️ Lambda Errors should be 0 (check logs if > 0)\n- ⚠️ DLQ Depth should be 0 (indicates failed scaling events)\n\n**Scaling Thresholds:**\n- Scale Up: CPU > 70% OR Pending Pods >= 1\n- Scale Down: CPU < 30% AND Memory < 50% (with 15min cooldown)\n\n**Links:**\n- [Lambda Logs](https://console.aws.amazon.com/cloudwatch/home?region=ap-southeast-1#logsV2:log-groups/log-group/$252Faws$252Flambda$252Fk3s-autoscaler-function)\n- [DynamoDB Tables](https://console.aws.amazon.com/dynamodbv2/home?region=ap-southeast-1#tables)\n- [EC2 Instances](https://console.aws.amazon.com/ec2/home?region=ap-southeast-1#Instances:instanceState=running)"
+      }
+    }
+  ]
+}

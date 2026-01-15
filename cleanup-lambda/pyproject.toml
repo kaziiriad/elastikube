@@ -1,0 +1,12 @@
+[project]
+name = "cleanup-lambda"
+version = "1.0.0"
+description = "Lambda for cleaning up failed K3s worker instances"
+requires-python = ">=3.8"
+dependencies = [
+    "boto3>=1.42.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

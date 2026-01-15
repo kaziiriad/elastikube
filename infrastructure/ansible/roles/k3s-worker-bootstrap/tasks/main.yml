@@ -35,9 +35,16 @@
     cmd: aws s3 cp /tmp/worker-bootstrap-{{ cluster_name }}.sh s3://{{ s3_bucket }}/{{ s3_key }} --region {{ aws_region }}
   register: upload_result
 
-- name: Display S3 URL
+- name: Upload check-node-by-ip script to S3
+  ansible.builtin.command:
+    cmd: aws s3 cp {{ role_path }}/files/check-node-by-ip.sh s3://{{ s3_bucket }}/scripts/check-node-by-ip.sh --region {{ aws_region }}
+  register: check_script_upload
+
+- name: Display S3 URLs
   debug:
-    msg: "User-data script uploaded to: https://{{ s3_bucket }}.s3.{{ aws_region }}.amazonaws.com/{{ s3_key }}"
+    msg:
+      - "User-data script uploaded to: https://{{ s3_bucket }}.s3.{{ aws_region }}.amazonaws.com/{{ s3_key }}"
+      - "Check-node script uploaded to: https://{{ s3_bucket }}.s3.{{ aws_region }}.amazonaws.com/scripts/check-node-by-ip.sh"
 
 - name: Save configuration for reference
   ansible.builtin.copy:
@@ -48,7 +55,8 @@
         "aws_region": "{{ aws_region }}",
         "s3_bucket": "{{ s3_bucket }}",
         "s3_key": "{{ s3_key }}",
-        "s3_url": "https://{{ s3_bucket }}.s3.{{ aws_region }}.amazonaws.com/{{ s3_key }}"
+        "s3_url": "https://{{ s3_bucket }}.s3.{{ aws_region }}.amazonaws.com/{{ s3_key }}",
+        "check_node_script_url": "https://{{ s3_bucket }}.s3.{{ aws_region }}.amazonaws.com/scripts/check-node-by-ip.sh"
       }
     mode: '0644'
 
