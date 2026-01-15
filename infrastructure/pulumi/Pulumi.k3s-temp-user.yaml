@@ -1,2 +1,2 @@
 config:
-  k3s-autoscaler:use_spot_instances: "false"
+  k3s-autoscaler:use_spot_instances: "true"

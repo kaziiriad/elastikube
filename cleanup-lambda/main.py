@@ -35,6 +35,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
         event: Lambda event
             - {"action": "health_check"} for health check
             - {"action": "clean_stale_nodes"} to only clean stale K8s nodes
+            - EventBridge Spot Interruption Warning event (automatic)
             - EventBridge trigger for periodic cleanup (does both EC2 and K8s cleanup)
         context: Lambda context
 
@@ -49,6 +50,11 @@ def lambda_handler(event: dict, context: Any) -> dict:
     if event.get("action") == "clean_stale_nodes":
         logger.info("Manual clean_stale_nodes invocation")
         return _clean_stale_nodes()
+
+    # Spot Instance Interruption Warning (from EventBridge)
+    if event.get("detail-type") == "EC2 Spot Instance Interruption Warning":
+        logger.info("Spot Instance Interruption Warning received")
+        return _handle_spot_interruption(event)
 
     logger.info("Cleanup Lambda invoked")
 
@@ -447,7 +453,7 @@ def _clean_stale_nodes() -> dict:
         }
 
     # Step 2: Get list of NotReady nodes via SSM
-    find_stale_command = """sudo kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name,ROLE:.metadata.labels.kubernetes.io/role,STATUS:.status.phase | awk '$3 == "NotReady" {print $1}'"""
+    find_stale_command = """sudo kubectl get nodes --no-headers | grep NotReady | awk '{print $1}'"""
 
     logger.info("Finding stale nodes via SSM on master")
     try:
@@ -464,6 +470,7 @@ def _clean_stale_nodes() -> dict:
         time.sleep(5)
 
         max_attempts = 6  # 30 seconds
+        result = dict()
         for attempt in range(max_attempts):
             result = ssm_client.get_command_invocation(
                 CommandId=command_id,
@@ -515,7 +522,7 @@ def _clean_stale_nodes() -> dict:
         logger.info(f"Deleting stale node: {node_name}")
 
         delete_command = f"sudo kubectl delete node {node_name} --ignore-not-found=true"
-
+        result = {}
         try:
             ssm_response = ssm_client.send_command(
                 InstanceIds=[master_instance_id],
@@ -562,3 +569,219 @@ def _clean_stale_nodes() -> dict:
             "failed_nodes": failed_nodes,
         }),
     }
+
+
+def _handle_spot_interruption(event: dict) -> dict:
+    """Handle spot instance interruption warning from EventBridge.
+
+    AWS sends this event 2 minutes before terminating a spot instance.
+    We use this time to gracefully drain the node and evict pods.
+
+    Event structure:
+    {
+        "detail-type": "EC2 Spot Instance Interruption Warning",
+        "detail": {
+            "instance-id": "i-xxxxxxxx",
+            "instance-action": "terminate"
+        }
+    }
+    """
+    import time
+
+    logger.info("Executing SPOT_INSTANCE_INTERRUPTION handler")
+
+    cluster_name = _get_cluster_name()
+    ssm_client = boto3.client("ssm")
+    ec2_client = boto3.client("ec2")
+
+    # Extract instance ID from event
+    detail = event.get("detail", {})
+    instance_id = detail.get("instance-id")
+
+    if not instance_id:
+        logger.error("No instance-id in interruption event")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": "Missing instance-id in event detail"}),
+        }
+
+    instance_action = detail.get("instance-action", "terminate")
+    logger.info(f"Spot instance {instance_id} will be {instance_action} in ~2 minutes")
+
+    try:
+        # Step 1: Get instance details to find private IP
+        instance_details = ec2_client.describe_instances(InstanceIds=[instance_id])
+        reservation = instance_details.get("Reservations", [{}])[0]
+        instance_data = reservation.get("Instances", [{}])[0]
+
+        private_ip = instance_data.get("PrivateIpAddress")
+        state = instance_data.get("State", {}).get("Name")
+
+        logger.info(f"Instance {instance_id} - IP: {private_ip}, State: {state}")
+
+        if not private_ip:
+            logger.warning(f"No private IP found for {instance_id}, cannot drain")
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "message": f"Instance {instance_id} has no private IP, skipping drain",
+                    "instance_id": instance_id,
+                    "drained": False,
+                }),
+            }
+
+        # Step 2: Get master IP and instance ID
+        try:
+            master_ip_response = ssm_client.get_parameter(
+                Name=f"/k3s/{cluster_name}/master-ip"
+            )
+            master_ip = master_ip_response["Parameter"]["Value"]
+            logger.info(f"Master IP: {master_ip}")
+        except ClientError as e:
+            logger.error(f"Failed to get master IP: {e}")
+            return {
+                "statusCode": 500,
+                "body": json.dumps({
+                    "error": f"Failed to get master IP: {e}",
+                    "instance_id": instance_id,
+                }),
+            }
+
+        try:
+            master_response = ec2_client.describe_instances(
+                Filters=[{"Name": "private-ip-address", "Values": [master_ip]}]
+            )
+            master_instance_id = master_response["Reservations"][0]["Instances"][0]["InstanceId"]
+        except (ClientError, IndexError, KeyError) as e:
+            logger.error(f"Failed to find master instance: {e}")
+            return {
+                "statusCode": 500,
+                "body": json.dumps({
+                    "error": f"Failed to find master instance: {e}",
+                    "instance_id": instance_id,
+                }),
+            }
+
+        # Step 3: Find the Kubernetes node name for this instance
+        # The node name is typically the private IP with hyphens (e.g., 10-0-2-93)
+        # We can get this by querying kubectl for nodes with the Ready condition
+        find_node_command = f"sudo kubectl get nodes -o wide | grep {private_ip} | awk '{{print $1}}'"
+
+        logger.info(f"Finding Kubernetes node for IP {private_ip}")
+        try:
+            ssm_response = ssm_client.send_command(
+                InstanceIds=[master_instance_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": [find_node_command]},
+                TimeoutSeconds=30,
+            )
+
+            command_id = ssm_response["Command"]["CommandId"]
+            time.sleep(5)
+
+            # Wait for command to complete
+            max_attempts = 6
+            result = {}
+            for _ in range(max_attempts):
+                result = ssm_client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=master_instance_id,
+                )
+                if result["Status"] in ["Success", "Failed", "TimedOut", "Cancelled"]:
+                    break
+                time.sleep(5)
+
+            stdout = result.get("StandardOutputContent", "")
+            stderr = result.get("StandardErrorContent", "")
+
+            if result["Status"] != "Success":
+                logger.warning(f"Failed to find node: {stderr}")
+                # Fallback: use IP-based node name
+                node_name = private_ip.replace(".", "-")
+            else:
+                node_name = stdout.strip()
+                if not node_name:
+                    node_name = private_ip.replace(".", "-")
+
+            logger.info(f"Kubernetes node: {node_name}")
+
+        except ClientError as e:
+            logger.warning(f"Failed to find node name: {e}, using IP-based name")
+            node_name = private_ip.replace(".", "-")
+
+        # Step 4: Drain the node (gracefully evict pods)
+        drain_command = f"sudo kubectl drain {node_name} --ignore-daemonsets --delete-emptydir-data --force --timeout=90s"
+        delete_command = f"sudo kubectl delete node {node_name} --ignore-not-found=true"
+
+        logger.info(f"Draining node {node_name} (90s timeout)...")
+        try:
+            ssm_response = ssm_client.send_command(
+                InstanceIds=[master_instance_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": [drain_command, delete_command]},
+                TimeoutSeconds=120,
+            )
+
+            command_id = ssm_response["Command"]["CommandId"]
+            time.sleep(5)
+
+            # Wait for command to complete
+            max_attempts = 12  # 60 seconds
+            result = {}
+            for _ in range(max_attempts):
+                result = ssm_client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=master_instance_id,
+                )
+                if result["Status"] in ["Success", "Failed", "TimedOut", "Cancelled"]:
+                    break
+                time.sleep(5)
+
+            stdout = result.get("StandardOutputContent", "")
+            stderr = result.get("StandardErrorContent", "")
+
+            if result["Status"] == "Success":
+                logger.info(f"✓ Drained node {node_name} successfully")
+                drained = True
+            else:
+                logger.warning(f"✗ Drain failed for {node_name}: {stderr}")
+                drained = False
+
+        except ClientError as e:
+            logger.error(f"Failed to send drain command: {e}")
+            drained = False
+
+        # Step 5: Tag the instance with interruption handled status
+        try:
+            ec2_client.create_tags(
+                Resources=[instance_id],
+                Tags=[
+                    {"Key": "SpotInterruptionHandled", "Value": "true"},
+                    {"Key": "InterruptedAt", "Value": datetime.now(timezone.utc).isoformat()},
+                ]
+            )
+            logger.info(f"✓ Tagged {instance_id} as interruption-handled")
+        except ClientError as e:
+            logger.warning(f"Failed to tag instance: {e}")
+
+        # Return result
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": f"Spot interruption handled for {instance_id}",
+                "instance_id": instance_id,
+                "node_name": node_name,
+                "drained": drained,
+                "instance_action": instance_action,
+            }),
+        }
+
+    except ClientError as e:
+        logger.error(f"Failed to handle spot interruption: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": str(e),
+                "instance_id": instance_id,
+            }),
+        }

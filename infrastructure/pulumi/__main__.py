@@ -408,6 +408,11 @@ autoscaler_policy = iam.RolePolicy(
                     "ec2:DescribeInstanceStatus",
                     "ec2:CreateTags",
                     "ec2:DescribeTags",
+                    # Spot Instance Permissions
+                    "ec2:DescribeSpotInstanceRequests",
+                    "ec2:DescribeSpotPriceHistory",
+                    "ec2:RequestSpotInstances",
+                    "ec2:CancelSpotInstanceRequests",
                 ],
                 "resources": ["*"],
                 "effect": "Allow",
@@ -965,6 +970,38 @@ cleanup_lambda_permission = aws.lambda_.Permission(
 cleanup_event_target = aws.cloudwatch.EventTarget(
     "k3s-cleanup-target",
     rule=cleanup_event_rule.name,
+    arn=cleanup_lambda.arn,
+)
+
+# =============================================================================
+# Spot Instance Interruption Handling
+# =============================================================================
+
+# EventBridge Rule - captures EC2 Spot Instance Interruption Warnings
+# AWS sends this 2 minutes before terminating a spot instance
+spot_interruption_rule = aws.cloudwatch.EventRule(
+    "k3s-spot-interruption-handler",
+    name_prefix="k3s-spot-interruption-",
+    event_pattern=json.dumps({
+        "source": ["aws.ec2"],
+        "detail-type": ["EC2 Spot Instance Interruption Warning"],
+    }),
+    tags={**common_tags, "Name": "k3s-spot-interruption-handler"}
+)
+
+# Lambda Permission - Allow EventBridge to invoke cleanup Lambda for spot interruptions
+spot_interruption_permission = aws.lambda_.Permission(
+    "cleanup-lambda-spot-interruption-permission",
+    action="lambda:InvokeFunction",
+    function=cleanup_lambda.name,
+    principal="events.amazonaws.com",
+    source_arn=spot_interruption_rule.arn,
+)
+
+# EventBridge Target - invokes cleanup Lambda for spot interruptions
+spot_interruption_target = aws.cloudwatch.EventTarget(
+    "k3s-spot-interruption-target",
+    rule=spot_interruption_rule.name,
     arn=cleanup_lambda.arn,
 )
 
