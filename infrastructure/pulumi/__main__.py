@@ -646,6 +646,29 @@ master_instance_profile = iam.InstanceProfile(
     tags={**common_tags, "Name": "k3s-master-instance-profile"}
 )
 
+
+master_cloudwatch_policy = iam.RolePolicy(
+    "k3s-master-cloudwatch-policy",
+    role=master_role.id,
+    policy=iam.get_policy_document(
+        statements=[
+            {
+                "actions": [
+                    "cloudwatch:PutMetricData",
+                    "ec2:DescribeVolumes",
+                    "ec2:DescribeTags",
+                    "logs:PutLogEvents",
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:DescribeLogStreams",
+                ],
+                "resources": ["*"],
+                "effect": "Allow",
+            },
+        ],
+        version="2012-10-17",
+    ).json
+)
 # =============================================================================
 # EC2 Instances
 # =============================================================================
@@ -1257,8 +1280,8 @@ scale_down_dlq_age_alarm = aws.cloudwatch.MetricAlarm(
 # CloudWatch Dashboard
 # =============================================================================
 
-# Read dashboard definition from JSON file
-dashboard_path = pathlib.Path(__file__).parent.parent.parent / "monitoring" / "dashboards" / "k3s-autoscaler-dashboard.json"
+# Read comprehensive cluster dashboard from JSON file
+dashboard_path = pathlib.Path(__file__).parent.parent.parent / "monitoring" / "dashboards" / "k3s-cluster-dashboard.json"
 
 try:
     with open(dashboard_path, "r") as f:
@@ -1279,9 +1302,9 @@ except FileNotFoundError:
         }]
     })
 
-autoscaler_dashboard = aws.cloudwatch.Dashboard(
-    "k3s-autoscaler-dashboard",
-    dashboard_name="K3s-Autoscaler-Metrics",
+cluster_dashboard = aws.cloudwatch.Dashboard(
+    "k3s-cluster-dashboard",
+    dashboard_name="K3s-Cluster-Comprehensive",
     dashboard_body=dashboard_body
 )
 
@@ -1303,7 +1326,7 @@ pulumi.export("decision_lambda_log_group", lambda_function.name.apply(
 pulumi.export("worker_instance_profile", worker_instance_profile.name)
 pulumi.export("master_instance_profile", master_instance_profile.name)
 pulumi.export("event_rule_arn", event_rule.arn)
-pulumi.export("cloudwatch_dashboard", autoscaler_dashboard.dashboard_name)
+pulumi.export("cloudwatch_dashboard", cluster_dashboard.dashboard_name)
 
 # Security Group ID (now merged - single security group for cluster)
 pulumi.export("security_group_id", bastion_security_group.id)

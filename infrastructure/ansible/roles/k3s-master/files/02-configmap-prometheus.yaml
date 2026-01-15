@@ -68,10 +68,3 @@ data:
             target_label: __address__
             replacement: ${1}:8080
         scrape_interval: 30s
-
-      # Autoscaler metrics
-      - job_name: 'autoscaler'
-        static_configs:
-          - targets: ['prototype-autoscaler-1.prototype.svc.cluster.local:9091']
-        scrape_interval: 5s
-        metrics_path: /metrics

@@ -1,0 +1,83 @@
+---
+# CloudWatch Agent main configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudwatch-agent-config
+  namespace: monitoring
+data:
+  cwagentconfig.json: |
+    {
+      "logs": {
+        "metrics_collected": {
+          "prometheus": {
+            "cluster_name": "production-k3s",
+            "prometheus_config_path": "/etc/prometheus/cwagent_prometheus.yml",
+            "log_group_name": "/aws/containerinsights/production-k3s/prometheus",
+            "emf_processor": {
+              "metric_namespace": "ContainerInsights/Prometheus",
+              "metric_declaration": [
+                {
+                  "source_labels": ["job"],
+                  "label_matcher": "^node-exporter$",
+                  "dimensions": [["ClusterName"], ["ClusterName", "instance"]],
+                  "metric_selectors": [
+                    "^node_cpu_seconds_total$",
+                    "^node_memory_.*$",
+                    "^node_filesystem_.*$",
+                    "^node_network_.*$"
+                  ]
+                },
+                {
+                  "source_labels": ["job"],
+                  "label_matcher": "^kube-state-metrics",
+                  "dimensions": [["ClusterName"]],
+                  "metric_selectors": [
+                    "^kube_node_.*$",
+                    "^kube_pod_.*$",
+                    "^kube_deployment_.*$"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "force_flush_interval": 15
+      }
+    }
+---
+# Prometheus scrape configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudwatch-agent-prometheus-config
+  namespace: monitoring
+data:
+  cwagent_prometheus.yml: |
+    global:
+      scrape_interval: 60s
+      scrape_timeout: 10s
+      external_labels:
+        ClusterName: 'production-k3s'
+
+    scrape_configs:
+      # Node Exporter - System metrics (using service DNS for headless service)
+      # The headless service returns all pod IPs, giving us per-node metrics
+      - job_name: 'node-exporter'
+        static_configs:
+          - targets: ['node-exporter.kube-system.svc.cluster.local:9100']
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+            replacement: '${1}'
+
+      # Kube-state-metrics - K8s object metrics (using service DNS)
+      - job_name: 'kube-state-metrics'
+        static_configs:
+          - targets: ['kube-state-metrics.kube-system.svc.cluster.local:8080']
+        scrape_interval: 30s
+
+      # Prometheus itself - monitoring the monitor (using ClusterIP service)
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['prometheus-nodeport.monitoring.svc.cluster.local:9090']

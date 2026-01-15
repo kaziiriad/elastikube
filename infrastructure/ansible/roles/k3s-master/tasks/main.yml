@@ -327,3 +327,52 @@
 - name: Display script installation status
   debug:
     msg: "check-node-by-ip.sh installed: {{ script_check.stdout }}"
+
+# ==========================================
+# Deploy CloudWatch Agent for Prometheus Scraping
+# ==========================================
+
+- name: Copy CloudWatch Agent manifests to master
+  copy:
+    src: files/
+    dest: /tmp/cwagent/
+    mode: '0644'
+
+- name: Deploy CloudWatch Agent ServiceAccount, ClusterRole, and Binding
+  command: kubectl apply -f /tmp/cwagent/11-cwagent-sa.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Deploy CloudWatch Agent ConfigMap
+  command: kubectl apply -f /tmp/cwagent/12-cwagent-configmap.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: cwagent_config
+  changed_when: true
+
+- name: Deploy CloudWatch Agent DaemonSet
+  command: kubectl apply -f /tmp/cwagent/13-cwagent-daemonset.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: cwagent_deploy
+
+- name: Wait for CloudWatch Agent pods to be ready
+  command: kubectl wait --for=condition=ready pod -l app=cloudwatch-agent -n monitoring --timeout=180s
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when: cwagent_deploy.changed
+  ignore_errors: true
+
+- name: Get CloudWatch Agent status
+  command: kubectl get pods -n monitoring -l app=cloudwatch-agent
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: cwagent_status
+  changed_when: false
+
+- name: Display CloudWatch Agent status
+  debug:
+    msg:
+      - "CloudWatch Agent Pods:"
+      - "{{ cwagent_status.stdout_lines }}"
