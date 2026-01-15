@@ -35,6 +35,33 @@
   debug:
     msg: "Master IP: {{ master_ip.stdout }}, Token: {{ k3s_token.stdout[:20] }}..."
 
+# ==========================================
+# Taint master node to prevent regular workload scheduling
+# ==========================================
+
+- name: Get master node name
+  shell: kubectl get nodes --no-headers | grep "control-plane" | awk '{print $1}'
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: master_node_name
+  changed_when: false
+  ignore_errors: true
+
+- name: Taint master node with NoSchedule
+  shell: |
+    kubectl taint nodes {{ master_node_name.stdout }} node-role.kubernetes.io/control-plane=true:NoSchedule --overwrite
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when: master_node_name.stdout != ""
+  register: taint_result
+  changed_when: true
+  ignore_errors: true
+
+- name: Display taint result
+  debug:
+    msg: "Master node {{ master_node_name.stdout }} tainted with NoSchedule to prevent regular workload scheduling"
+  when: master_node_name.stdout != ""
+
 - name: Install boto3 and botocore on master node
   ansible.builtin.pip:
     name:
