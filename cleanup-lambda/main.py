@@ -34,7 +34,8 @@ def lambda_handler(event: dict, context: Any) -> dict:
     Args:
         event: Lambda event
             - {"action": "health_check"} for health check
-            - EventBridge trigger for periodic cleanup
+            - {"action": "clean_stale_nodes"} to only clean stale K8s nodes
+            - EventBridge trigger for periodic cleanup (does both EC2 and K8s cleanup)
         context: Lambda context
 
     Returns:
@@ -44,51 +45,62 @@ def lambda_handler(event: dict, context: Any) -> dict:
     if event.get("action") == "health_check":
         return _handle_health_check()
 
+    # Manual clean_stale_nodes invocation
+    if event.get("action") == "clean_stale_nodes":
+        logger.info("Manual clean_stale_nodes invocation")
+        return _clean_stale_nodes()
+
     logger.info("Cleanup Lambda invoked")
 
     cluster_name = os.environ.get("CLUSTER_NAME", "production-k3s")
     max_age_minutes = int(os.environ.get("MAX_INSTANCE_AGE_MINUTES", "5"))
 
     try:
-        # Find failed instances
+        # Phase 1: Clean up failed EC2 instances
         failed_instances = _find_failed_instances(cluster_name, max_age_minutes)
 
-        if not failed_instances:
-            logger.info("No failed instances found")
-            return {
-                "statusCode": 200,
-                "body": json.dumps({
-                    "message": "No cleanup needed",
-                    "terminated_count": 0,
-                }),
-            }
-
-        logger.info(f"Found {len(failed_instances)} failed instances to clean up")
-
-        # Terminate failed instances
         terminated = []
-        for instance in failed_instances:
-            instance_id = instance["InstanceId"]
-            reason = _get_failure_reason(instance)
+        if failed_instances:
+            logger.info(f"Found {len(failed_instances)} failed instances to clean up")
 
-            logger.info(f"Terminating {instance_id}: {reason}")
+            # Terminate failed instances
+            for instance in failed_instances:
+                instance_id = instance["InstanceId"]
+                reason = _get_failure_reason(instance)
 
-            success = _terminate_instance(instance_id)
-            if success:
-                terminated.append({
-                    "instance_id": instance_id,
-                    "reason": reason,
-                    "launch_time": instance.get("LaunchTime"),
-                })
+                logger.info(f"Terminating {instance_id}: {reason}")
 
-        logger.info(f"✓ Cleaned up {len(terminated)} failed instances")
+                success = _terminate_instance(instance_id)
+                if success:
+                    terminated.append({
+                        "instance_id": instance_id,
+                        "reason": reason,
+                        "launch_time": instance.get("LaunchTime"),
+                    })
 
+            logger.info(f"✓ Cleaned up {len(terminated)} failed instances")
+        else:
+            logger.info("No failed instances found")
+
+        # Phase 2: Clean up stale Kubernetes nodes
+        logger.info("Starting stale Kubernetes node cleanup")
+        stale_nodes_result = _clean_stale_nodes()
+        stale_nodes_data = json.loads(stale_nodes_result.get("body", "{}"))
+
+        # Return combined summary
         return {
             "statusCode": 200,
             "body": json.dumps({
-                "message": f"Cleaned up {len(terminated)} failed instances",
-                "terminated_count": len(terminated),
-                "terminated_instances": terminated,
+                "message": f"Cleanup completed: {len(terminated)} EC2 instances terminated, "
+                          f"{stale_nodes_data.get('nodes_deleted', 0)} stale K8s nodes deleted",
+                "ec2_cleanup": {
+                    "terminated_count": len(terminated),
+                    "terminated_instances": terminated,
+                },
+                "k8s_cleanup": {
+                    "nodes_deleted": stale_nodes_data.get("nodes_deleted", 0),
+                    "failed_nodes": stale_nodes_data.get("failed_nodes", []),
+                },
             }, default=str),
         }
 
@@ -383,3 +395,170 @@ def _terminate_instance(instance_id: str) -> bool:
     except ClientError as e:
         logger.error(f"Failed to terminate {instance_id}: {e}")
         return False
+
+
+def _get_cluster_name() -> str:
+    """Get cluster name from environment."""
+    return os.environ.get("CLUSTER_NAME", "production-k3s")
+
+
+def _clean_stale_nodes() -> dict:
+    """Remove NotReady nodes from the Kubernetes cluster using SSM.
+
+    This identifies nodes that are NotReady (terminated instances but not
+    removed from Kubernetes) and deletes them one-by-one via kubectl on the master.
+    Each deletion uses a separate SSM command for atomicity and better logging.
+    """
+    logger.info("Executing CLEAN_STALE_NODES operation")
+
+    import time
+
+    cluster_name = _get_cluster_name()
+    ssm_client = boto3.client("ssm")
+    ec2_client = boto3.client("ec2")
+
+    # Step 1: Get master IP and instance ID
+    try:
+        master_ip_response = ssm_client.get_parameter(
+            Name=f"/k3s/{cluster_name}/master-ip"
+        )
+        master_ip = master_ip_response["Parameter"]["Value"]
+        logger.info(f"Master IP: {master_ip}")
+    except ClientError as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": f"Failed to get master IP from SSM: {e}",
+            }),
+        }
+
+    try:
+        master_response = ec2_client.describe_instances(
+            Filters=[{"Name": "private-ip-address", "Values": [master_ip]}]
+        )
+        master_instance_id = master_response["Reservations"][0]["Instances"][0]["InstanceId"]
+        logger.info(f"Master instance ID: {master_instance_id}")
+    except (ClientError, IndexError, KeyError) as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": f"Failed to find master instance for IP {master_ip}: {e}",
+            }),
+        }
+
+    # Step 2: Get list of NotReady nodes via SSM
+    find_stale_command = """sudo kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name,ROLE:.metadata.labels.kubernetes.io/role,STATUS:.status.phase | awk '$3 == "NotReady" {print $1}'"""
+
+    logger.info("Finding stale nodes via SSM on master")
+    try:
+        ssm_response = ssm_client.send_command(
+            InstanceIds=[master_instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [find_stale_command]},
+            TimeoutSeconds=30,
+        )
+
+        command_id = ssm_response["Command"]["CommandId"]
+
+        # Wait for command to complete
+        time.sleep(5)
+
+        max_attempts = 6  # 30 seconds
+        for attempt in range(max_attempts):
+            result = ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=master_instance_id,
+            )
+            if result["Status"] in ["Success", "Failed", "TimedOut", "Cancelled"]:
+                break
+            time.sleep(5)
+
+        stdout = result.get("StandardOutputContent", "")
+        stderr = result.get("StandardErrorContent", "")
+
+        if result["Status"] != "Success":
+            return {
+                "statusCode": 500,
+                "body": json.dumps({
+                    "error": f"Failed to find stale nodes: {stderr}",
+                }),
+            }
+
+        # Parse node names from output
+        stale_nodes = [line.strip() for line in stdout.split('\n') if line.strip()]
+
+        if not stale_nodes:
+            logger.info("No stale nodes found")
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "message": "No stale nodes found",
+                    "nodes_deleted": 0,
+                }),
+            }
+
+        logger.info(f"Found {len(stale_nodes)} stale nodes: {stale_nodes}")
+
+    except ClientError as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": f"Failed to query stale nodes: {e}",
+            }),
+        }
+
+    # Step 3: Delete each stale node individually via SSM
+    nodes_deleted = 0
+    failed_nodes = []
+
+    for node_name in stale_nodes:
+        logger.info(f"Deleting stale node: {node_name}")
+
+        delete_command = f"sudo kubectl delete node {node_name} --ignore-not-found=true"
+
+        try:
+            ssm_response = ssm_client.send_command(
+                InstanceIds=[master_instance_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": [delete_command]},
+                TimeoutSeconds=30,
+            )
+
+            command_id = ssm_response["Command"]["CommandId"]
+
+            # Wait for command to complete
+            time.sleep(3)
+
+            max_attempts = 6  # 30 seconds
+            for attempt in range(max_attempts):
+                result = ssm_client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=master_instance_id,
+                )
+                if result["Status"] in ["Success", "Failed", "TimedOut", "Cancelled"]:
+                    break
+                time.sleep(5)
+
+            stdout = result.get("StandardOutputContent", "")
+            stderr = result.get("StandardErrorContent", "")
+
+            if result["Status"] == "Success":
+                nodes_deleted += 1
+                logger.info(f"✓ Deleted stale node: {node_name}")
+            else:
+                failed_nodes.append(node_name)
+                logger.warning(f"✗ Failed to delete node {node_name}: {stderr}")
+
+        except ClientError as e:
+            failed_nodes.append(node_name)
+            logger.warning(f"✗ Failed to send delete command for {node_name}: {e}")
+
+    # Return summary
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": f"Stale node cleanup completed: {nodes_deleted} deleted, {len(failed_nodes)} failed",
+            "nodes_deleted": nodes_deleted,
+            "failed_nodes": failed_nodes,
+        }),
+    }

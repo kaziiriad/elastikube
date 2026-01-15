@@ -849,6 +849,8 @@ scale_up_lambda = lambda_.Function(
             "KEY_NAME": existing_key_name,  # SSH key pair for debugging
             # Spot Instance Configuration
             "USE_SPOT_INSTANCES": config.get_bool("use_spot_instances", False),
+            # Bootstrap Verification Configuration
+            "BOOTSTRAP_TIMEOUT_SECONDS": str(config.get_int("bootstrap_timeout", 180)),
             # S3 Configuration for bootstrap script
             "USER_DATA_S3_BUCKET": worker_userdata_bucket.bucket,
             "USER_DATA_S3_KEY": "user-data/worker-bootstrap.sh",

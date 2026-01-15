@@ -207,6 +207,7 @@ def _get_config() -> dict:
         "state_table_name": os.environ.get("STATE_TABLE_NAME"),
         "cluster_name": os.environ.get("CLUSTER_NAME", "production-k3s"),
         "use_spot_instances": os.environ.get("USE_SPOT_INSTANCES", "false").lower() == "true",
+        "bootstrap_timeout": int(os.environ.get("BOOTSTRAP_TIMEOUT_SECONDS", "180")),
     }
 
     # Validate required config (key_name and state_table_name are optional)
@@ -659,12 +660,13 @@ def _handle_scale_up(detail: dict) -> dict:
             logger.info(f"Launched instance {instance_id}, waiting for bootstrap...")
 
             # Verification: Wait for bootstrap script to set JoinStatus=success tag
-            # Timeout is 2 minutes - bootstrap script tags itself when complete
-            verify_result = _verify_node_joined_tag(instance_id, timeout_seconds=120)
+            # Use configured timeout (default 180s / 3 minutes)
+            bootstrap_timeout = config.get("bootstrap_timeout", 180)
+            verify_result = _verify_node_joined_tag(instance_id, timeout_seconds=bootstrap_timeout)
 
             # Log verification result
             if verify_result["success"]:
-                logger.info(f"✓ Node successfully joined cluster")
+                logger.info("✓ Node successfully joined cluster")
             else:
                 logger.warning(f"Bootstrap verification: {verify_result.get('error')}")
 
@@ -721,7 +723,7 @@ def _handle_scale_up(detail: dict) -> dict:
                 _release_distributed_lock(table_name, cluster_name, lock_id)
 
 
-def _verify_node_joined_tag(instance_id: str, timeout_seconds: int = 120) -> dict:
+def _verify_node_joined_tag(instance_id: str, timeout_seconds: int = 180) -> dict:
     """Verify node joined by checking JoinStatus tag set by bootstrap script.
 
     The bootstrap script (user-data.sh.j2) tags the instance with:
@@ -770,7 +772,7 @@ def _verify_node_joined_tag(instance_id: str, timeout_seconds: int = 120) -> dic
             join_status = tags.get("JoinStatus", "")
 
             if join_status == "success":
-                logger.info(f"✓ Bootstrap completed successfully")
+                logger.info("✓ Bootstrap completed successfully")
                 # Tag as verified for cleanup Lambda
                 try:
                     ec2_client.create_tags(
