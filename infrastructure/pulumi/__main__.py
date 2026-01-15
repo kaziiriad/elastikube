@@ -950,10 +950,10 @@ cleanup_lambda = lambda_.Function(
     opts=pulumi.ResourceOptions(depends_on=[cleanup_lambda_build]),
 )
 
-# EventBridge Rule - triggers cleanup every 5 minutes
+# EventBridge Rule - triggers cleanup every 15 minutes
 cleanup_event_rule = aws.cloudwatch.EventRule(
     "k3s-cleanup-schedule",
-    schedule_expression="rate(5 minutes)",
+    schedule_expression="rate(15 minutes)",
     tags={**common_tags, "Name": "k3s-cleanup-schedule"}
 )
 
