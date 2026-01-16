@@ -480,7 +480,227 @@ All Lambdas share the same IAM role (`k3s-autoscaler-lambda-role`) with permissi
 | S3 Bucket | `k3s-userdata-{cluster_name}` | Worker bootstrap scripts |
 | CloudWatch Dashboard | `K3s-Cluster-Comprehensive` | Metrics visualization |
 
+### IAM Permissions and Security
 
+ElastiKube uses a multi-layered IAM architecture with scoped permissions for each component. The complete IAM policy documentation is available in [docs/iam-policies.json](docs/iam-policies.json).
+
+#### IAM Roles Summary
+
+| Role | Purpose | Managed Policies | Inline Policies |
+|------|---------|------------------|-----------------|
+| **`k3s-autoscaler-lambda-role`** | Execution role for all 4 Lambda functions (Decision, Scale-Up, Scale-Down, Cleanup) | AWSLambdaBasicExecutionRole, AWSLambdaVPCAccessExecutionRole | autoscaler_core_policy, lambda_pass_role_policy |
+| **`k3s-worker-node-role`** | IAM role for K3s worker EC2 instances (permanent and autoscaled) | AmazonSSMManagedInstanceCore, AWSSecretsManagerClientReadOnlyAccess | worker_node_policy |
+| **`k3s-master-node-role`** | IAM role for K3s master/control-plane EC2 instance | AmazonSSMManagedInstanceCore, SecretsManagerReadWrite | master_cloudwatch_policy |
+
+#### Deployment User
+
+| User | Purpose | Policy | Restrictions |
+|------|---------|--------|--------------|
+| **`k3s-temp-user`** | Pulumi infrastructure deployment | `temp-user-policy` (managed) | Resource prefix scoping (`k3s-*`), regional boundary (`ap-southeast-1`), PassRole service restriction |
+
+#### Lambda Execution Role Permissions
+
+The `k3s-autoscaler-lambda-role` has the following key permissions:
+
+| Service | Permissions | Purpose |
+|---------|-------------|---------|
+| **EC2** | RunInstances, TerminateInstances, DescribeInstances, CreateTags, Spot instance operations | Launch and terminate worker nodes |
+| **DynamoDB** | Full CRUD on `k3s-cluster-state` and `k3s-scaling-wal` tables | State management and WAL |
+| **SSM** | GetParameter, SendCommand, GetCommandInvocation | Retrieve master IP, execute kubectl drain |
+| **EventBridge** | PutEvents, DescribeRule, ListRules | Lambda chaining, observability |
+| **Secrets Manager** | GetSecretValue, DescribeSecret, UpdateSecretVersionStage | Retrieve K3s join token |
+| **CloudWatch** | PutMetricData, logs:CreateLogGroup, logs:PutLogEvents | Metrics and logging |
+| **S3** | GetObject on `k3s-userdata-*` buckets | Retrieve bootstrap scripts |
+| **IAM** | PassRole (scoped to `k3s-worker-node-role`) | Attach instance profile to workers |
+
+#### Worker Node Role Permissions
+
+| Service | Permissions | Purpose |
+|---------|-------------|---------|
+| **DynamoDB** | UpdateItem, PutItem on state table | Update node status and heartbeat |
+| **SSM** | GetParameter on `/k3s/*` | Retrieve master IP for cluster join |
+| **EC2** | DescribeInstances, DescribeTags, CreateTags | Tag own instance during bootstrap |
+| **Secrets Manager** | Read-only via managed policy | Retrieve K3s join token |
+
+#### Master Node Role Permissions
+
+| Service | Permissions | Purpose |
+|---------|-------------|---------|
+| **CloudWatch** | PutMetricData, logs operations | Publish metrics and logs |
+| **EC2** | DescribeVolumes, DescribeTags | Volume monitoring |
+| **Secrets Manager** | Read/write via managed policy | Store K3s join token after cluster init |
+
+#### Security Features
+
+**Resource Scoping:**
+- IAM permissions scoped to `k3s-*` prefixed roles and instance profiles only
+- DynamoDB permissions scoped to specific table ARNs
+- S3 permissions scoped to `k3s-userdata-*` buckets
+- SSM parameters scoped to `/k3s/*` prefix
+- Secrets Manager scoped to `k3s-*-*` secret names
+
+**Least Privilege Implementation:**
+- Lambda functions have minimum required permissions for autoscaling operations
+- EC2 Describe* and CreateTags use wildcard resources (AWS design limitation - instance ARNs unknown at launch)
+- IAM PassRole scoped to specific role ARNs and services (EC2, Lambda only)
+
+**Regional Boundary (Deployment User):**
+```json
+"Condition": {
+  "StringEquals": {
+    "aws:RequestedRegion": "ap-southeast-1"
+  }
+}
+```
+Prevents accidental resource creation in other regions.
+
+**PassRole Restriction:**
+```json
+"Condition": {
+  "StringEquals": {
+    "iam:PassedToService": ["ec2.amazonaws.com", "lambda.amazonaws.com"]
+  }
+}
+```
+Prevents privilege escalation via PassRole to other services.
+
+#### Audit and Compliance
+
+| Feature | Implementation |
+|---------|----------------|
+| **Audit Trail** | All IAM actions logged via AWS CloudTrail |
+| **Secrets Storage** | K3s join token in Secrets Manager with automatic rotation recommended |
+| **Network Security** | Lambda functions in VPC private subnets, no direct internet access |
+| **Assume Role Policies** | All roles use service-specific principals (lambda.amazonaws.com, ec2.amazonaws.com) |
+| **Distributed Locking** | DynamoDB conditional writes prevent concurrent scaling operations |
+
+**For detailed IAM policy documents including all statements and conditions, see [docs/iam-policies.json](docs/iam-policies.json).**
+
+## Cost Analysis
+
+### Estimated Monthly Costs (ap-southeast-1 Region)
+
+**Fixed Infrastructure Costs (24/7 Resources):**
+
+| Resource | Specification | Hours/Month | Unit Cost | Monthly Cost |
+|----------|---------------|-------------|-----------|--------------|
+| **EC2 Seed Nodes** | | | | |
+| Bastion Host | t3.micro | 730 | $0.019/hr | ~$13.87 |
+| Master Node | t3.small | 730 | $0.026/hr | ~$18.98 |
+| Permanent Worker 1 | t3.small | 730 | $0.026/hr | ~$18.98 |
+| Permanent Worker 2 | t3.small | 730 | $0.026/hr | ~$18.98 |
+| **Subtotal (Seed Nodes)** | | | | **~$70.81** |
+| **NAT Gateway** | 1 gateway | 730 | $0.045/hr | ~$32.85 |
+| **Elastic IP** | 1 address | 730 | $0.005/hr | ~$0.37 |
+| **Secrets Manager** | 2 secrets | - | $0.40/secret | ~$0.80 |
+| **DynamoDB** | On-demand | ~1GB storage | $1.25/GB | ~$1.25 |
+| **S3 Storage** | Bootstrap scripts | ~1GB | $0.023/GB | ~$0.02 |
+| **CloudWatch Logs** | ~5GB logs | - | $2.36/GB-ingest | ~$5.00 |
+| **Lambda Compute** | All functions | Within free tier | - | **$0.00** |
+| **Fixed Infrastructure Total** | | | | **~$111.10** |
+
+**Variable Costs (Autoscaled Workers):**
+
+| Scenario | Avg Worker Count | Runtime | Monthly Cost |
+|----------|------------------|---------|--------------|
+| **Low Load** | 0-2 autoscaled | 50% | $0 - $19 |
+| **Medium Load** | 2-4 autoscaled | 75% | $19 - $57 |
+| **High Load** | 4-8 autoscaled | 90% | $57 - $172 |
+
+**Total Monthly Cost Ranges:**
+
+| Usage Level | Fixed + Variable | Total/Month |
+|-------------|------------------|-------------|
+| Minimum | $111 + $0 | **~$111** |
+| Typical | $111 + $38 | **~$149** |
+| Peak | $111 + $172 | **~$283** |
+
+### Cost Breakdown by Service
+
+```
+EC2 Instances:       64% - 78% (seed nodes + autoscaled workers)
+NAT Gateway:         23% - 29%
+CloudWatch Logs:      2% - 4%
+DynamoDB:            < 1%
+Secrets Manager:     < 1%
+S3:                  < 1%
+Lambda:              0% (free tier)
+```
+
+### Cost Optimization Strategies
+
+**Implemented Optimizations:**
+
+1. **Spot Instances** (up to 70% savings)
+   - Configured via `USE_SPOT_INSTANCES=true` environment variable
+   - Automatic graceful handling of 2-minute interruption warnings
+   - Ideal for stateless worker nodes
+
+2. **Lambda Free Tier** ($0/month)
+   - Decision Lambda: ~43,800 invocations/month (within 1M free)
+   - Scale-Up/Down/Cleanup: Minimal usage
+   - Compute: 256MB × 5s avg = within 400K GB-sec free tier
+
+3. **DynamoDB On-Demand**
+   - PAY_PER_REQUEST billing (no capacity planning overhead)
+   - Pay only for actual reads/writes
+   - TTL enabled for automatic cleanup
+
+4. **CloudWatch Log Retention**
+   - Configure appropriate retention (e.g., 7 days instead of indefinite)
+   - Use log filters to reduce ingestion volume
+
+5. **S3 Intelligent Tiering**
+   - Bootstrap scripts are small and infrequently accessed
+   - Consider lifecycle policies to move to Glacier
+
+**Future Optimization Opportunities:**
+
+| Optimization | Estimated Savings | Effort |
+|--------------|-------------------|--------|
+| **Reserved Instances** (1-year term for seed nodes) | 30-40% on EC2 ($21-$28/mo) | Low |
+| **Compute Savings Plans** (1 or 3-year) | Up to 66% on EC2/Lambda | Medium |
+| **Spot Instance Fallback** | 50-70% on workers (when available) | High |
+| **NAT Gateway Replacement** (VPC endpoints + S3 Gateway) | ~$33/mo | Medium |
+| **CloudWatch Logs Insights** (vs. full log storage) | $3-5/mo | Low |
+| **Graviton Instances** (t4g instead of t3) | ~20% on EC2 | Medium |
+
+**Right-Sizing Recommendations:**
+
+| Component | Current | Recommendation | Reason |
+|-----------|---------|----------------|--------|
+| Master Node | t3.small | t3.medium | For >10 nodes |
+| Bastion | t3.micro | t3.nano | If only SSH access |
+| Workers (variable) | t3.small | t3.small | Balanced for K3s |
+| Lambda Memory | 128-256MB | 128MB (cleanup), 256MB (decision) | Optimize cost/latency |
+
+**Cost Monitoring:**
+
+Enable AWS Budgets to alert on spending:
+```bash
+# Set up monthly budget alert at $150
+aws budgets create-budget --account-id <account-id> --budget file://budget.json
+```
+
+Example `budget.json`:
+```json
+{
+  "BudgetName": "elastikube-monthly",
+  "BudgetLimit": {
+    "Amount": "150",
+    "Unit": "USD"
+  },
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST"
+}
+```
+
+**Notes:**
+- Prices are estimates for ap-southeast-1 (Singapore) region as of 2024
+- Actual costs vary based on usage patterns, instance availability, and data transfer
+- Free tier eligibility reduces first-year costs (Lambda, DynamoDB, CloudWatch)
+- NAT Gateway is one of the highest fixed costs—consider alternatives for production
+- Spot instance savings depend on market availability and interruption tolerance
 
 ## Quick Start
 

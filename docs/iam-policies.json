@@ -1,0 +1,631 @@
+{
+  "application": "ElastiKube (K3s Autoscaler)",
+  "version": "1.0.0",
+  "last_updated": "2025-01-16",
+  "description": "Complete IAM permission policies for the ElastiKube autoscaling system",
+  "iam_users": {
+    "deployment_temp_user": {
+      "name": "k3s-temp-user",
+      "purpose": "Deployment user for Pulumi infrastructure provisioning",
+      "policy_name": "temp-user-policy",
+      "policy_arn": "arn:aws:iam::835637957143:policy/temp-user-policy",
+      "managed_policy": {
+        "description": "Scoped IAM permissions for infrastructure deployment with regional and resource boundaries",
+        "statement": [
+          {
+            "sid": "IAMRoleManagement",
+            "effect": "Allow",
+            "actions": [
+              "iam:CreateRole",
+              "iam:DeleteRole",
+              "iam:GetRole",
+              "iam:UpdateRole",
+              "iam:UpdateRoleDescription",
+              "iam:TagRole",
+              "iam:UntagRole",
+              "iam:ListRoles",
+              "iam:ListInstanceProfilesForRole"
+            ],
+            "resources": ["arn:aws:iam::835637957143:role/k3s-*"],
+            "purpose": "Create and manage K3s IAM roles (lambda, worker, master)"
+          },
+          {
+            "sid": "IAMInstanceProfileManagement",
+            "effect": "Allow",
+            "actions": [
+              "iam:CreateInstanceProfile",
+              "iam:DeleteInstanceProfile",
+              "iam:GetInstanceProfile",
+              "iam:AddRoleToInstanceProfile",
+              "iam:RemoveRoleFromInstanceProfile",
+              "iam:TagInstanceProfile",
+              "iam:UntagInstanceProfile"
+            ],
+            "resources": ["arn:aws:iam::835637957143:instance-profile/k3s-*"],
+            "purpose": "Manage EC2 instance profiles for worker/master nodes"
+          },
+          {
+            "sid": "IAMInlinePolicyManagement",
+            "effect": "Allow",
+            "actions": [
+              "iam:PutRolePolicy",
+              "iam:DeleteRolePolicy",
+              "iam:GetRolePolicy",
+              "iam:ListRolePolicies"
+            ],
+            "resources": ["arn:aws:iam::835637957143:role/k3s-*"],
+            "purpose": "Attach inline policies to K3s roles"
+          },
+          {
+            "sid": "IAMManagedPolicyAttachment",
+            "effect": "Allow",
+            "actions": [
+              "iam:AttachRolePolicy",
+              "iam:DetachRolePolicy",
+              "iam:ListAttachedRolePolicies"
+            ],
+            "resources": [
+              "arn:aws:iam::835637957143:role/k3s-*",
+              "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+              "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+            ],
+            "purpose": "Attach AWS managed policies to K3s roles"
+          },
+          {
+            "sid": "IAMPassRole",
+            "effect": "Allow",
+            "actions": ["iam:PassRole"],
+            "resources": ["arn:aws:iam::835637957143:role/k3s-*"],
+            "condition": {
+              "StringEquals": {
+                "iam:PassedToService": ["ec2.amazonaws.com", "lambda.amazonaws.com"]
+              }
+            },
+            "purpose": "Allow passing K3s roles to EC2 and Lambda services"
+          },
+          {
+            "sid": "IAMReadOnlyForDiscovery",
+            "effect": "Allow",
+            "actions": [
+              "iam:ListPolicies",
+              "iam:ListPolicyVersions",
+              "iam:GetPolicy",
+              "iam:GetPolicyVersion"
+            ],
+            "resources": ["*"],
+            "purpose": "Read-only access for policy discovery during infrastructure provisioning"
+          },
+          {
+            "sid": "S3BucketManagement",
+            "effect": "Allow",
+            "actions": ["s3:*"],
+            "resources": [
+              "arn:aws:s3:::k3s-userdata-*",
+              "arn:aws:s3:::k3s-userdata-*/*"
+            ],
+            "purpose": "Full S3 access for K3s user-data buckets (bootstrap scripts)"
+          },
+          {
+            "sid": "SSMGlobalActions",
+            "effect": "Allow",
+            "actions": ["ssm:DescribeParameters"],
+            "resources": ["*"],
+            "purpose": "List SSM parameters globally"
+          },
+          {
+            "sid": "SSMParameterActions",
+            "effect": "Allow",
+            "actions": [
+              "ssm:GetParameters",
+              "ssm:GetParameter",
+              "ssm:GetParametersByPath"
+            ],
+            "resources": ["arn:aws:ssm:*:*:parameter/k3s/*"],
+            "purpose": "Read K3s SSM parameters (master IP, config values)"
+          },
+          {
+            "sid": "SecretsManagerGlobalActions",
+            "effect": "Allow",
+            "actions": [
+              "secretsmanager:DescribeSecret",
+              "secretsmanager:GetSecretValue",
+              "secretsmanager:GetResourcePolicy",
+              "secretsmanager:ListSecrets",
+              "secretsmanager:UpdateSecretVersionStage"
+            ],
+            "resources": ["arn:aws:secretsmanager:*:*:secret:k3s-*-*"],
+            "purpose": "Read K3s secrets (join token, sensitive config)"
+          },
+          {
+            "sid": "RegionalServices",
+            "effect": "Allow",
+            "actions": [
+              "ec2:*",
+              "dynamodb:*",
+              "events:*",
+              "cloudwatch:*",
+              "lambda:*",
+              "logs:*",
+              "autoscaling:*",
+              "elasticloadbalancing:*",
+              "apigateway:*",
+              "ecr:*",
+              "sqs:*",
+              "sns:*",
+              "states:*",
+              "cloudformation:*",
+              "vpc-lattice:*",
+              "ssm:PutParameter",
+              "ssm:DeleteParameter",
+              "ssm:AddTagsToResource",
+              "ssm:ListTagsForResource",
+              "secretsmanager:CreateSecret",
+              "secretsmanager:DeleteSecret",
+              "secretsmanager:RestoreSecret",
+              "secretsmanager:TagResource",
+              "secretsmanager:PutSecretValue"
+            ],
+            "resources": ["*"],
+            "condition": {
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-southeast-1"
+              }
+            },
+            "purpose": "Full regional access for infrastructure provisioning (scoped to ap-southeast-1)"
+          }
+        ]
+      },
+      "security_features": {
+        "resource_scoping": [
+          "IAM permissions scoped to k3s-* prefixed roles and instance profiles",
+          "S3 permissions scoped to k3s-userdata-* buckets",
+          "SSM parameters scoped to /k3s/* prefix",
+          "Secrets Manager scoped to k3s-*-* secret names"
+        ],
+        "regional_boundary": {
+          "condition": "aws:RequestedRegion condition on all regional service actions",
+          "allowed_region": "ap-southeast-1",
+          "prevents": "Accidental resource creation in other regions"
+        },
+        "iam_pass_role_restriction": {
+          "condition": "iam:PassedToService condition",
+          "allowed_services": ["ec2.amazonaws.com", "lambda.amazonaws.com"],
+          "prevents": "Privilege escalation via PassRole to other services"
+        }
+      }
+    }
+  },
+  "iam_roles": {
+    "lambda_execution_role": {
+      "name": "k3s-autoscaler-lambda-role",
+      "purpose": "Execution role for all Lambda functions (Decision, Scale-Up, Scale-Down, Cleanup)",
+      "assumed_by": "lambda.amazonaws.com",
+      "managed_policies": [
+        {
+          "arn": "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+          "purpose": "Basic Lambda execution permissions (CloudWatch Logs write access)"
+        },
+        {
+          "arn": "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole",
+          "purpose": "VPC network access for Lambda functions (ENI creation, DNS resolution)"
+        }
+      ],
+      "inline_policies": {
+        "autoscaler_core_policy": {
+          "description": "Core permissions for autoscaling operations (EC2, DynamoDB, SSM, EventBridge, Secrets Manager, CloudWatch, S3)",
+          "statement": [
+            {
+              "sid": "EC2Permissions",
+              "effect": "Allow",
+              "actions": [
+                "ec2:RunInstances",
+                "ec2:TerminateInstances",
+                "ec2:DescribeInstances",
+                "ec2:DescribeInstanceStatus",
+                "ec2:CreateTags",
+                "ec2:DescribeTags"
+              ],
+              "resources": ["*"],
+              "purpose": "Launch and terminate worker instances, tag instances for tracking"
+            },
+            {
+              "sid": "SpotInstancePermissions",
+              "effect": "Allow",
+              "actions": [
+                "ec2:DescribeSpotInstanceRequests",
+                "ec2:DescribeSpotPriceHistory",
+                "ec2:RequestSpotInstances",
+                "ec2:CancelSpotInstanceRequests"
+              ],
+              "resources": ["*"],
+              "purpose": "Launch and manage spot instances for cost optimization"
+            },
+            {
+              "sid": "DynamoDBStateTableAccess",
+              "effect": "Allow",
+              "actions": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:Query",
+                "dynamodb:Scan",
+                "dynamodb:DeleteItem"
+              ],
+              "resources": [
+                "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/k3s-cluster-state",
+                "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/k3s-cluster-state/*"
+              ],
+              "purpose": "Read/write cluster state (node counts, scaling status, cooldowns, distributed locks)"
+            },
+            {
+              "sid": "DynamoDBWALTableAccess",
+              "effect": "Allow",
+              "actions": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:Query",
+                "dynamodb:Scan",
+                "dynamodb:DeleteItem"
+              ],
+              "resources": [
+                "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/k3s-scaling-wal",
+                "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/k3s-scaling-wal/*"
+              ],
+              "purpose": "Write-Ahead Log for crash recovery and operation tracking"
+            },
+            {
+              "sid": "SSMParameterRead",
+              "effect": "Allow",
+              "actions": ["ssm:GetParameter"],
+              "resources": ["arn:aws:ssm:${AWS::Region}:*:parameter/k3s/*"],
+              "purpose": "Retrieve master node IP from SSM Parameter Store for worker bootstrap"
+            },
+            {
+              "sid": "SSMSendCommand",
+              "effect": "Allow",
+              "actions": ["ssm:SendCommand"],
+              "resources": [
+                "arn:aws:ssm:${AWS::Region}:*:document/AWS-RunShellScript",
+                "arn:aws:ec2:${AWS::Region}:*:instance/*"
+              ],
+              "purpose": "Execute kubectl drain on master node via SSM Run Command"
+            },
+            {
+              "sid": "SSMGetCommandInvocation",
+              "effect": "Allow",
+              "actions": ["ssm:GetCommandInvocation"],
+              "resources": ["*"],
+              "purpose": "Retrieve output from SSM commands (kubectl drain execution status)"
+            },
+            {
+              "sid": "EventBridgePutEvents",
+              "effect": "Allow",
+              "actions": ["events:PutEvents"],
+              "resources": ["arn:aws:events:${AWS::Region}:*:event-bus/*"],
+              "purpose": "Publish ScaleUp/ScaleDown events for Lambda chaining"
+            },
+            {
+              "sid": "EventBridgeReadPermissions",
+              "effect": "Allow",
+              "actions": [
+                "events:DescribeRule",
+                "events:ListRules",
+                "events:DescribeEventBus",
+                "events:ListEventBuses"
+              ],
+              "resources": [
+                "arn:aws:events:${AWS::Region}:*:rule/*",
+                "arn:aws:events:${AWS::Region}:*:event-bus/*"
+              ],
+              "purpose": "Read EventBridge rules for debugging and observability"
+            },
+            {
+              "sid": "SecretsManagerAccess",
+              "effect": "Allow",
+              "actions": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret",
+                "secretsmanager:DeleteSecret",
+                "secretsmanager:UpdateSecretVersionStage"
+              ],
+              "resources": ["arn:aws:secretsmanager:${AWS::Region}:*:secret:k3s-*-*"],
+              "purpose": "Retrieve K3s join token for worker bootstrap authentication"
+            },
+            {
+              "sid": "CloudWatchLogsPermissions",
+              "effect": "Allow",
+              "actions": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "resources": ["arn:aws:logs:*:*:*"],
+              "purpose": "Write Lambda execution logs to CloudWatch"
+            },
+            {
+              "sid": "CloudWatchMetricsPermissions",
+              "effect": "Allow",
+              "actions": [
+                "cloudwatch:PutMetricData",
+                "cloudwatch:GetMetricStatistics",
+                "cloudwatch:ListMetrics"
+              ],
+              "resources": ["*"],
+              "purpose": "Publish custom metrics (CPU, memory, pending pods) to CloudWatch"
+            },
+            {
+              "sid": "S3BootstrapScriptRead",
+              "effect": "Allow",
+              "actions": ["s3:GetObject"],
+              "resources": ["arn:aws:s3:::k3s-userdata-${ClusterName}/*"],
+              "purpose": "Retrieve worker bootstrap script from S3 during instance launch"
+            }
+          ]
+        },
+        "lambda_pass_role_policy": {
+          "description": "Allows Lambda to pass the worker instance profile when launching EC2 instances",
+          "statement": [
+            {
+              "sid": "PassWorkerInstanceProfile",
+              "effect": "Allow",
+              "actions": ["iam:PassRole"],
+              "resources": ["arn:aws:iam::${AWS::AccountId}:role/k3s-worker-node-role"],
+              "purpose": "Attach worker IAM instance profile to newly launched EC2 instances"
+            }
+          ]
+        }
+      }
+    },
+    "worker_node_role": {
+      "name": "k3s-worker-node-role",
+      "purpose": "IAM role for K3s worker nodes (both permanent and autoscaled)",
+      "assumed_by": "ec2.amazonaws.com",
+      "instance_profile": "k3s-worker-instance-profile",
+      "managed_policies": [
+        {
+          "arn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+          "purpose": "SSM Session Manager access for SSH-less management, Run Command execution"
+        },
+        {
+          "arn": "arn:aws:iam::aws:policy/AWSSecretsManagerClientReadOnlyAccess",
+          "purpose": "Read-only access to Secrets Manager for retrieving K3s join token during bootstrap"
+        }
+      ],
+      "inline_policies": {
+        "worker_node_policy": {
+          "description": "Custom permissions for worker node bootstrap and state updates",
+          "statement": [
+            {
+              "sid": "DynamoDBStateUpdate",
+              "effect": "Allow",
+              "actions": [
+                "dynamodb:UpdateItem",
+                "dynamodb:PutItem"
+              ],
+              "resources": ["arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/k3s-cluster-state"],
+              "purpose": "Update node status and heartbeat in DynamoDB state table"
+            },
+            {
+              "sid": "SSMParameterRead",
+              "effect": "Allow",
+              "actions": ["ssm:GetParameter"],
+              "resources": ["arn:aws:ssm:${AWS::Region}:*:parameter/k3s/*"],
+              "purpose": "Retrieve master node IP for K3s cluster join"
+            },
+            {
+              "sid": "EC2SelfTagging",
+              "effect": "Allow",
+              "actions": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeTags",
+                "ec2:CreateTags"
+              ],
+              "resources": ["*"],
+              "purpose": "Tag own instance with join status during bootstrap"
+            }
+          ]
+        }
+      }
+    },
+    "master_node_role": {
+      "name": "k3s-master-node-role",
+      "purpose": "IAM role for K3s master/control-plane node",
+      "assumed_by": "ec2.amazonaws.com",
+      "instance_profile": "k3s-master-instance-profile",
+      "managed_policies": [
+        {
+          "arn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+          "purpose": "SSM Session Manager access for SSH-less management, Run Command execution (kubectl drain)"
+        },
+        {
+          "arn": "arn:aws:iam::aws:policy/SecretsManagerReadWrite",
+          "purpose": "Read/write access to Secrets Manager for storing K3s join token after cluster initialization"
+        }
+      ],
+      "inline_policies": {
+        "master_cloudwatch_policy": {
+          "description": "CloudWatch permissions for metrics and logs from master node",
+          "statement": [
+            {
+              "sid": "CloudWatchMetricsAndLogs",
+              "effect": "Allow",
+              "actions": [
+                "cloudwatch:PutMetricData",
+                "ec2:DescribeVolumes",
+                "ec2:DescribeTags",
+                "logs:PutLogEvents",
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:DescribeLogStreams"
+              ],
+              "resources": ["*"],
+              "purpose": "Publish system metrics and logs to CloudWatch for monitoring"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "permission_summary": {
+    "total_roles": 3,
+    "total_users": 1,
+    "total_managed_policies": 6,
+    "total_inline_policies": 4,
+    "service_permissions": {
+      "ec2": [
+        "RunInstances",
+        "TerminateInstances",
+        "DescribeInstances",
+        "DescribeInstanceStatus",
+        "CreateTags",
+        "DescribeTags",
+        "DescribeSpotInstanceRequests",
+        "DescribeSpotPriceHistory",
+        "RequestSpotInstances",
+        "CancelSpotInstanceRequests",
+        "DescribeVolumes"
+      ],
+      "dynamodb": [
+        "GetItem",
+        "PutItem",
+        "UpdateItem",
+        "Query",
+        "Scan",
+        "DeleteItem"
+      ],
+      "ssm": [
+        "GetParameter",
+        "SendCommand",
+        "GetCommandInvocation"
+      ],
+      "events": [
+        "PutEvents",
+        "DescribeRule",
+        "ListRules",
+        "DescribeEventBus",
+        "ListEventBuses"
+      ],
+      "secretsmanager": [
+        "GetSecretValue",
+        "DescribeSecret",
+        "DeleteSecret",
+        "UpdateSecretVersionStage"
+      ],
+      "logs": [
+        "CreateLogGroup",
+        "CreateLogStream",
+        "PutLogEvents",
+        "DescribeLogStreams"
+      ],
+      "cloudwatch": [
+        "PutMetricData",
+        "GetMetricStatistics",
+        "ListMetrics"
+      ],
+      "s3": [
+        "GetObject",
+        "*"
+      ],
+      "iam": [
+        "PassRole",
+        "CreateRole",
+        "DeleteRole",
+        "GetRole",
+        "UpdateRole",
+        "UpdateRoleDescription",
+        "TagRole",
+        "UntagRole",
+        "ListRoles",
+        "ListInstanceProfilesForRole",
+        "CreateInstanceProfile",
+        "DeleteInstanceProfile",
+        "GetInstanceProfile",
+        "AddRoleToInstanceProfile",
+        "RemoveRoleFromInstanceProfile",
+        "TagInstanceProfile",
+        "UntagInstanceProfile",
+        "PutRolePolicy",
+        "DeleteRolePolicy",
+        "GetRolePolicy",
+        "ListRolePolicies",
+        "AttachRolePolicy",
+        "DetachRolePolicy",
+        "ListAttachedRolePolicies",
+        "ListPolicies",
+        "ListPolicyVersions",
+        "GetPolicy",
+        "GetPolicyVersion"
+      ]
+    },
+    "deployment_user_permissions": {
+      "note": "Deployment user (k3s-temp-user) has scoped administrative access for infrastructure provisioning",
+      "restrictions": [
+        "IAM actions scoped to k3s-* prefixed roles and instance profiles only",
+        "S3 actions scoped to k3s-userdata-* buckets only",
+        "SSM parameters scoped to /k3s/* prefix only",
+        "Secrets Manager scoped to k3s-*-* secrets only",
+        "Regional services restricted to ap-southeast-1 via aws:RequestedRegion condition",
+        "iam:PassRole restricted to EC2 and Lambda services only (prevents privilege escalation)"
+      ]
+    },
+    "least_privilege_notes": [
+      "EC2 permissions use wildcard resources (*) because instance ARNs are not known at launch time",
+      "SSM GetCommandInvocation requires wildcard resources due to AWS API design",
+      "CloudWatch metrics use wildcard resources for custom namespace publishing",
+      "DynamoDB permissions are scoped to specific table ARNs with resource-level permissions",
+      "S3 permissions are scoped to specific bucket prefix for bootstrap scripts",
+      "IAM PassRole is scoped to specific worker role ARN (security best practice)",
+      "Secrets Manager permissions use wildcard in account/region but scoped to secret name prefix (k3s-*)",
+      "Deployment user (k3s-temp-user) has scoped administrative access with multiple boundaries: resource prefix scoping (k3s-*) and regional restriction (ap-southeast-1 only)"
+    ],
+    "security_considerations": [
+      "SSH access (port 22) is open to 0.0.0.0/0 - should be restricted to specific IP ranges in production",
+      "EC2 Describe* and CreateTags permissions use * resources - acceptable for EC2 service design",
+      "K3s join token stored in Secrets Manager with automatic rotation recommended",
+      "Lambda functions run in VPC with private subnets - no direct internet access required",
+      "All IAM roles use assume role policies for specific services (lambda.amazonaws.com, ec2.amazonaws.com)",
+      "Distributed locking via DynamoDB conditional writes prevents concurrent scaling operations",
+      "Spot instance interruption handled via EventBridge rules with 2-minute warning",
+      "Dead-letter queues (SQS) capture failed EventBridge events for debugging",
+      "CloudWatch alarms configured for scaling failures, lock timeouts, and provisioning issues",
+      "Deployment user (k3s-temp-user) has iam:PassRole restricted to EC2 and Lambda services only, preventing privilege escalation via PassRole to other services",
+      "Deployment user permissions are scoped to k3s-* prefixed resources only, preventing unauthorized access to non-K3s AWS resources"
+    ]
+  },
+  "iam_entities_summary": {
+    "roles": {
+      "lambda_execution_role": "k3s-autoscaler-lambda-role (shared by Decision, Scale-Up, Scale-Down, Cleanup Lambdas)",
+      "worker_node_role": "k3s-worker-node-role (for worker EC2 instances)",
+      "master_node_role": "k3s-master-node-role (for master EC2 instance)"
+    },
+    "users": {
+      "deployment_temp_user": "k3s-temp-user (for Pulumi infrastructure deployment)"
+    },
+    "managed_policies": {
+      "service_role_policies": [
+        "AWSLambdaBasicExecutionRole",
+        "AWSLambdaVPCAccessExecutionRole",
+        "AmazonSSMManagedInstanceCore",
+        "AWSSecretsManagerClientReadOnlyAccess",
+        "SecretsManagerReadWrite"
+      ],
+      "custom_policies": [
+        "temp-user-policy (k3s-temp-user)"
+      ]
+    }
+  },
+  "compliance_mapping": {
+    "cis_controls": {
+      "controlled_access": "IAM roles with least privilege, no access keys for Lambda/EC2",
+      "logging": "CloudWatch Logs enabled for all components, audit trail via CloudTrail",
+      "configuration_management": "Infrastructure as Code via Pulumi, version-controlled"
+    },
+    "security_best_practices": {
+      "secrets_management": "K3s join token in Secrets Manager, master IP in SSM Parameter Store",
+      "network_security": "Private subnets for cluster nodes, security groups with port-specific rules",
+      "incident_response": "CloudWatch alarms for scaling failures, DLQ for failed events",
+      "data_encryption": "AWS-managed encryption keys for DynamoDB, Secrets Manager, S3"
+    }
+  }
+}
