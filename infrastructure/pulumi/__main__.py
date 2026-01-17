@@ -482,6 +482,12 @@ autoscaler_policy = iam.RolePolicy(
                 "resources": [f"arn:aws:events:{region}:*:rule/*"],
                 "effect": "Allow",
             },
+            # EventBridge PutRule Permission (for adaptive scheduling - dynamic check intervals)
+            {
+                "actions": ["events:PutRule"],
+                "resources": [f"arn:aws:events:{region}:*:rule/k3s-autoscaler-schedule*"],
+                "effect": "Allow",
+            },
             {
                 "actions": [
                     "events:DescribeEventBus",
@@ -802,6 +808,12 @@ lambda_function = lambda_.Function(
             "SCALE_UP_COOLDOWN": str(scale_up_cooldown),
             "SCALE_DOWN_COOLDOWN": str(scale_down_cooldown),
             "DRY_RUN": "false",
+            # Adaptive Scheduling Configuration
+            "ADAPTIVE_SCHEDULING_ENABLED": config.get_bool("adaptive_scheduling", True),
+            "EVENT_RULE_NAME": event_rule.name,
+            "ADAPTIVE_INTERVAL_FAST": "2",  # minutes (near thresholds)
+            "ADAPTIVE_INTERVAL_NORMAL": "5",  # minutes (stable mid-range)
+            "ADAPTIVE_INTERVAL_SLOW": "10",  # minutes (very stable/off-peak)
             # EC2 Configuration
             "SUBNET_ID": private_subnet.id,
             "SECURITY_GROUP_ID": bastion_security_group.id,

@@ -266,7 +266,7 @@ flowchart TD
 
 ### Decision Lambda (`k3s-autoscaler-function`)
 
-**Trigger:** EventBridge rule (every 2 minutes)
+**Trigger:** EventBridge rule (adaptive: 2-10 minutes based on cluster state)
 
 **Key Responsibilities:**
 1. Acquire distributed lock (10s timeout, 1s retries)
@@ -276,7 +276,25 @@ flowchart TD
 5. Evaluate scaling decision
 6. Publish EventBridge event if scaling needed
 7. Update state with current `ready_nodes` count
-8. Release distributed lock (always in `finally` block)
+8. **Update adaptive schedule** (adjust next check interval based on cluster conditions)
+9. Release distributed lock (always in `finally` block)
+
+**Adaptive Scheduling:**
+The Lambda dynamically adjusts its own EventBridge trigger interval:
+
+| Interval | Conditions | Use Case |
+|----------|------------|----------|
+| **2 min** | CPU ≥ 60%, pending pods > 0, at min/max nodes, recent scaling action | Near thresholds or unstable |
+| **5 min** | Default normal operation | Stable mid-range CPU/memory |
+| **10 min** | CPU < 20%, memory < 40%, no pending pods, not at boundaries | Off-peak / very stable |
+
+This self-adjusting behavior reduces Lambda invocations by 60-80% during stable periods while maintaining responsiveness during unstable conditions.
+
+**Configuration:**
+- `ADAPTIVE_SCHEDULING_ENABLED`: Enable/disable adaptive scheduling (default: `true`)
+- `ADAPTIVE_INTERVAL_FAST`: Fast interval in minutes (default: `2`)
+- `ADAPTIVE_INTERVAL_NORMAL`: Normal interval in minutes (default: `5`)
+- `ADAPTIVE_INTERVAL_SLOW`: Slow interval in minutes (default: `10`)
 
 **Health Check:** Invoke with `{"action": "health_check"}`
 
@@ -692,12 +710,19 @@ Lambda:              0% (free tier)
    - Ideal for stateless worker nodes
    - `InstanceLifecycle` tag reflects actual instance type ("spot" or "on-demand")
 
-2. **Lambda Free Tier** ($0/month)
-   - Decision Lambda: ~43,800 invocations/month (within 1M free)
+2. **Adaptive Scheduling** (60-80% reduction in Lambda invocations)
+   - Self-adjusting check intervals based on cluster state
+   - Fast (2 min) when near thresholds, slow (10 min) during stable periods
+   - Configured via `ADAPTIVE_SCHEDULING_ENABLED=true` environment variable
+   - Reduces Decision Lambda invocations from 21,600/month to 4,320-8,640/month
+   - Maintains responsiveness while optimizing for off-peak periods
+
+3. **Lambda Free Tier** ($0/month)
+   - Decision Lambda: ~4,320-21,600 invocations/month depending on adaptive scheduling (within 1M free)
    - Scale-Up/Down/Cleanup: Minimal usage
    - Compute: 256MB × 5s avg = within 400K GB-sec free tier
 
-3. **DynamoDB On-Demand**
+4. **DynamoDB On-Demand**
    - PAY_PER_REQUEST billing (no capacity planning overhead)
    - Pay only for actual reads/writes
    - TTL enabled for automatic cleanup
@@ -859,17 +884,29 @@ production/
 ### Decision Lambda Environment Variables
 
 ```bash
+# Cluster Configuration
 CLUSTER_NAME=production-k3s
 PROMETHEUS_URL=http://<master-ip>:30900
 STATE_TABLE_NAME=k3s-cluster-state
 WAL_TABLE_NAME=k3s-scaling-wal
 EVENT_BUS_NAME=default
+
+# Scaling Limits
 MIN_NODES=2
 MAX_NODES=10
 SCALE_UP_THRESHOLD=70
 SCALE_DOWN_THRESHOLD=30
 SCALE_UP_COOLDOWN=300
 SCALE_DOWN_COOLDOWN=900
+
+# Adaptive Scheduling
+ADAPTIVE_SCHEDULING_ENABLED=true
+EVENT_RULE_NAME=k3s-autoscaler-schedule
+ADAPTIVE_INTERVAL_FAST=2
+ADAPTIVE_INTERVAL_NORMAL=5
+ADAPTIVE_INTERVAL_SLOW=10
+
+# Other
 DRY_RUN=false
 ```
 
@@ -995,7 +1032,7 @@ AWS_PROFILE=k3s-temp-user aws dynamodb scan \
 | **GitOps Configuration** | Version-controlled configuration with auditable rollbacks via Git | Change management, traceability, safer deployments |
 | **Slack Notifications** | Concise alerts for scale actions, drains, failures with troubleshooting context | Faster incident response, better operational awareness |
 
-**Note:** Spot Instance Fallback with automatic On-Demand fallback is already implemented (see "Implemented Optimizations" in Cost Analysis section).
+**Note:** Spot Instance Fallback with automatic On-Demand fallback and Adaptive Scheduling are already implemented (see "Implemented Optimizations" in Cost Analysis section).
 
 ### Implementation Priority
 
