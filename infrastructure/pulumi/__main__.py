@@ -19,7 +19,7 @@ import pulumi
 import pulumi_command as command
 from pulumi_command import local
 import pulumi_aws as aws
-from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3
+from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3, sns
 
 # If CustomTimeouts is provider-specific (e.g., AWS, Kubernetes):
 
@@ -52,6 +52,9 @@ scale_up_threshold = config.get_int("autoscaler:scaleUpThreshold", 70)
 scale_down_threshold = config.get_int("autoscaler:scaleDownThreshold", 30)
 scale_up_cooldown = config.get_int("autoscaler:scaleUpCooldown", 300)
 scale_down_cooldown = config.get_int("autoscaler:scaleDownCooldown", 900)
+
+# Alarm Notification Configuration
+alarm_email = config.get("alarm:email", None)  # Optional: Set to your email for alarm notifications
 
 # =============================================================================
 # Tags
@@ -372,7 +375,8 @@ lambda_assume_role = iam.get_policy_document(
 lambda_role = iam.Role(
     "k3s-autoscaler-lambda-role",
     assume_role_policy=lambda_assume_role.json,
-    tags={**common_tags, "Name": "k3s-autoscaler-lambda-role"}
+    tags={**common_tags, "Name": "k3s-autoscaler-lambda-role"},
+    opts=pulumi.ResourceOptions(delete_before_replace=True)
 )
 
 # Attach basic Lambda execution policy
@@ -543,7 +547,8 @@ ec2_assume_role = iam.get_policy_document(
 worker_role = iam.Role(
     "k3s-worker-node-role",
     assume_role_policy=ec2_assume_role.json,
-    tags={**common_tags, "Name": "k3s-worker-node-role"}
+    tags={**common_tags, "Name": "k3s-worker-node-role"},
+    opts=pulumi.ResourceOptions(delete_before_replace=True)
 )
 
 # Worker node policy
@@ -620,9 +625,10 @@ lambda_pass_role_policy = iam.RolePolicy(
 # Master Node IAM Role (for SSM access - kubectl drain)
 # =============================================================================
 master_role = iam.Role(
-            "k3s-master-node-role",
+    "k3s-master-node-role",
     assume_role_policy=ec2_assume_role.json,
-    tags={**common_tags, "Name": "k3s-master-node-role"}
+    tags={**common_tags, "Name": "k3s-master-node-role"},
+    opts=pulumi.ResourceOptions(delete_before_replace=True)
 )
 
 # Attach SSM managed policy for Session Manager (kubectl drain via SSM)
@@ -1111,6 +1117,28 @@ scale_down_lambda_permission = aws.lambda_.Permission(
 )
 
 # =============================================================================
+# SNS Topic for Alarm Notifications
+# =============================================================================
+
+# Create SNS topic for critical and warning alerts
+alarm_topic = sns.Topic(
+    "k3s-autoscaler-alarms",
+    tags={**common_tags, "Name": "k3s-autoscaler-alarms", "Purpose": "alarm-notifications"}
+)
+
+# Email subscription (optional - set alarm:email config to enable)
+# If alarm_email is set, automatically create email subscription
+# Otherwise, you can manually subscribe after deployment:
+# aws sns subscribe --topic-arn <alarm-topic-arn> --protocol email --notification-endpoint your-email@example.com
+if alarm_email is not None:
+    alarm_subscription_email = sns.TopicSubscription(
+        "k3s-alarms-email-subscription",
+        topic=alarm_topic.arn,
+        protocol="email",
+        endpoint=alarm_email,
+    )
+
+# =============================================================================
 # CloudWatch Alarms
 # =============================================================================
 
@@ -1277,6 +1305,164 @@ scale_down_dlq_age_alarm = aws.cloudwatch.MetricAlarm(
 )
 
 # =============================================================================
+# Critical Failure Alarms - Lambda Execution Health
+# =============================================================================
+
+# Decision Lambda Errors - detects code failures, exceptions
+decision_lambda_errors_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-decision-lambda-errors-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="Errors",
+    namespace="AWS/Lambda",
+    period=300,  # 5 minutes
+    statistic="Sum",
+    threshold=1.0,
+    alarm_description="CRITICAL: Decision Lambda is throwing exceptions. Autoscaling decisions may not be executing.",
+    dimensions={
+        "FunctionName": lambda_function.name,
+    },
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-decision-lambda-errors-alarm", "Severity": "CRITICAL"}
+)
+
+# Decision Lambda Duration - detects timeout risk (approaching 300s max)
+decision_lambda_duration_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-decision-lambda-duration-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=2,
+    metric_name="Duration",
+    namespace="AWS/Lambda",
+    period=300,  # 5 minutes
+    statistic="Maximum",
+    threshold=240,  # 80% of 300s timeout
+    alarm_description="WARNING: Decision Lambda duration exceeding 240s (80% of timeout). Risk of timeout.",
+    dimensions={
+        "FunctionName": lambda_function.name,
+    },
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-decision-lambda-duration-alarm", "Severity": "WARNING"}
+)
+
+# Scale-Up Lambda Errors - detects worker launch failures
+scale_up_lambda_errors_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-scale-up-lambda-errors-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="Errors",
+    namespace="AWS/Lambda",
+    period=300,  # 5 minutes
+    statistic="Sum",
+    threshold=1.0,
+    alarm_description="CRITICAL: Scale-Up Lambda is failing. Workers cannot be launched to handle load.",
+    dimensions={
+        "FunctionName": scale_up_lambda.name,
+    },
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-scale-up-lambda-errors-alarm", "Severity": "CRITICAL"}
+)
+
+# Scale-Down Lambda Errors - detects drain/terminate failures
+scale_down_lambda_errors_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-scale-down-lambda-errors-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="Errors",
+    namespace="AWS/Lambda",
+    period=300,  # 5 minutes
+    statistic="Sum",
+    threshold=1.0,
+    alarm_description="CRITICAL: Scale-Down Lambda is failing. Workers may not be draining/terminating properly.",
+    dimensions={
+        "FunctionName": scale_down_lambda.name,
+    },
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-scale-down-lambda-errors-alarm", "Severity": "CRITICAL"}
+)
+
+# Cleanup Lambda Errors - detects stale node cleanup failures
+cleanup_lambda_errors_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-cleanup-lambda-errors-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=2,
+    metric_name="Errors",
+    namespace="AWS/Lambda",
+    period=300,  # 5 minutes
+    statistic="Sum",
+    threshold=3.0,
+    alarm_description="WARNING: Cleanup Lambda experiencing errors. Stale nodes may accumulate.",
+    dimensions={
+        "FunctionName": cleanup_lambda.name,
+    },
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-cleanup-lambda-errors-alarm", "Severity": "WARNING"}
+)
+
+# =============================================================================
+# Infrastructure Health Alarms
+# =============================================================================
+
+# Pending Pods Stuck - detects when pods can't be scheduled (autoscaler broken)
+pending_pods_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-pending-pods-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=3,
+    metric_name="PendingPods",
+    namespace="K3sAutoscaler",
+    period=60,  # 1 minute
+    statistic="Average",
+    threshold=5.0,  # 5 or more pods pending for 3+ minutes
+    alarm_description="CRITICAL: 5+ pods pending for 3+ minutes. Autoscaler may be failing to scale up.",
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-pending-pods-alarm", "Severity": "CRITICAL"}
+)
+
+# WAL Stale Operations - detects crashed operations
+wal_stale_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-wal-stale-operations-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="IncompleteOperations",
+    namespace="K3sAutoscaler",
+    period=300,  # 5 minutes
+    statistic="Maximum",
+    threshold=600,  # Operations incomplete for 10+ minutes
+    alarm_description="WARNING: WAL has operations incomplete for 10+ minutes. Crash recovery may be needed.",
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-wal-stale-operations-alarm", "Severity": "WARNING"}
+)
+
+# Node Count Drops Below Minimum - detects worker loss
+node_count_minimum_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-node-count-minimum-alarm",
+    comparison_operator="LessThanThreshold",
+    evaluation_periods=2,
+    metric_name="TotalNodes",
+    namespace="K3sAutoscaler",
+    period=60,  # 1 minute
+    statistic="Average",
+    threshold=2.0,  # Below min_nodes
+    alarm_description="CRITICAL: Node count dropped below minimum (2). Worker nodes may have crashed.",
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-node-count-minimum-alarm", "Severity": "CRITICAL"}
+)
+
+# Master Node Memory - detects master resource exhaustion
+master_memory_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-master-memory-alarm",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=2,
+    metric_name="MasterMemoryPercent",
+    namespace="K3sAutoscaler",
+    period=300,  # 5 minutes
+    statistic="Average",
+    threshold=90.0,  # 90% memory usage
+    alarm_description="WARNING: Master node memory usage > 90%. Control plane at risk.",
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-master-memory-alarm", "Severity": "WARNING"}
+)
+
+# =============================================================================
 # CloudWatch Dashboard
 # =============================================================================
 
@@ -1397,6 +1583,14 @@ pulumi.export("scale_up_dlq_url", scale_up_dlq.url)
 pulumi.export("scale_up_dlq_arn", scale_up_dlq.arn)
 pulumi.export("scale_down_dlq_url", scale_down_dlq.url)
 pulumi.export("scale_down_dlq_arn", scale_down_dlq.arn)
+
+# Alarm SNS Topic
+pulumi.export("alarm_sns_topic_arn", alarm_topic.arn)
+pulumi.export("alarm_sns_topic_name", alarm_topic.name)
+pulumi.export("alarm_sns_subscribe_command", pulumi.Output.format(
+    "aws sns subscribe --topic-arn {arn} --protocol email --notification-endpoint YOUR_EMAIL@example.com",
+    arn=alarm_topic.arn
+))
 
 
 # =============================================================================

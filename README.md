@@ -460,6 +460,31 @@ All Lambdas share the same IAM role (`k3s-autoscaler-lambda-role`) with permissi
 
 ### CloudWatch Alarms
 
+#### Critical Failure Alarms (Lambda Health)
+
+These alarms detect Lambda execution failures that prevent the autoscaler from functioning:
+
+| Alarm | Severity | Trigger | Response Time |
+|-------|----------|---------|---------------|
+| Decision Lambda Errors | CRITICAL | Errors > 0 (5min) | Immediate |
+| Scale-Up Lambda Errors | CRITICAL | Errors > 0 (5min) | Immediate |
+| Scale-Down Lambda Errors | CRITICAL | Errors > 0 (5min) | Immediate |
+| Decision Lambda Duration | WARNING | Duration > 240s (10min) | 10 minutes |
+| Cleanup Lambda Errors | WARNING | Errors > 3 (10min) | 10 minutes |
+
+#### Infrastructure Health Alarms
+
+These alarms detect operational issues with the cluster:
+
+| Alarm | Severity | Trigger | Response Time |
+|-------|----------|---------|---------------|
+| Pending Pods Stuck | CRITICAL | > 5 pods for 3min | Immediate |
+| Node Count Below Min | CRITICAL | Nodes < 2 | 2 minutes |
+| WAL Stale Operations | WARNING | Incomplete > 10min | 5 minutes |
+| Master Memory | WARNING | Memory > 90% | 10 minutes |
+
+#### Existing Monitoring Alarms
+
 | Alarm | Metric | Threshold | Period |
 |-------|--------|-----------|--------|
 | High CPU | ClusterCPU > 85% | 2 periods | 5 min |
@@ -470,6 +495,31 @@ All Lambdas share the same IAM role (`k3s-autoscaler-lambda-role`) with permissi
 | Scale-Down EventBridge Failures | FailedInvocations > 0 | 1 period | 5 min |
 | DLQ Messages (both) | ApproximateNumberOfMessagesVisible > 0 | 1 period | 5 min |
 | DLQ Age (both) | ApproximateAgeOfOldestMessage > 3600s | 1 period | 5 min |
+
+#### Alarm Notifications
+
+All alarms are configured to send notifications to an SNS topic for alerting:
+
+| Resource | Purpose |
+|----------|---------|
+| SNS Topic | `k3s-autoscaler-alarms` (created during deployment) |
+| Subscription | Email (must be configured - see below) |
+
+**To receive alarm notifications:**
+
+1. **During deployment** (automatic):
+   ```bash
+   pulumi config set alarm:email your-email@example.com
+   pulumi up
+   ```
+
+2. **After deployment** (manual):
+   ```bash
+   pulumi stack output alarm_sns_subscribe_command
+   # Example: aws sns subscribe --topic-arn arn:aws:sns:...:k3s-autoscaler-alarms-... --protocol email --notification-endpoint YOUR_EMAIL@example.com
+   ```
+
+3. **Verify subscription**: You'll receive a confirmation email. Click the link to activate notifications.
 
 ### Other Resources
 
