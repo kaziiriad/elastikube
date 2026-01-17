@@ -293,7 +293,10 @@ flowchart TD
 
 **Launch Process:**
 1. Fetch bootstrap script from S3 (`USER_DATA_S3_BUCKET/USER_DATA_S3_KEY`)
-2. Launch EC2 instance with tags: `CreatedBy=autoscaler`, `Permanent=false`
+2. Launch EC2 instance with spot instance fallback:
+   - **First attempt**: Launch Spot instance (70-90% cost savings) if `USE_SPOT_INSTANCES=true`
+   - **Fallback**: If spot capacity unavailable (InsufficientInstanceCapacity, SpotInstanceCapacityNotAvailable, MaxSpotInstanceCountExceeded), automatically launch On-Demand instance at full price
+   - **Tag updates**: `InstanceLifecycle` tag reflects actual instance type ("spot" or "on-demand")
 3. Poll for `JoinStatus` tag (set by bootstrap script) every 10s (180s timeout)
 4. Tag instance as `JoinVerified=true` on success
 5. Update DynamoDB state with `last_scale_operation=SCALE_UP`
@@ -681,10 +684,13 @@ Lambda:              0% (free tier)
 
 **Implemented Optimizations:**
 
-1. **Spot Instances** (up to 70% savings)
+1. **Spot Instances with Automatic Fallback** (up to 70% savings)
    - Configured via `USE_SPOT_INSTANCES=true` environment variable
+   - Automatic fallback to on-demand when spot capacity unavailable
+   - Handles: InsufficientInstanceCapacity, SpotInstanceCapacityNotAvailable, MaxSpotInstanceCountExceeded
    - Automatic graceful handling of 2-minute interruption warnings
    - Ideal for stateless worker nodes
+   - `InstanceLifecycle` tag reflects actual instance type ("spot" or "on-demand")
 
 2. **Lambda Free Tier** ($0/month)
    - Decision Lambda: ~43,800 invocations/month (within 1M free)
@@ -710,10 +716,11 @@ Lambda:              0% (free tier)
 |--------------|-------------------|--------|
 | **Reserved Instances** (1-year term for seed nodes) | 30-40% on EC2 ($21-$28/mo) | Low |
 | **Compute Savings Plans** (1 or 3-year) | Up to 66% on EC2/Lambda | Medium |
-| **Spot Instance Fallback** | 50-70% on workers (when available) | High |
 | **NAT Gateway Replacement** (VPC endpoints + S3 Gateway) | ~$33/mo | Medium |
 | **CloudWatch Logs Insights** (vs. full log storage) | $3-5/mo | Low |
 | **Graviton Instances** (t4g instead of t3) | ~20% on EC2 | Medium |
+
+**Note:** Spot Instance Fallback with automatic On-Demand fallback is already implemented (see "Implemented Optimizations" above).
 
 **Right-Sizing Recommendations:**
 
@@ -983,17 +990,17 @@ AWS_PROFILE=k3s-temp-user aws dynamodb scan \
 | Feature | Description | Benefit |
 |---------|-------------|---------|
 | **Multi-AZ Awareness** | Distribute workers across availability zones with zone-aware draining | Improved resilience during AZ failures |
-| **Spot Instance Fallback** | Use Spot instances for cost savings with automatic On-Demand fallback when unavailable | Cost optimization with stability guarantees |
 | **Predictive Scaling** | Use historical metrics trends to pre-scale before known traffic patterns | Proactive scaling, reduce lag during spikes |
 | **Custom App Metrics** | Incorporate application-level metrics (queue depth, latency, error rates) into scaling decisions | More accurate scaling based on actual load |
 | **GitOps Configuration** | Version-controlled configuration with auditable rollbacks via Git | Change management, traceability, safer deployments |
 | **Slack Notifications** | Concise alerts for scale actions, drains, failures with troubleshooting context | Faster incident response, better operational awareness |
 
+**Note:** Spot Instance Fallback with automatic On-Demand fallback is already implemented (see "Implemented Optimizations" in Cost Analysis section).
+
 ### Implementation Priority
 
 **High Priority:**
 - Multi-AZ Awareness (resilience)
-- Spot Instance Fallback (cost + stability)
 - Slack Notifications (operational visibility)
 
 **Medium Priority:**

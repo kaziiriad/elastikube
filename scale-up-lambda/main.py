@@ -932,11 +932,68 @@ def _launch_test_instance() -> dict:
         logger.info("Using ON-DEMAND instances")
 
     logger.info(f"Launching instance with: ami={run_params['ImageId']}, "
-                f"type={run_params['InstanceType']}, subnet={run_params['SubnetId']}")
+                f"type={run_params['InstanceType']}, subnet={run_params['Subnet_id']}")
     logger.info(f"User-data size: {len(user_data_base64)} bytes (base64 encoded)")
 
-    # Launch instance
-    response = ec2_client.run_instances(**run_params)
+    # Launch instance with spot fallback mechanism
+    response = None
+    instance_type = run_params["InstanceType"]
+    using_spot = config.get("use_spot_instances")
+
+    try:
+        if using_spot:
+            logger.info("Attempting SPOT instance launch (70-90% cost savings)")
+            try:
+                response = ec2_client.run_instances(**run_params)
+                instance_id = response["Instances"][0]["InstanceId"]
+                logger.info(f"✓ Launched SPOT instance: {instance_id}")
+            except ec2_client.exceptions.ClientError as e:
+                error_code = e.response["Error"]["Code"]
+                error_message = e.response["Error"]["Message"]
+
+                # Spot-specific errors that should trigger fallback
+                spot_errors = [
+                    "InsufficientInstanceCapacity",
+                    "SpotInstanceCapacityNotAvailable",
+                    "MaxSpotInstanceCountExceeded",
+                ]
+
+                if any(err in error_message for err in spot_errors):
+                    logger.warning(f"⚠️ Spot capacity unavailable: {error_code} - {error_message}")
+                    logger.info("Falling back to ON-DEMAND instance (full price)")
+
+                    # Remove spot configuration and retry
+                    run_params_ondemand = {k: v for k, v in run_params.items()
+                                              if k not in ["InstanceMarketOptions", "SpotOptions"]}
+
+                    # Update tags to reflect on-demand
+                    for tags_spec in run_params_ondemand.get("TagSpecifications", []):
+                        for tag_list in tags_spec.get("Tags", []):
+                            if tag_list.get("Key") == "InstanceLifecycle":
+                                tag_list["Value"] = "on-demand"
+
+                    # Launch on-demand
+                    response = ec2_client.run_instances(**run_params_ondemand)
+                    instance_id = response["Instances"][0]["InstanceId"]
+                    logger.info(f"✓ Launched ON-DEMAND instance: {instance_id}")
+                else:
+                    # Not a spot-related error, re-raise
+                    raise
+        else:
+            logger.info("Launching ON-DEMAND instance (full price)")
+            response = ec2_client.run_instances(**run_params)
+            instance_id = response["Instances"][0]["InstanceId"]
+            logger.info(f"✓ Launched ON-DEMAND instance: {instance_id}")
+
+    except Exception as e:
+        logger.error(f"Failed to launch instance: {e}")
+        # Re-raise for calling code to handle
+        raise
+
+    # Ensure we got a response
+    if response is None:
+        raise RuntimeError("Failed to launch instance: no response from EC2 API")
+
     instance_id = response["Instances"][0]["InstanceId"]
 
     logger.info(f"Launched worker instance: {instance_id}")
