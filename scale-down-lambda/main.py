@@ -768,8 +768,13 @@ def _scale_down() -> dict:
 
     selected = autoscaler_workers[0] if autoscaler_workers else workers[0]
     instance_id = selected["instance"]["InstanceId"]
+    availability_zone = selected["tags"].get("AvailabilityZone", "unknown")
+    subnet_id = selected["tags"].get("SubnetId", "unknown")
 
     logger.info(f"Selected worker for scale-down: {instance_id}")
+    logger.info(f"  Availability Zone: {availability_zone}")
+    logger.info(f"  Subnet ID: {subnet_id}")
+    logger.info(f"  Launch Time: {selected['launch_time']}")
 
     # First drain the node
     drain_result = _drain_worker(instance_id)
@@ -787,6 +792,8 @@ def _scale_down() -> dict:
         logger.info("✓ SCALE-DOWN OPERATION COMPLETED SUCCESSFULLY")
         logger.info(f"  Instance ID: {instance_id}")
         logger.info(f"  Node Name: {drain_data.get('node_name', 'N/A')}")
+        logger.info(f"  Availability Zone: {availability_zone}")
+        logger.info(f"  Subnet ID: {subnet_id}")
         logger.info("  Node Drained: Yes")
         logger.info("  Node Deleted: Yes")
         logger.info("  Instance Terminated: Yes")

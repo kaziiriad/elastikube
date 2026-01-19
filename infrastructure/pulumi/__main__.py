@@ -83,6 +83,18 @@ vpc = ec2.Vpc(
     opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="5m", delete="15m")),
 )
 
+# =============================================================================
+# Multi-AZ Subnet Configuration
+# =============================================================================
+# We create subnets in 3 AZs for high availability:
+# - ap-southeast-1a: Primary AZ (master + permanent workers)
+# - ap-southeast-1b: Secondary AZ (scaled workers)
+# - ap-southeast-1c: Tertiary AZ (scaled workers)
+#
+# Scaled workers are distributed using round-robin across all 3 AZs.
+# Single NAT Gateway in AZ-a for cost optimization (private subnets route to it).
+# =============================================================================
+
 # Create subnets
 public_subnet = ec2.Subnet('public-subnet',
     vpc_id=vpc.id,
@@ -91,20 +103,58 @@ public_subnet = ec2.Subnet('public-subnet',
     availability_zone='ap-southeast-1a',
     tags={
         'Name': 'public-subnet',
+        'AvailabilityZone': 'ap-southeast-1a',
     },
     opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="10m")),
 )
 
-private_subnet = ec2.Subnet('private-subnet',
+# Private subnet in AZ-a (10.0.2.0/24)
+# Contains: Master node + permanent workers (k3s-worker-1, k3s-worker-2)
+private_subnet_a = ec2.Subnet('private-subnet-a',
     vpc_id=vpc.id,
     cidr_block='10.0.2.0/24',
     map_public_ip_on_launch=False,
     availability_zone='ap-southeast-1a',
     tags={
-        'Name': 'private-subnet',
+        'Name': 'private-subnet-a',
+        'AvailabilityZone': 'ap-southeast-1a',
+        'Type': 'primary',  # Primary AZ for master and permanent workers
     },
     opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="10m")),
 )
+
+# Private subnet in AZ-b (10.0.3.0/24)
+# Contains: Scaled workers (round-robin distribution)
+private_subnet_b = ec2.Subnet('private-subnet-b',
+    vpc_id=vpc.id,
+    cidr_block='10.0.3.0/24',
+    map_public_ip_on_launch=False,
+    availability_zone='ap-southeast-1b',
+    tags={
+        'Name': 'private-subnet-b',
+        'AvailabilityZone': 'ap-southeast-1b',
+        'Type': 'scaled',  # For scaled workers only
+    },
+    opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="10m")),
+)
+
+# Private subnet in AZ-c (10.0.4.0/24)
+# Contains: Scaled workers (round-robin distribution)
+private_subnet_c = ec2.Subnet('private-subnet-c',
+    vpc_id=vpc.id,
+    cidr_block='10.0.4.0/24',
+    map_public_ip_on_launch=False,
+    availability_zone='ap-southeast-1c',
+    tags={
+        'Name': 'private-subnet-c',
+        'AvailabilityZone': 'ap-southeast-1c',
+        'Type': 'scaled',  # For scaled workers only
+    },
+    opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="10m")),
+)
+
+# For backward compatibility - keep the old reference
+private_subnet = private_subnet_a
 
 # Internet Gateway
 igw = ec2.InternetGateway('internet-gateway', vpc_id=vpc.id)
@@ -148,9 +198,10 @@ nat_gateway = ec2.NatGateway(
     opts=pulumi.ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create="5m", delete="10m")),
 )
 
-# Route Table for Private Subnet 
+# Route Table for Private Subnet (shared by all AZs for cost optimization)
+# All private subnets route to the single NAT Gateway in AZ-a
 private_route_table = ec2.RouteTable(
-    'private-route-table', 
+    'private-route-table',
     vpc_id=vpc.id,
     routes=[{
         'cidr_block': '0.0.0.0/0',
@@ -161,14 +212,32 @@ private_route_table = ec2.RouteTable(
     }
 )
 
-# Associate the private route table with the private subnet
-private_route_table_association = ec2.RouteTableAssociation(
-    'private-route-table-association',
-    subnet_id=private_subnet.id,
+# Associate the private route table with all 3 private subnets
+# This allows all private subnets to use the single NAT Gateway in AZ-a
+private_route_table_association_a = ec2.RouteTableAssociation(
+    'private-route-table-association-a',
+    subnet_id=private_subnet_a.id,
     route_table_id=private_route_table.id,
     # Ensure route table association deletes before subnet (helps with cleanup)
     opts=pulumi.ResourceOptions(delete_before_replace=True, custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m")),
 )
+
+private_route_table_association_b = ec2.RouteTableAssociation(
+    'private-route-table-association-b',
+    subnet_id=private_subnet_b.id,
+    route_table_id=private_route_table.id,
+    opts=pulumi.ResourceOptions(delete_before_replace=True, custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m")),
+)
+
+private_route_table_association_c = ec2.RouteTableAssociation(
+    'private-route-table-association-c',
+    subnet_id=private_subnet_c.id,
+    route_table_id=private_route_table.id,
+    opts=pulumi.ResourceOptions(delete_before_replace=True, custom_timeouts=pulumi.CustomTimeouts(create="2m", delete="5m")),
+)
+
+# For backward compatibility - keep the old reference
+private_route_table_association = private_route_table_association_a
 
 # Security Group for K3s Cluster (bastion + cluster nodes + monitoring)
 # Merged security group to avoid slow deployment from cross-references
@@ -886,8 +955,16 @@ scale_up_lambda = lambda_.Function(
             # Cluster Configuration
             "CLUSTER_NAME": cluster_name,
             "STATE_TABLE_NAME": cluster_state_table.name,
-            # EC2 Configuration
-            "SUBNET_ID": private_subnet.id,
+            # Multi-AZ Configuration
+            # We provide all 3 subnet IDs for round-robin distribution
+            "SUBNET_IDS": pulumi.Output.all(
+                subnet_a_id=private_subnet_a.id,
+                subnet_b_id=private_subnet_b.id,
+                subnet_c_id=private_subnet_c.id,
+            ).apply(lambda ids: json.dumps([ids["subnet_a_id"], ids["subnet_b_id"], ids["subnet_c_id"]])),
+            # Primary subnet for backward compatibility (master + permanent workers)
+            "SUBNET_ID": private_subnet_a.id,
+            # Security Configuration
             "SECURITY_GROUP_ID": bastion_security_group.id,
             "IAM_INSTANCE_PROFILE": worker_instance_profile.name,
             "AMI_ID": ami_id,

@@ -10,20 +10,20 @@ This autoscaler monitors K3s cluster metrics via Prometheus and automatically sc
 
 ```mermaid
 flowchart TB
-    subgraph K3S["K3s Cluster (AWS EC2)"]
-        Master["Master Node<br/>(Control Plane)"]
-        Workers["Worker Nodes<br/>(2-10 instances)"]
+    subgraph K3S["K3s Cluster (Multi-AZ)"]
+        Master["Master Node<br/>(AZ-a)"]
+        Workers["Worker Nodes<br/>(Round-Robin: AZ-a/b/c)"]
         Prometheus["Prometheus<br/>(Metrics & Monitoring)"]
-        
+
         Master --> Workers
         Prometheus -->|"Scrapes metrics"| Workers
         Prometheus -->|"Scrapes metrics"| Master
     end
 
     subgraph AWS["AWS Autoscaler"]
-        EventBridge["EventBridge<br/>(Triggers every 2 min)"]
+        EventBridge["EventBridge<br/>(Adaptive: 2-10 min)"]
         Lambdas["Lambda Functions<br/>(Decision, Scale-Up, Scale-Down, Cleanup)"]
-        DynamoDB["DynamoDB<br/>(Cluster State & Locks)"]
+        DynamoDB["DynamoDB<br/>(State & AZ Index)"]
         CloudWatch["CloudWatch<br/>(Logs, Metrics, Alarms, Dashboard)"]
         EC2API["EC2 API<br/>(Launch/Terminate Instances)"]
     end
@@ -31,11 +31,11 @@ flowchart TB
     %% Main Flow
     EventBridge -->|"Trigger"| Lambdas
     Prometheus <-->|"Query metrics<br/>(HTTP:30900)"| Lambdas
-    Lambdas <-->|"Read/Write state"| DynamoDB
+    Lambdas <-->|"Read/Write state<br/>& AZ index"| DynamoDB
     Lambdas -->|"Logs & Metrics"| CloudWatch
-    Lambdas -->|"Launch/Terminate"| EC2API
-    
-    EC2API -.->|"Add/Remove"| Workers
+    Lambdas -->|"Launch/Terminate<br/>(Multi-AZ)"| EC2API
+
+    EC2API -.->|"Add/Remove<br/>(Round-Robin/LIFO)"| Workers
 
     %% Styling
     classDef k3sStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:4px,color:#000
@@ -193,8 +193,8 @@ The scale-down operation uses **LIFO (Last In, First Out)**:
 ```mermaid
 flowchart TD
     subgraph "Triggers"
-        EB1["EventBridge<br/>(Rate: 2 minutes)"]
-        EB2["EventBridge<br/>(Rate: 5 minutes)"]
+        EB1["EventBridge<br/>(Adaptive: 2-10 min)"]
+        EB2["EventBridge<br/>(Variable: 15 minutes(default))"]
         EBSpot["EventBridge<br/>(Spot Interruption<br/>2 min before termination)"]
     end
 
@@ -310,14 +310,21 @@ This self-adjusting behavior reduces Lambda invocations by 60-80% during stable 
 5. **Distributed lock** (200s timeout) - Prevents concurrent execution
 
 **Launch Process:**
-1. Fetch bootstrap script from S3 (`USER_DATA_S3_BUCKET/USER_DATA_S3_KEY`)
-2. Launch EC2 instance with spot instance fallback:
+1. Select subnet using **round-robin** across multiple AZs for high availability
+2. Fetch bootstrap script from S3 (`USER_DATA_S3_BUCKET/USER_DATA_S3_KEY`)
+3. Launch EC2 instance with spot instance fallback:
    - **First attempt**: Launch Spot instance (70-90% cost savings) if `USE_SPOT_INSTANCES=true`
    - **Fallback**: If spot capacity unavailable (InsufficientInstanceCapacity, SpotInstanceCapacityNotAvailable, MaxSpotInstanceCountExceeded), automatically launch On-Demand instance at full price
    - **Tag updates**: `InstanceLifecycle` tag reflects actual instance type ("spot" or "on-demand")
-3. Poll for `JoinStatus` tag (set by bootstrap script) every 10s (180s timeout)
-4. Tag instance as `JoinVerified=true` on success
-5. Update DynamoDB state with `last_scale_operation=SCALE_UP`
+4. Poll for `JoinStatus` tag (set by bootstrap script) every 10s (180s timeout)
+5. Tag instance as `JoinVerified=true` on success
+6. Update DynamoDB state with `last_scale_operation=SCALE_UP`, subnet ID, and availability zone
+
+**Multi-AZ Round-Robin Distribution:**
+- Scaled workers are distributed across 3 AZs using round-robin selection
+- DynamoDB tracks `last_subnet_index` to cycle through subnets: AZ-a → AZ-b → AZ-c → AZ-a...
+- Each instance is tagged with `AvailabilityZone` and `SubnetId` for observability
+- Master and permanent workers remain in AZ-a for control plane stability
 
 **Instance Tags:**
 - `Name`: `k3s-worker-{cluster_name}-{uuid}`
@@ -325,6 +332,8 @@ This self-adjusting behavior reduces Lambda invocations by 60-80% during stable 
 - `NodeRole`: `worker`
 - `Permanent`: `false`
 - `CreatedBy`: `autoscaler`
+- `AvailabilityZone`: `ap-southeast-1a/b/c` (for observability)
+- `SubnetId`: `subnet-xxx` (for observability)
 - `JoinStatus`: `success`/`failed` (set by bootstrap script)
 - `JoinVerified`: `true` (set by Lambda after verification)
 
@@ -346,10 +355,17 @@ This self-adjusting behavior reduces Lambda invocations by 60-80% during stable 
 2. Exclude permanent workers (`Permanent=true` tag)
 3. Sort by launch time (most recent first)
 4. Prefer autoscaler-created workers (`CreatedBy=autoscaler` tag)
-5. Execute `kubectl drain --ignore-daemonsets --delete-emptydir-data --timeout=120s` via SSM
-6. Run `k3s-agent-uninstall.sh` via SSM (graceful K3s agent removal)
-7. Terminate EC2 instance
-8. Update DynamoDB state with new `node_count`
+5. Log selected worker's **availability zone** and **subnet** for observability
+6. Execute `kubectl drain --ignore-daemonsets --delete-emptydir-data --timeout=120s` via SSM
+7. Run `k3s-agent-uninstall.sh` via SSM (graceful K3s agent removal)
+8. Terminate EC2 instance
+9. Update DynamoDB state with new `node_count`
+
+**Multi-AZ Behavior:**
+- LIFO naturally complements round-robin scale-up
+- Most recent worker (selected for removal) is likely in a different AZ each time
+- AZ and subnet information logged for each scale-down operation
+- No special AZ-aware logic needed - LIFO maintains distribution balance
 
 **Node Name Format:** `ip-{private_ip}` (e.g., `ip-10.0.2.42`)
 
@@ -387,16 +403,135 @@ Uses SSM to verify node actually joined cluster (runs `check-node-by-ip.sh` on m
 
 The AWS infrastructure is defined in `infrastructure/pulumi/__main__.py` using Pulumi (Infrastructure as Code). Below is a summary of the provisioned resources:
 
+```mermaid
+graph TB
+    Internet["🌐 Internet / Users"]
+    
+    subgraph VPC["AWS VPC (10.0.0.0/16) - ap-southeast-1"]
+        direction TB
+        
+        IGW["Internet Gateway"]
+        
+        subgraph Subnets["Multi-AZ Subnets"]
+            direction LR
+            
+            subgraph Public["Public Subnet<br/>(10.0.1.0/24, AZ-a)"]
+                Bastion["Bastion<br/>t3.micro<br/>10.0.1.10"]
+                NAT["NAT Gateway<br/>(Elastic IP)"]
+            end
+            
+            subgraph AZa["Private Subnet AZ-a<br/>(10.0.2.0/24)"]
+                subgraph Master["Master<br/>t3.small<br/>10.0.2.10"]
+                    
+                end
+                subgraph Worker12["EC2 Workers 1-2<br/>t3.small<br/>Permanent"]
+                end
+                Workers3["Autoscaled<br/>EC2 Worker"]
+            end
+            
+            subgraph AZb["Private Subnet AZ-b<br/>(10.0.3.0/24)"]
+                subgraph WorkersB["Autoscaled<br/>EC2 Worker"]
+                end
+            end
+            
+            subgraph AZc["Private Subnet AZ-c<br/>(10.0.4.0/24)"]
+                WorkersC["Autoscaled<br/>EC2 Worker"]
+            end
+        end
+        
+        SG["Security Group<br/>k3s-cluster-secgrp"]
+        
+        subgraph LambdaSubnet["Lambda VPC Attachment (Private AZ-a)"]
+            Decision["Decision Lambda<br/>256MB, 300s"]
+            ScaleUp["Scale-Up Lambda<br/>256MB, 300s"]
+            ScaleDown["Scale-Down Lambda<br/>256MB, 300s"]
+            Cleanup["Cleanup Lambda<br/>128MB, 60s"]
+        end
+    end
+    
+    subgraph AWS["AWS Managed Services (Outside VPC)"]
+        direction TB
+        
+        subgraph Storage["Storage Services"]
+            DynamoDB["DynamoDB<br/>PAY_PER_REQUEST<br/>cluster-state + wal"]
+            S3["S3 Bucket<br/>worker-userdata"]
+            Secrets["Secrets Manager<br/>K3s join token"]
+            SSM["SSM Parameter<br/>Master IP"]
+        end
+        
+        subgraph Events["EventBridge"]
+            EB["EventBridge<br/>Rules + Schedules"]
+        end
+        
+        subgraph Monitor["Monitoring"]
+            CloudWatch["CloudWatch<br/>Logs + Metrics<br/>+ Alarms"]
+            SNS["SNS Topic<br/>Alarms"]
+            DLQ["SQS DLQs"]
+        end
+    end
+    
+    %% Network Connectivity
+    Internet -->|SSH :22| IGW
+    IGW <-->|Public IP| Bastion
+    IGW <-->|Elastic IP| NAT
+    
+    
+    AZa -->|Route Table| NAT
+    AZb -->|Route Table| NAT
+    AZc -->|Route Table| NAT
+    
+        
+    
+    SG -.->|Protects| Master
+    SG -.->|Protects| Worker12
+    SG -.->|Protects| Workers3
+    SG -.->|Protects| WorkersB
+    SG -.->|Protects| WorkersC
+    SG -.->|Protects| LambdaSubnet
+    SG -.->|Protects| Bastion
+
+        
+    LambdaSubnet -->|HTTPS| DynamoDB
+    LambdaSubnet -->|HTTPS| S3
+    LambdaSubnet -->|HTTPS| Secrets
+    LambdaSubnet -->|HTTPS| SSM
+    LambdaSubnet -->|HTTPS| EB
+    LambdaSubnet -->|HTTPS| CloudWatch
+
+    
+    EB -->|Invoke| LambdaSubnet
+    CloudWatch -->|Notify| SNS
+    EB -.->|Failed Events| DLQ
+    
+    %% Styling
+
+    class VPC,Subnets,Public,AZa,AZb,AZc,LambdaSubnet vpcStyle
+    class Bastion,Master,Worker12,WorkersB,WorkersC,Prom,NAT,IGW,SG ec2Style
+    class Decision,ScaleUp,ScaleDown,Cleanup lambdaStyle
+    class AWS,Storage,DynamoDB,S3,Secrets,SSM storageStyle
+    class Monitor,CloudWatch,SNS,DLQ monitorStyle
+    class Events,EB eventStyle
+```
+
 ### VPC & Networking
 
 | Resource | CIDR/IP | Purpose |
 |----------|---------|---------|
 | VPC | `10.0.0.0/16` | Main network for K3s cluster |
 | Public Subnet | `10.0.1.0/24` | Bastion host (SSH access) |
-| Private Subnet | `10.0.2.0/24` | K3s cluster nodes |
+| Private Subnet AZ-a | `10.0.2.0/24` | K3s master + permanent workers (ap-southeast-1a) |
+| Private Subnet AZ-b | `10.0.3.0/24` | Scaled workers (ap-southeast-1b) |
+| Private Subnet AZ-c | `10.0.4.0/24` | Scaled workers (ap-southeast-1c) |
 | Internet Gateway | - | Public internet access |
-| NAT Gateway | Elastic IP | Outbound internet for private subnet |
+| NAT Gateway | Elastic IP (AZ-a) | Outbound internet for all private subnets |
 | Route Tables | 2 | Public/Private routing |
+
+**Multi-AZ Architecture:**
+- **3 private subnets** across different availability zones (ap-southeast-1a, ap-southeast-1b, ap-southeast-1c)
+- **Single NAT Gateway** in AZ-a for cost optimization (all private subnets route to it)
+- **Master and permanent workers** reside in AZ-a for consistent control plane availability
+- **Scaled workers** distributed across all 3 AZs using **round-robin** for high availability
+- **LIFO scale-down** removes most recent workers regardless of AZ, maintaining natural distribution balance
 
 ### Security Group (`k3s-cluster-secgrp`)
 
@@ -1026,18 +1161,16 @@ AWS_PROFILE=k3s-temp-user aws dynamodb scan \
 
 | Feature | Description | Benefit |
 |---------|-------------|---------|
-| **Multi-AZ Awareness** | Distribute workers across availability zones with zone-aware draining | Improved resilience during AZ failures |
 | **Predictive Scaling** | Use historical metrics trends to pre-scale before known traffic patterns | Proactive scaling, reduce lag during spikes |
 | **Custom App Metrics** | Incorporate application-level metrics (queue depth, latency, error rates) into scaling decisions | More accurate scaling based on actual load |
 | **GitOps Configuration** | Version-controlled configuration with auditable rollbacks via Git | Change management, traceability, safer deployments |
 | **Slack Notifications** | Concise alerts for scale actions, drains, failures with troubleshooting context | Faster incident response, better operational awareness |
 
-**Note:** Spot Instance Fallback with automatic On-Demand fallback and Adaptive Scheduling are already implemented (see "Implemented Optimizations" in Cost Analysis section).
+**Note:** Spot Instance Fallback with automatic On-Demand fallback, Adaptive Scheduling, and Multi-AZ worker distribution are already implemented (see "Implemented Optimizations" in Cost Analysis section and "VPC & Networking" for multi-AZ details).
 
 ### Implementation Priority
 
 **High Priority:**
-- Multi-AZ Awareness (resilience)
 - Slack Notifications (operational visibility)
 
 **Medium Priority:**

@@ -10,7 +10,8 @@ Triggered by EventBridge when main autoscaler decides to scale up.
 Also supports direct invocation for testing.
 
 Environment variables required:
-    SUBNET_ID: Subnet ID to launch instance in
+    SUBNET_IDS: JSON array of subnet IDs for multi-AZ round-robin distribution
+    SUBNET_ID: (Optional) Primary subnet ID for backward compatibility
     SECURITY_GROUP_ID: Security group ID
     IAM_INSTANCE_PROFILE: IAM instance profile name
     AMI_ID: AMI ID for the instance
@@ -195,8 +196,17 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
 def _get_config() -> dict:
     """Get configuration from environment variables."""
+    # Parse SUBNET_IDS JSON array if available
+    subnet_ids_str = os.environ.get("SUBNET_IDS", "[]")
+    try:
+        subnet_ids = json.loads(subnet_ids_str) if subnet_ids_str else []
+    except json.JSONDecodeError:
+        logger.warning(f"Failed to parse SUBNET_IDS JSON: {subnet_ids_str}")
+        subnet_ids = []
+
     config = {
-        "subnet_id": os.environ.get("SUBNET_ID"),
+        "subnet_ids": subnet_ids,  # Multi-AZ subnets for round-robin
+        "subnet_id": os.environ.get("SUBNET_ID"),  # Primary subnet (backward compat)
         "security_group_id": os.environ.get("SECURITY_GROUP_ID"),
         "iam_instance_profile": os.environ.get("IAM_INSTANCE_PROFILE"),
         "ami_id": os.environ.get("AMI_ID"),
@@ -218,6 +228,76 @@ def _get_config() -> dict:
         raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
 
     return config
+
+
+def _get_next_subnet_id(config: dict) -> tuple[str, str]:
+    """Get the next subnet ID using round-robin selection.
+
+    Reads the last used subnet index from DynamoDB and returns the next subnet ID.
+    This distributes scaled workers across all availability zones.
+
+    Args:
+        config: Configuration dictionary containing subnet_ids and cluster info
+
+    Returns:
+        Tuple of (subnet_id, availability_zone)
+    """
+    import boto3
+
+    subnet_ids = config.get("subnet_ids", [])
+    cluster_name = config.get("cluster_name", "production-k3s")
+    table_name = config.get("state_table_name")
+
+    # If no multiple subnets configured, use primary subnet
+    if not subnet_ids or len(subnet_ids) == 0:
+        primary_subnet = config.get("subnet_id")
+        logger.info(f"Using primary subnet: {primary_subnet}")
+        return primary_subnet, "ap-southeast-1a"
+
+    dynamodb = boto3.client("dynamodb")
+
+    try:
+        # Get the last used subnet index from DynamoDB
+        response = dynamodb.get_item(
+            TableName=table_name,
+            Key={"cluster_id": {"S": cluster_name}},
+            ProjectionExpression="last_subnet_index",
+        )
+
+        # Get current index or default to -1 (so first usage gets index 0)
+        current_index = -1
+        if "Item" in response and "last_subnet_index" in response["Item"]:
+            current_index = int(response["Item"]["last_subnet_index"]["N"])
+
+        # Calculate next index using round-robin
+        next_index = (current_index + 1) % len(subnet_ids)
+        next_subnet_id = subnet_ids[next_index]
+
+        # Extract AZ from subnet ID (assuming subnet IDs don't directly contain AZ info)
+        # We'll tag the instance with the subnet ID and determine AZ from EC2 describe later
+        az_mapping = {
+            0: "ap-southeast-1a",  # Primary AZ
+            1: "ap-southeast-1b",  # Secondary AZ
+            2: "ap-southeast-1c",  # Tertiary AZ
+        }
+        az = az_mapping.get(next_index, "ap-southeast-1a")
+
+        # Update DynamoDB with the new index
+        dynamodb.update_item(
+            TableName=table_name,
+            Key={"cluster_id": {"S": cluster_name}},
+            UpdateExpression="SET last_subnet_index = :index",
+            ExpressionAttributeValues={
+                ":index": {"N": str(next_index)},
+            },
+        )
+
+        logger.info(f"Round-robin: subnet index {current_index} -> {next_index}, using subnet {next_subnet_id} in AZ {az}")
+        return next_subnet_id, az
+
+    except Exception as e:
+        logger.warning(f"Failed to get next subnet from round-robin, using primary: {e}")
+        return config.get("subnet_id"), "ap-southeast-1a"
 
 
 def _check_bootstrap_credentials(config: dict) -> tuple[bool, str]:
@@ -670,25 +750,42 @@ def _handle_scale_up(detail: dict) -> dict:
             else:
                 logger.warning(f"Bootstrap verification: {verify_result.get('error')}")
 
-            # Update DynamoDB state
+            # Update DynamoDB state with subnet and AZ information
             if table_name:
                 try:
+                    # Extract subnet and AZ from launch result
+                    body = json.loads(launch_result.get("body", "{}"))
+                    subnet_id = body.get("config", {}).get("subnet", "")
+                    availability_zone = body.get("config", {}).get("availability_zone", "")
+
                     dynamodb = boto3.client("dynamodb")
+                    update_expr = (
+                        "SET last_scale_operation = :op, "
+                        "last_scale_time = :time, "
+                        "last_launched_instance = :instance_id"
+                    )
+
+                    expr_values = {
+                        ":op": {"S": "SCALE_UP"},
+                        ":time": {"S": datetime.now(timezone.utc).isoformat()},
+                        ":instance_id": {"S": instance_id},
+                    }
+
+                    # Add subnet and AZ if available
+                    if subnet_id:
+                        update_expr += ", last_subnet_id = :subnet_id"
+                        expr_values[":subnet_id"] = {"S": subnet_id}
+                    if availability_zone:
+                        update_expr += ", last_availability_zone = :az"
+                        expr_values[":az"] = {"S": availability_zone}
+
                     dynamodb.update_item(
                         TableName=table_name,
                         Key={"cluster_id": {"S": cluster_name}},
-                        UpdateExpression=(
-                            "SET last_scale_operation = :op, "
-                            "last_scale_time = :time, "
-                            "last_launched_instance = :instance_id"
-                        ),
-                        ExpressionAttributeValues={
-                            ":op": {"S": "SCALE_UP"},
-                            ":time": {"S": datetime.now(timezone.utc).isoformat()},
-                            ":instance_id": {"S": instance_id},
-                        },
+                        UpdateExpression=update_expr,
+                        ExpressionAttributeValues=expr_values,
                     )
-                    logger.info("✓ State updated: scale operation logged")
+                    logger.info(f"✓ State updated: scale operation logged (subnet={subnet_id}, az={availability_zone})")
                 except ClientError as e:
                     logger.error(f"Failed to update DynamoDB state: {e}")
 
@@ -856,7 +953,11 @@ def _launch_test_instance() -> dict:
 
     # Get configuration
     config = _get_config()
-    logger.info(f"Config: subnet={config['subnet_id']}, ami={config['ami_id']}")
+
+    # Select subnet using round-robin for multi-AZ distribution
+    subnet_id, availability_zone = _get_next_subnet_id(config)
+    logger.info(f"Config: subnet={subnet_id}, az={availability_zone}, ami={config['ami_id']}")
+    logger.info(f"Multi-AZ: {'enabled' if len(config.get('subnet_ids', [])) > 1 else 'disabled (single subnet)'}")
 
     logger.info("")
     logger.info("=" * 60)
@@ -884,6 +985,8 @@ def _launch_test_instance() -> dict:
         {"Key": "CreatedBy", "Value": "autoscaler"},
         {"Key": "Project", "Value": "k3s-autoscaler"},
         {"Key": "LaunchTime", "Value": datetime.now(timezone.utc).isoformat()},
+        {"Key": "SubnetId", "Value": subnet_id},  # Track which subnet was used
+        {"Key": "AvailabilityZone", "Value": availability_zone},  # Track AZ for observability
     ]
 
     # Prepare instance launch parameters
@@ -896,7 +999,7 @@ def _launch_test_instance() -> dict:
         "InstanceType": config["instance_type"],
         "MinCount": 1,
         "MaxCount": 1,
-        "SubnetId": config["subnet_id"],
+        "SubnetId": subnet_id,  # Use round-robin selected subnet
         "SecurityGroupIds": [config["security_group_id"]],
         "IamInstanceProfile": {"Name": config["iam_instance_profile"]},
         "UserData": user_data_base64,
@@ -1011,7 +1114,8 @@ def _launch_test_instance() -> dict:
             "config": {
                 "ami": config["ami_id"],
                 "instance_type": config["instance_type"],
-                "subnet": config["subnet_id"],
+                "subnet": subnet_id,
+                "availability_zone": availability_zone,
                 "s3_bucket": config["s3_bucket"],
                 "s3_key": config["s3_key"],
             },
