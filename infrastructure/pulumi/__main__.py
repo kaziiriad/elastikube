@@ -19,7 +19,7 @@ import pulumi
 import pulumi_command as command
 from pulumi_command import local
 import pulumi_aws as aws
-from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3, sns
+from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3, sns, cloudwatch
 
 # If CustomTimeouts is provider-specific (e.g., AWS, Kubernetes):
 
@@ -914,9 +914,46 @@ decision_lambda_build = local.Command(
 # Lambda deployment package (built by the command above)
 lambda_archive = pulumi.FileArchive(f"{base_dir}/decision-lambda/build/lambda.zip")
 
+# =============================================================================
+# CloudWatch Log Groups (explicit creation with fixed names for dashboards)
+# =============================================================================
+
+# Decision Lambda Log Group
+decision_log_group = cloudwatch.LogGroup(
+    "k3s-autoscaler-decision-logs",
+    name="/aws/lambda/k3s-autoscaler",
+    retention_in_days=7,  # Keep logs for 7 days
+    tags=common_tags,
+)
+
+# Scale-Up Lambda Log Group
+scale_up_log_group = cloudwatch.LogGroup(
+    "k3s-autoscaler-scale-up-logs",
+    name="/aws/lambda/k3s-autoscaler-scale-up",
+    retention_in_days=7,
+    tags=common_tags,
+)
+
+# Scale-Down Lambda Log Group
+scale_down_log_group = cloudwatch.LogGroup(
+    "k3s-autoscaler-scale-down-logs",
+    name="/aws/lambda/k3s-autoscaler-scale-down",
+    retention_in_days=7,
+    tags=common_tags,
+)
+
+# Cleanup Lambda Log Group
+cleanup_log_group = cloudwatch.LogGroup(
+    "k3s-autoscaler-cleanup-logs",
+    name="/aws/lambda/k3s-autoscaler-cleanup",
+    retention_in_days=7,
+    tags=common_tags,
+)
+
 # Lambda Function
 lambda_function = lambda_.Function(
     "k3s-autoscaler-function",
+    name="k3s-autoscaler",  # Fixed name - matches log group
     runtime="python3.11",
     handler="main.lambda_handler",
     role=lambda_role.arn,
@@ -956,7 +993,7 @@ lambda_function = lambda_.Function(
     ),
     code=lambda_archive,
     tags={**common_tags, "Name": "k3s-autoscaler"},
-    opts=pulumi.ResourceOptions(depends_on=[decision_lambda_build]),
+    opts=pulumi.ResourceOptions(depends_on=[decision_lambda_build, decision_log_group]),
 )
 
 # Lambda Permission for EventBridge to invoke
@@ -998,9 +1035,9 @@ scale_up_archive = pulumi.FileArchive(
 )
 
 # Scale-Up Lambda Function
-# Note: CloudWatch will automatically create a log group with the Lambda's name
 scale_up_lambda = lambda_.Function(
     "scale-up-lambda",
+    name="k3s-autoscaler-scale-up",  # Fixed name - matches log group
     runtime="python3.11",
     handler="main.lambda_handler",
     role=lambda_role.arn,  # Reuse existing autoscaler Lambda role
@@ -1041,7 +1078,7 @@ scale_up_lambda = lambda_.Function(
     ),
     code=scale_up_archive,
     tags={**common_tags, "Name": "scale-up-lambda", "Purpose": "worker-scaling"},
-    opts=pulumi.ResourceOptions(depends_on=[scale_up_lambda_build]),
+    opts=pulumi.ResourceOptions(depends_on=[scale_up_lambda_build, scale_up_log_group]),
 )
 
 # =============================================================================
@@ -1065,9 +1102,9 @@ scale_down_archive = pulumi.FileArchive(
 )
 
 # Scale-Down Lambda Function
-# Note: CloudWatch will automatically create a log group with the Lambda's name
 scale_down_lambda = lambda_.Function(
     "scale-down-lambda",
+    name="k3s-autoscaler-scale-down",  # Fixed name - matches log group
     runtime="python3.11",
     handler="main.lambda_handler",
     role=lambda_role.arn,  # Reuse existing autoscaler Lambda role
@@ -1086,7 +1123,7 @@ scale_down_lambda = lambda_.Function(
     ),
     code=scale_down_archive,
     tags={**common_tags, "Name": "scale-down-lambda", "Purpose": "worker-scaling"},
-    opts=pulumi.ResourceOptions(depends_on=[scale_down_lambda_build]),
+    opts=pulumi.ResourceOptions(depends_on=[scale_down_lambda_build, scale_down_log_group]),
 )
 
 # =============================================================================
@@ -1108,6 +1145,7 @@ cleanup_archive = pulumi.FileArchive(
 # Cleanup Lambda Function
 cleanup_lambda = lambda_.Function(
     "cleanup-lambda",
+    name="k3s-autoscaler-cleanup",  # Fixed name - matches log group
     runtime="python3.11",
     handler="main.lambda_handler",
     role=lambda_role.arn,  # Reuse existing autoscaler Lambda role (has EC2 permissions)
@@ -1125,7 +1163,7 @@ cleanup_lambda = lambda_.Function(
     ),
     code=cleanup_archive,
     tags={**common_tags, "Name": "cleanup-lambda", "Purpose": "failed-instance-cleanup"},
-    opts=pulumi.ResourceOptions(depends_on=[cleanup_lambda_build]),
+    opts=pulumi.ResourceOptions(depends_on=[cleanup_lambda_build, cleanup_log_group]),
 )
 
 # EventBridge Rule - triggers cleanup every 15 minutes

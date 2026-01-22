@@ -345,12 +345,12 @@ def lambda_handler(event: dict, context: Any) -> dict:
                 result = {"message": decision.reason}
 
             # Always sync node_count from actual cluster state (Prometheus/Kubernetes API)
-            # Use ready_nodes instead of total_nodes to exclude NotReady nodes from count
+            # Use worker_count (excludes master/control-plane nodes)
             # This prevents state desync when nodes fail to join or leave unexpectedly
             # Note: last_scale_operation and last_scale_time are set by scale-up/scale-down Lambdas
             # after they complete their operations, not here during decision making
             update_kwargs = {
-                "node_count": metrics.ready_nodes,
+                "node_count": metrics.worker_count,
                 "scaling_in_progress": False,
             }
 

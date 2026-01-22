@@ -87,7 +87,7 @@ class ScalingEngine:
         Returns:
             Scaling decision with action and reasoning
         """
-        current_nodes = metrics.total_nodes
+        current_nodes = metrics.worker_count  # Use worker count, not total (excludes master)
 
         # Layer 3: Flash Sale Detection (emergency response, overrides cooldown)
         # Check BEFORE cooldown to allow immediate scaling during spikes

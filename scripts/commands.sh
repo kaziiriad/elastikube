@@ -27,3 +27,5 @@ aws sts get-caller-identity  # Run from master node via SSH
 
 # 5. List CloudWatch metrics
 aws cloudwatch list-metrics --namespace ContainerInsights/Prometheus --region ap-southeast-1
+
+kubectl delete deployment cpu-stress

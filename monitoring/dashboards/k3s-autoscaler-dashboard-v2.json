@@ -247,7 +247,7 @@
       "width": 8,
       "height": 6,
       "properties": {
-        "query": "SOURCE '/aws/lambda/k3s-autoscaler-function'\n| fields @timestamp, @message\n| filter @message like /Decision:/\n| sort @timestamp desc\n| limit 20",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler'\n| fields @timestamp, @message\n| filter @message like /Decision:/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
         "stacked": false,
         "title": "Recent Scaling Decisions",

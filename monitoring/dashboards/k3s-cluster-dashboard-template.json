@@ -278,7 +278,7 @@
       "height": 6,
       "properties": {
         "title": "Lambda Logs (Errors & Warnings)",
-        "query": "SOURCE '/aws/lambda/k3s-autoscaler-function-04518b3'\n| fields @timestamp, @message\n| filter @message like /ERROR|WARN|error|warn|fail|Fail/\n| sort @timestamp desc\n| limit 20",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler'\n| fields @timestamp, @message\n| filter @message like /ERROR|WARN|error|warn|fail|Fail/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1"
       }
     },
@@ -290,7 +290,7 @@
       "height": 6,
       "properties": {
         "title": "Decision Lambda Logs (Scaling)",
-        "query": "SOURCE '/aws/lambda/k3s-autoscaler-function-04518b3'\n| fields @timestamp, @message\n| filter @message like /Decision:|Scaling|scale|Scale/\n| sort @timestamp desc\n| limit 20",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler'\n| fields @timestamp, @message\n| filter @message like /Decision:|Scaling|scale|Scale/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1"
       }
     },
@@ -302,7 +302,7 @@
       "height": 6,
       "properties": {
         "title": "Scale-Up Lambda Logs",
-        "query": "SOURCE '/aws/lambda/scale-up-lambda-c4a07b2'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler-scale-up'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
         "region": "ap-southeast-1"
       }
     },
@@ -314,7 +314,7 @@
       "height": 6,
       "properties": {
         "title": "Scale-Down Lambda Logs",
-        "query": "SOURCE '/aws/lambda/scale-down-lambda-1021d62'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler-scale-down'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
         "region": "ap-southeast-1"
       }
     },

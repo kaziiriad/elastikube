@@ -1035,7 +1035,7 @@ def _launch_test_instance() -> dict:
         logger.info("Using ON-DEMAND instances")
 
     logger.info(f"Launching instance with: ami={run_params['ImageId']}, "
-                f"type={run_params['InstanceType']}, subnet={run_params['Subnet_id']}")
+                f"type={run_params['InstanceType']}, subnet={run_params['SubnetId']}")
     logger.info(f"User-data size: {len(user_data_base64)} bytes (base64 encoded)")
 
     # Launch instance with spot fallback mechanism

@@ -64,9 +64,6 @@ flowchart TB
 | **Token Storage** | K3s join token & bootstrap scripts | AWS S3 |
 | **Monitoring** | Logs, metrics, dashboards | CloudWatch |
 
-**<!-- TODO: Add detailed Lambda interaction flow diagram showing EventBridge orchestration -->**
-
-**<!-- TODO: Add data flow diagram showing Prometheus → Lambda → EventBridge → Scale-Up/Down Lambdas -->**
 
 
 ## Architecture
@@ -131,29 +128,53 @@ flowchart TD
 The Decision Lambda evaluates scaling conditions in a specific order defined in `decision-lambda/src/scaler/scaling.py`:
 
 **Evaluation Order:**
-1. Check scale-up cooldown (blocks all scale-up if active)
-2. Check scale-up conditions (CPU OR pending pods)
-3. If scale-up not triggered, check scale-down cooldown (blocks only scale-down)
-4. Check scale-down conditions (CPU AND memory both low)
+1. **Flash Sale Detection** (emergency response, overrides cooldown)
+2. Check scale-up cooldown (blocks all scale-up if active)
+3. Check scale-up conditions (CPU OR pending pods)
+4. If scale-up not triggered, check scale-down cooldown (blocks only scale-down)
+5. Check scale-down conditions (CPU AND memory both low)
+
+#### Layer 3: Flash Sale Detection (Emergency Response)
+
+Before any cooldown checks, the system detects sudden CPU spikes:
+- **Trigger**: CPU increase > 30% within 2 minutes
+- **Action**: Immediate scale-up, bypasses all cooldowns
+- **Purpose**: Handle sudden traffic surges (e.g., flash sales, viral content)
+
+#### Layer 2: Time-Aware Scaling
+
+The autoscaler uses different CPU thresholds based on time of day:
+
+| Time Period | Hours | Scale-Up Threshold | Scale-Down Threshold |
+|-------------|-------|-------------------|---------------------|
+| **Peak** | 9 AM - 9 PM | 85% | 60% |
+| **Off-Peak** | 9 PM - 9 AM | 60% | 40% |
+
+**Why Time-Aware?**
+- Peak hours have higher baseline CPU (70-80%), so thresholds are raised
+- Prevents threshold thrashing (constant scale-up/down at boundary)
+- Off-peak hours use lower thresholds for faster response to increased load
+
+#### Standard Scaling Logic
 
 **Scale UP when ALL of these conditions are met:**
 - NOT in scale-up cooldown (default: 300 seconds)
-- AND (Worker CPU >= scale_up_threshold (default: 70%) OR Pending pods >= 1)
-- AND Current total nodes < max_nodes (default: 10)
-  - Note: `total_nodes` includes the master node in the count
+- AND (Worker CPU >= time-aware threshold OR Pending pods >= 1)
+- AND Current worker nodes < max_nodes (default: 10)
+  - **Note**: Uses `worker_count` (excludes master), NOT `total_nodes`
 
 **Scale DOWN when ALL of these conditions are met:**
 - NOT in scale-down cooldown (default: 900 seconds)
-- AND Worker CPU < scale_down_threshold (default: 30%)
+- AND Worker CPU < time-aware threshold
 - AND Worker Memory < 50% (hardcoded threshold, not configurable)
-- AND Current total nodes > min_nodes (default: 2)
-  - Note: `total_nodes` includes the master node in the count
+- AND Current worker nodes > min_nodes (default: 2)
+  - **Note**: Uses `worker_count` (excludes master), NOT `total_nodes`
 
 **Important Notes:**
 - Scale-up and scale-down cannot both occur in the same evaluation cycle
 - Pending pods condition takes precedence and can trigger scale-up even during scale-down cooldown
 - The scale-down memory threshold (50%) is hardcoded in the scaling engine and not configurable via environment variables
-- Node count checks use `total_nodes` from Kubernetes, which includes the master/control-plane node
+- Node count checks use `worker_count` from Kubernetes, which **excludes** the master/control-plane node (v1.1 fix)
 
 ### Cooldown Behavior
 
@@ -850,6 +871,22 @@ Lambda:              0% (free tier)
    - Bootstrap scripts are small and infrequently accessed
    - Consider lifecycle policies to move to Glacier
 
+**Polling vs. Adaptive Invocation: The 2-Minute Decision**
+
+We evaluated whether to replace the fixed 2-minute EventBridge schedule with an adaptive approach using CloudWatch Alarms triggered by Prometheus metrics. The analysis below shows why simple polling remains the optimal choice for our use case.
+
+| Approach | Monthly Cost | Response Time | Complexity |
+|----------|-------------|---------------|------------|
+| **Current: 2-min polling** | $0.00 (free tier) | Consistent 2-min | Simple |
+| **Prometheus → CloudWatch Alarm → Lambda** | ~$3.00 (metrics) | Immediate, but blind spots | Complex |
+| **Exponential backoff (2-10 min)** | $0.00 (free tier) | 2-10 min variable | Medium |
+
+**Decision**: Kept 2-min polling because:
+1. Both are within EventBridge free tier (1M invocations)
+2. Alarm-based approach requires Prometheus → CloudWatch metric export (~$3/month)
+3. Simpler design with predictable response time
+4. Maximum savings would be ~$0.016/month (not worth complexity)
+
 **Future Optimization Opportunities:**
 
 | Optimization | Estimated Savings | Effort |
@@ -1047,6 +1084,29 @@ The project includes a comprehensive CloudWatch dashboard at:
 - **DynamoDB Metrics**: Read/Write capacity
 - **Log Insights**: Error logs, scaling decisions, Lambda execution logs
 
+<!-- TODO: Add dashboard screenshots -->
+
+#### Dashboard Screenshot - Cluster Metrics
+![Dashboard Screenshot](./images/cluster_metrics.png)
+
+*Figure: CloudWatch dashboard showing K3s cluster CPU, memory, and node counts with gauge and single-value widgets.*
+
+#### Dashboard Screenshot - Lambda Logs
+![Dashboard Screenshot](./images/lambda_logs.png)
+
+*Figure: CloudWatch Logs Insights showing error logs, scaling decisions, and Lambda execution logs across all four Lambda functions.*
+
+### Fixed Log Group Names (v1.1)
+
+All Lambda functions use explicit CloudWatch LogGroups with fixed names for stable dashboard references:
+
+| Lambda Function | Log Group Name |
+|-----------------|----------------|
+| Decision Lambda | `/aws/lambda/k3s-autoscaler` |
+| Scale-Up Lambda | `/aws/lambda/k3s-autoscaler-scale-up` |
+| Scale-Down Lambda | `/aws/lambda/k3s-autoscaler-scale-down` |
+| Cleanup Lambda | `/aws/lambda/k3s-autoscaler-cleanup` |
+
 ### Automated Dashboard Updates
 
 After each Pulumi deployment, update the dashboard with new resource names:
@@ -1134,7 +1194,7 @@ AWS_PROFILE=k3s-temp-user aws dynamodb scan \
 
 | Feature | Description | Benefit |
 |---------|-------------|---------|
-| **Predictive Scaling** | Use historical metrics trends to pre-scale before known traffic patterns | Proactive scaling, reduce lag during spikes |
+| **Predictive Scaling (with Fallback)** | ML model trained on historical data predicts scaling needs. Automatically falls back to current time-aware + flash sale detection if predictions fail or confidence is low. Data collection infrastructure already in place. | Pre-scales before traffic spikes, graceful degradation ensures reliability |
 | **Custom App Metrics** | Incorporate application-level metrics (queue depth, latency, error rates) into scaling decisions | More accurate scaling based on actual load |
 | **GitOps Configuration** | Version-controlled configuration with auditable rollbacks via Git | Change management, traceability, safer deployments |
 | **Slack Notifications** | Concise alerts for scale actions, drains, failures with troubleshooting context | Faster incident response, better operational awareness |
@@ -1152,6 +1212,18 @@ AWS_PROFILE=k3s-temp-user aws dynamodb scan \
 
 **Lower Priority:**
 - Predictive Scaling (advanced optimization)
+
+## Recent Enhancements
+
+**v1.1 - Layered Autoscaling Architecture (Latest)**
+
+| Feature | Description |
+|---------|-------------|
+| **Time-Aware Scaling** | Different CPU thresholds for peak (9 AM - 9 PM) vs off-peak hours. Peak: 85%/60% thresholds. Off-peak: 60%/40% thresholds. |
+| **Flash Sale Detection** | Emergency response when CPU spikes >30% within 2 minutes. Overrides cooldown for immediate scale-up. |
+| **Data Collection for ML** | Records all scaling decisions and periodic metrics samples to DynamoDB for future ML-based predictive scaling. |
+| **Permanent Worker Protection** | Fixed bug where autoscaler used `total_nodes` instead of `worker_count`, preventing scale-down of permanent workers. |
+| **Fixed CloudWatch Log Groups** | Explicit LogGroup resources with fixed names for stable dashboard references. |
 
 ## License
 MIT

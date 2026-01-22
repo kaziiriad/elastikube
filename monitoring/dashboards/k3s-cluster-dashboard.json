@@ -21,7 +21,7 @@
         "metrics": [
           ["K3sAutoscaler", "WorkerCPU", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "timeSeries",
+        "view": "gauge",
         "region": "ap-southeast-1",
         "period": 60,
         "yAxis": {"left": {"min": 0, "max": 100}}
@@ -38,7 +38,7 @@
         "metrics": [
           ["K3sAutoscaler", "WorkerMemory", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "timeSeries",
+        "view": "gauge",
         "region": "ap-southeast-1",
         "period": 60,
         "yAxis": {"left": {"min": 0, "max": 100}}
@@ -56,9 +56,10 @@
           ["K3sAutoscaler", "ReadyNodes", "Cluster", "k3s-cluster", {"stat": "Average"}],
           ["K3sAutoscaler", "TotalNodes", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "timeSeries",
+        "view": "singleValue",
         "region": "ap-southeast-1",
-        "period": 60
+        "period": 60,
+        "yAxis": {"left": {"min": 0}}
       }
     },
     {
@@ -72,7 +73,7 @@
         "metrics": [
           ["K3sAutoscaler", "WorkerCount", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "timeSeries",
+        "view": "singleValue",
         "region": "ap-southeast-1",
         "period": 60
       }
@@ -88,7 +89,7 @@
         "metrics": [
           ["K3sAutoscaler", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "timeSeries",
+        "view": "singleValue",
         "region": "ap-southeast-1",
         "period": 60,
         "annotations": {
@@ -111,7 +112,7 @@
         "metrics": [
           ["K3sAutoscaler", "MasterCPU", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "timeSeries",
+        "view": "gauge",
         "region": "ap-southeast-1",
         "period": 60,
         "yAxis": {"left": {"min": 0, "max": 100}}
@@ -128,7 +129,7 @@
         "metrics": [
           ["K3sAutoscaler", "MasterMemory", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "timeSeries",
+        "view": "gauge",
         "region": "ap-southeast-1",
         "period": 60,
         "yAxis": {"left": {"min": 0, "max": 100}}
@@ -162,7 +163,7 @@
         "metrics": [
           ["AWS/Lambda", "Errors"]
         ],
-        "view": "timeSeries",
+        "view": "singleValue",
         "region": "ap-southeast-1",
         "period": 300,
         "stat": "Sum"
@@ -196,7 +197,7 @@
         "metrics": [
           ["AWS/Lambda", "ConcurrentExecutions"]
         ],
-        "view": "timeSeries",
+        "view": "singleValue",
         "region": "ap-southeast-1",
         "period": 300,
         "stat": "Maximum"
@@ -278,7 +279,7 @@
       "height": 6,
       "properties": {
         "title": "Lambda Logs (Errors & Warnings)",
-        "query": "SOURCE '/aws/lambda/k3s-autoscaler-function-04518b3'\n| fields @timestamp, @message\n| filter @message like /ERROR|WARN|error|warn|fail|Fail/\n| sort @timestamp desc\n| limit 20",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler'\n| fields @timestamp, @message\n| filter @message like /ERROR|WARN|error|warn|fail|Fail/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1"
       }
     },
@@ -290,7 +291,7 @@
       "height": 6,
       "properties": {
         "title": "Decision Lambda Logs (Scaling)",
-        "query": "SOURCE '/aws/lambda/k3s-autoscaler-function-04518b3'\n| fields @timestamp, @message\n| filter @message like /Decision:|Scaling|scale|Scale/\n| sort @timestamp desc\n| limit 20",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler'\n| fields @timestamp, @message\n| filter @message like /Decision:|Scaling|scale|Scale/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1"
       }
     },
@@ -302,7 +303,7 @@
       "height": 6,
       "properties": {
         "title": "Scale-Up Lambda Logs",
-        "query": "SOURCE '/aws/lambda/scale-up-lambda-c4a07b2'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler-scale-up'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
         "region": "ap-southeast-1"
       }
     },
@@ -314,7 +315,7 @@
       "height": 6,
       "properties": {
         "title": "Scale-Down Lambda Logs",
-        "query": "SOURCE '/aws/lambda/scale-down-lambda-1021d62'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler-scale-down'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
         "region": "ap-southeast-1"
       }
     },
@@ -325,8 +326,8 @@
       "width": 24,
       "height": 6,
       "properties": {
-        "title": "All Lambda Logs (Recent)",
-        "query": "fields @timestamp, @logStream, @message\n| filter @logStream like /k3s|scale/\n| sort @timestamp desc\n| limit 50",
+        "title": "Cleanup Lambda Logs (Failed Instance Removal)",
+        "query": "SOURCE '/aws/lambda/k3s-autoscaler-cleanup'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
         "region": "ap-southeast-1"
       }
     }

@@ -161,7 +161,7 @@
       "width": 6,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/scale-up-lambda-e2378cf",
+        "logGroupName": "/aws/lambda/k3s-autoscaler-scale-up",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /SPOT/ or @message like /ON-DEMAND/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
@@ -219,7 +219,7 @@
       "width": 12,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/scale-down-lambda-66bdee2",
+        "logGroupName": "/aws/lambda/k3s-autoscaler-scale-down",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /Draining/ or @message like /Terminating/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
@@ -277,7 +277,7 @@
       "width": 12,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function-7024efe",
+        "logGroupName": "/aws/lambda/k3s-autoscaler",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /Decision:/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
@@ -301,7 +301,7 @@
       "width": 8,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function-7024efe",
+        "logGroupName": "/aws/lambda/k3s-autoscaler",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /health check/ or @message like /components/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
@@ -315,7 +315,7 @@
       "width": 8,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/scale-up-lambda-e2378cf",
+        "logGroupName": "/aws/lambda/k3s-autoscaler-scale-up",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /health check/ or @message like /components/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
@@ -329,7 +329,7 @@
       "width": 8,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/scale-down-lambda-66bdee2",
+        "logGroupName": "/aws/lambda/k3s-autoscaler-scale-down",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /health check/ or @message like /components/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
@@ -343,13 +343,51 @@
       "width": 24,
       "height": 1,
       "properties": {
+        "markdown": "## Cleanup Lambda - Failed Instance Removal"
+      }
+    },
+    {
+      "type": "log",
+      "x": 0,
+      "y": 38,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/k3s-autoscaler-cleanup",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
+        "region": "ap-southeast-1",
+        "title": "Cleanup Lambda Logs"
+      }
+    },
+    {
+      "type": "log",
+      "x": 12,
+      "y": 38,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "logGroupName": "/aws/lambda/k3s-autoscaler-cleanup",
+        "view": "table",
+        "query": "fields @timestamp, @message\n| filter @message like /Terminating/ or @message like /failed to join/ or @message like /age/\n| sort @timestamp desc\n| limit 20",
+        "region": "ap-southeast-1",
+        "title": "Failed Instance Terminations"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 44,
+      "width": 24,
+      "height": 1,
+      "properties": {
         "markdown": "## Cluster Metrics (from Prometheus)"
       }
     },
     {
       "type": "metric",
       "x": 0,
-      "y": 38,
+      "y": 45,
       "width": 8,
       "height": 6,
       "properties": {
@@ -372,7 +410,7 @@
     {
       "type": "metric",
       "x": 8,
-      "y": 38,
+      "y": 45,
       "width": 8,
       "height": 6,
       "properties": {
@@ -395,7 +433,7 @@
     {
       "type": "metric",
       "x": 16,
-      "y": 38,
+      "y": 45,
       "width": 8,
       "height": 6,
       "properties": {
@@ -418,7 +456,7 @@
     {
       "type": "metric",
       "x": 0,
-      "y": 44,
+      "y": 51,
       "width": 12,
       "height": 6,
       "properties": {
@@ -440,7 +478,7 @@
     {
       "type": "metric",
       "x": 12,
-      "y": 44,
+      "y": 51,
       "width": 12,
       "height": 6,
       "properties": {
@@ -462,7 +500,7 @@
     {
       "type": "text",
       "x": 0,
-      "y": 50,
+      "y": 57,
       "width": 24,
       "height": 1,
       "properties": {
@@ -472,11 +510,11 @@
     {
       "type": "log",
       "x": 0,
-      "y": 51,
+      "y": 58,
       "width": 12,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function-7024efe",
+        "logGroupName": "/aws/lambda/k3s-autoscaler",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /Fetching cluster metrics/ or @message like /Prometheus/ or @message like /Worker Metrics:/ or @message like /Master Metrics:/\n| sort @timestamp desc\n| limit 50",
         "region": "ap-southeast-1",
@@ -486,11 +524,11 @@
     {
       "type": "log",
       "x": 12,
-      "y": 51,
+      "y": 58,
       "width": 12,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/k3s-autoscaler-function-7024efe",
+        "logGroupName": "/aws/lambda/k3s-autoscaler",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /ERROR/ and @message like /Prometheus/ or @message like /Failed to fetch/ or @message like /Connection error/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
@@ -500,7 +538,7 @@
     {
       "type": "text",
       "x": 0,
-      "y": 57,
+      "y": 64,
       "width": 24,
       "height": 1,
       "properties": {
@@ -510,7 +548,7 @@
     {
       "type": "metric",
       "x": 0,
-      "y": 58,
+      "y": 65,
       "width": 12,
       "height": 6,
       "properties": {
@@ -527,11 +565,11 @@
     {
       "type": "log",
       "x": 12,
-      "y": 58,
+      "y": 65,
       "width": 12,
       "height": 6,
       "properties": {
-        "logGroupName": "/aws/lambda/scale-up-lambda-e2378cf",
+        "logGroupName": "/aws/lambda/k3s-autoscaler-scale-up",
         "view": "table",
         "query": "fields @timestamp, @message\n| filter @message like /70-90% cost savings/ or @message like /SPOT/ or @message like /ON-DEMAND/\n| sort @timestamp desc\n| limit 20",
         "region": "ap-southeast-1",
