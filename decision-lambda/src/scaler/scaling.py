@@ -6,14 +6,18 @@ Determines when to scale up or down based on:
 - Pending pods
 - Cooldown periods
 - Min/max node limits
+- Time of day (Layer 2: Time-Aware Scaling)
 """
 
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime, timezone
 
 from metrics.prometheus import ClusterMetrics
 from state.cluster_state import ClusterState
 from utils.config import get_config
+from scaler.time_aware import get_time_period, get_thresholds_for_period
+from scaler.flash_sale import FlashSaleDetector
 
 
 class ScalingAction(str, Enum):
@@ -59,6 +63,7 @@ class ScalingEngine:
     def __init__(self):
         """Initialize the scaling engine."""
         self._config = get_config()
+        self._flash_sale_detector = FlashSaleDetector()
 
     def evaluate(
         self,
@@ -72,6 +77,9 @@ class ScalingEngine:
         - Scale Down if: (CPU < threshold AND Memory < threshold) AND not at min AND not in cooldown
         - Otherwise: No operation
 
+        Time-Aware Scaling (Layer 2):
+        When enabled, thresholds are adjusted based on time period (peak/off-peak).
+
         Args:
             metrics: Current cluster metrics
             state: Current cluster state
@@ -80,6 +88,36 @@ class ScalingEngine:
             Scaling decision with action and reasoning
         """
         current_nodes = metrics.total_nodes
+
+        # Layer 3: Flash Sale Detection (emergency response, overrides cooldown)
+        # Check BEFORE cooldown to allow immediate scaling during spikes
+        if self._flash_sale_detector.detect(metrics.worker_cpu_percent_avg):
+            if current_nodes < self._config.max_nodes:
+                logger.warning("FLASH SALE: Triggering immediate scale-up")
+                return ScalingDecision(
+                    action=ScalingAction.SCALE_UP,
+                    reason=f"FLASH SALE: CPU spike detected ({metrics.worker_cpu_percent_avg:.1f}%)",
+                    current_nodes=current_nodes,
+                    target_nodes=current_nodes + 1,
+                    cpu_percent=metrics.worker_cpu_percent_avg,
+                    memory_percent=metrics.worker_memory_percent_avg,
+                    pending_pods=metrics.pending_pods,
+                )
+            else:
+                logger.warning("FLASH SALE: At max nodes, cannot scale further")
+
+        # Layer 2: Get time-aware thresholds if enabled
+        now = datetime.now(timezone.utc)
+        period = get_time_period(now)
+        scale_up_threshold, scale_down_threshold = get_thresholds_for_period(period)
+
+        # Log time-aware context if enabled
+        if period:
+            logger.info(
+                f"Time-aware scaling: period={period}, "
+                f"scale_up_threshold={scale_up_threshold}%, "
+                f"scale_down_threshold={scale_down_threshold}%"
+            )
 
         # Check cooldown periods
         # Scale-up cooldown blocks ALL scale-up operations
@@ -96,7 +134,7 @@ class ScalingEngine:
 
         # Check scale-up conditions FIRST (before scale-down cooldown)
         # Pending pods should ALWAYS trigger scale-up, regardless of scale-down cooldown
-        cpu_trigger = metrics.worker_cpu_percent_avg >= self._config.scale_up_threshold
+        cpu_trigger = metrics.worker_cpu_percent_avg >= scale_up_threshold
         pods_trigger = metrics.pending_pods >= 1
 
         if (cpu_trigger or pods_trigger) and current_nodes < self._config.max_nodes:
@@ -104,7 +142,11 @@ class ScalingEngine:
             if pods_trigger:
                 reason = f"Pending pods ({metrics.pending_pods}) >= 1"
             else:
-                reason = f"Worker CPU ({metrics.worker_cpu_percent_avg:.1f}%) >= threshold ({self._config.scale_up_threshold}%)"
+                period_info = f" [{period}]" if period else ""
+                reason = (
+                    f"Worker CPU ({metrics.worker_cpu_percent_avg:.1f}%) >= threshold "
+                    f"({scale_up_threshold}%){period_info}"
+                )
 
             return ScalingDecision(
                 action=ScalingAction.SCALE_UP,
@@ -129,15 +171,16 @@ class ScalingEngine:
             )
 
         # Check scale-down conditions (using worker metrics only)
-        cpu_low = metrics.worker_cpu_percent_avg < self._config.scale_down_threshold
+        cpu_low = metrics.worker_cpu_percent_avg < scale_down_threshold
         memory_low = metrics.worker_memory_percent_avg < 50  # Memory threshold for scale-down
 
         if cpu_low and memory_low and current_nodes > self._config.min_nodes:
+            period_info = f" [{period}]" if period else ""
             return ScalingDecision(
                 action=ScalingAction.SCALE_DOWN,
                 reason=(
                     f"Worker CPU ({metrics.worker_cpu_percent_avg:.1f}%) < threshold "
-                    f"({self._config.scale_down_threshold}%) "
+                    f"({scale_down_threshold}%){period_info} "
                     f"AND memory ({metrics.worker_memory_percent_avg:.1f}%) < 50%"
                 ),
                 current_nodes=current_nodes,
