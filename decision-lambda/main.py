@@ -37,6 +37,7 @@ from metrics.prometheus import PrometheusClient, ClusterMetrics
 from scaler.scaling import ScalingEngine, ScalingDecision, ScalingAction
 from state.cluster_state import StateManager, DistributedLock
 from utils.wal import WriteAheadLog, OperationType, OperationState
+from data.recorder import DynamoDBRecorder
 
 # Configure logging
 logger = logging.getLogger()
@@ -250,6 +251,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
         wal = WriteAheadLog(dynamodb_client)
         prometheus = PrometheusClient()
         scaling_engine = ScalingEngine()
+        recorder = DynamoDBRecorder(dynamodb_client)
 
         # Step 1: Fetch cluster state (before lock to detect stuck locks)
         logger.info("Fetching cluster state...")
@@ -311,6 +313,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
             logger.info("Fetching cluster metrics from Prometheus...")
             metrics = prometheus.get_cluster_metrics()
 
+            # Step 4.5: Record periodic metrics sample for ML training
+            recorder.record_metrics_sample(metrics)
+
             # Log to console
             logger.info(f"Worker Metrics: CPU={metrics.worker_cpu_percent_avg:.1f}%, "
                        f"Memory={metrics.worker_memory_percent_avg:.1f}%, "
@@ -327,6 +332,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
             logger.info("Evaluating scaling decision...")
             decision = scaling_engine.evaluate(metrics, state)
             logger.info(f"Decision: {decision.action.value} - {decision.reason}")
+
+            # Step 5.5: Record scaling decision for ML training and audit trail
+            recorder.record_decision(decision, metrics)
 
             # Step 6: Execute scaling action via EventBridge
             if decision.action == ScalingAction.SCALE_UP:

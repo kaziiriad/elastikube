@@ -375,6 +375,49 @@ wal_table = dynamodb.Table(
     tags={**common_tags, "Name": "k3s-scaling-wal"},
 )
 
+# Scaling History Table (for ML training and audit trail)
+scaling_history_table = dynamodb.Table(
+    "k3s-scaling-history",
+    attributes=[
+        dynamodb.TableAttributeArgs(name="decision_id", type="S"),
+        dynamodb.TableAttributeArgs(name="timestamp", type="S"),
+    ],
+    hash_key="decision_id",
+    range_key="timestamp",
+    billing_mode="PAY_PER_REQUEST",
+    ttl=dynamodb.TableTtlArgs(
+        attribute_name="ttl",
+        enabled=True,
+    ),
+    tags={**common_tags, "Name": "k3s-scaling-history"},
+)
+
+# Metrics Samples Table (for ML training and pattern analysis)
+metrics_samples_table = dynamodb.Table(
+    "k3s-scaling-metrics-samples",
+    attributes=[
+        dynamodb.TableAttributeArgs(name="sample_id", type="S"),
+        dynamodb.TableAttributeArgs(name="timestamp", type="S"),
+    ],
+    hash_key="sample_id",
+    range_key="timestamp",
+    billing_mode="PAY_PER_REQUEST",
+    ttl=dynamodb.TableTtlArgs(
+        attribute_name="ttl",
+        enabled=True,
+    ),
+    global_secondary_indexes=[
+        # Index for time-series queries (for ML training data retrieval)
+        dynamodb.TableGlobalSecondaryIndexArgs(
+            name="TimestampIndex",
+            hash_key="timestamp",
+            range_key="sample_id",
+            projection_type="ALL",
+        )
+    ],
+    tags={**common_tags, "Name": "k3s-scaling-metrics-samples"},
+)
+
 # =============================================================================
 # SSM Parameter Store & Secrets Manager for Node Join
 # =============================================================================
@@ -469,6 +512,8 @@ autoscaler_policy = iam.RolePolicy(
     policy=pulumi.Output.all(
         cluster_state_arn=cluster_state_table.arn,
         wal_table_arn=wal_table.arn,
+        scaling_history_table_arn=scaling_history_table.arn,
+        metrics_samples_table_arn=metrics_samples_table.arn,
         userdata_bucket_arn=worker_userdata_bucket.arn,
     ).apply(lambda args: iam.get_policy_document(
         statements=[
@@ -513,6 +558,30 @@ autoscaler_policy = iam.RolePolicy(
                     "dynamodb:DeleteItem",
                 ],
                 "resources": [args["wal_table_arn"], f"{args['wal_table_arn']}/*"],
+                "effect": "Allow",
+            },
+            {
+                "actions": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:Query",
+                    "dynamodb:Scan",
+                    "dynamodb:DeleteItem",
+                ],
+                "resources": [args["scaling_history_table_arn"], f"{args['scaling_history_table_arn']}/*"],
+                "effect": "Allow",
+            },
+            {
+                "actions": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:Query",
+                    "dynamodb:Scan",
+                    "dynamodb:DeleteItem",
+                ],
+                "resources": [args["metrics_samples_table_arn"], f"{args['metrics_samples_table_arn']}/*"],
                 "effect": "Allow",
             },
             # SSM Permissions
@@ -863,6 +932,9 @@ lambda_function = lambda_.Function(
             "PROMETHEUS_URL": master_instance.private_ip.apply(lambda ip: f"http://{ip}:30900"),
             "STATE_TABLE_NAME": cluster_state_table.name,
             "WAL_TABLE_NAME": wal_table.name,
+            "DECISION_TABLE_NAME": scaling_history_table.name,
+            "METRICS_TABLE_NAME": metrics_samples_table.name,
+            "DATA_RETENTION_DAYS": "90",  # TTL for historical data
             "EVENT_BUS_NAME": "default",  # EventBridge default event bus
             "MIN_NODES": str(min_nodes),
             "MAX_NODES": str(max_nodes),
