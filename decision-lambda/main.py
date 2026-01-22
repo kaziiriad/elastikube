@@ -224,97 +224,6 @@ def _handle_health_check() -> dict:
     }
 
 
-def _update_adaptive_schedule(metrics: ClusterMetrics, state, decision: ScalingDecision) -> None:
-    """Update EventBridge rule schedule based on cluster state for adaptive polling.
-
-    Adjusts the check interval based on current cluster conditions:
-    - Fast (2 min): Near scale-up threshold, pending pods, or recent scaling
-    - Normal (5 min): Stable mid-range CPU/memory
-    - Slow (10 min): Very stable/off-peak with low resource usage
-
-    Args:
-        metrics: Current cluster metrics from Prometheus
-        state: Current cluster state from DynamoDB
-        decision: Scaling decision that was just made
-    """
-    import os
-    import boto3
-
-    # Check if adaptive scheduling is enabled
-    if not os.environ.get("ADAPTIVE_SCHEDULING_ENABLED", "true").lower() == "true":
-        logger.debug("Adaptive scheduling disabled, skipping schedule update")
-        return
-
-    # Get configuration
-    rule_name = os.environ.get("EVENT_RULE_NAME")
-    interval_fast = int(os.environ.get("ADAPTIVE_INTERVAL_FAST", "2"))
-    interval_normal = int(os.environ.get("ADAPTIVE_INTERVAL_NORMAL", "5"))
-    interval_slow = int(os.environ.get("ADAPTIVE_INTERVAL_SLOW", "10"))
-
-    if not rule_name:
-        logger.warning("EVENT_RULE_NAME not set, cannot update adaptive schedule")
-        return
-
-    # Get thresholds for decision making
-    scale_up_threshold = float(os.environ.get("SCALE_UP_THRESHOLD", "70"))
-    scale_down_threshold = float(os.environ.get("SCALE_DOWN_THRESHOLD", "30"))
-    min_nodes = int(os.environ.get("MIN_NODES", "2"))
-    max_nodes = int(os.environ.get("MAX_NODES", "10"))
-
-    # Determine appropriate interval
-    selected_interval = interval_normal  # Default
-    reason = ""
-
-    # Conditions for FAST interval (2 min) - high monitoring needed
-    if (
-        # Near scale-up threshold (within 10%)
-        metrics.worker_cpu_percent_avg >= (scale_up_threshold - 10)
-        or metrics.pending_pods > 0  # Any pending pods
-        or decision.action != ScalingAction.NO_ACTION  # Recent scaling action
-        or metrics.worker_count >= max_nodes  # At max capacity
-        or metrics.worker_count <= min_nodes  # At min capacity
-    ):
-        selected_interval = interval_fast
-        reason = "near_threshold_or_scaling"
-
-    # Conditions for SLOW interval (10 min) - low monitoring needed
-    elif (
-        metrics.worker_cpu_percent_avg < (scale_down_threshold - 10)  # Well below scale-down
-        and metrics.worker_memory_percent_avg < 40  # Low memory usage
-        and metrics.pending_pods == 0  # No pending pods
-        and min_nodes < metrics.worker_count < max_nodes  # Not at boundaries
-        and decision.action == ScalingAction.NO_ACTION  # No action taken
-    ):
-        selected_interval = interval_slow
-        reason = "stable_off_peak"
-    else:
-        # Normal interval (5 min) - default monitoring
-        reason = "normal_operation"
-
-    # Get current schedule
-    events_client = boto3.client("events")
-    try:
-        current_rule = events_client.describe_rule(Name=rule_name)
-        current_expression = current_rule.get("ScheduleExpression", "")
-
-        # Build new schedule expression
-        new_expression = f"rate({selected_interval} minutes)"
-
-        # Only update if interval changed
-        if current_expression != new_expression:
-            logger.info(f"Updating adaptive schedule: {current_expression} → {new_expression} (reason: {reason})")
-            events_client.put_rule(
-                Name=rule_name,
-                ScheduleExpression=new_expression,
-            )
-            logger.info(f"✓ Adaptive schedule updated to {selected_interval} minutes (reason: {reason})")
-        else:
-            logger.debug(f"Adaptive schedule already at {selected_interval} minutes (reason: {reason})")
-
-    except Exception as e:
-        logger.warning(f"Failed to update adaptive schedule: {e}")
-
-
 def lambda_handler(event: dict, context: Any) -> dict:
     """Lambda entry point for K3s autoscaler.
 
@@ -438,9 +347,6 @@ def lambda_handler(event: dict, context: Any) -> dict:
             }
 
             _ = state_manager.update_state(**update_kwargs)
-
-            # Step 7: Adaptive Scheduling - Update check interval based on cluster state
-            _update_adaptive_schedule(metrics, state, decision)
 
             return {
                 "statusCode": 200,
