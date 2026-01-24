@@ -1366,6 +1366,79 @@ Located in `ml_training/` directory:
 - `notebooks/01_exploratory_analysis.ipynb` - EDA for seasonality analysis
 - `pyproject.toml` - uv dependencies (prophet, pandas, boto3, matplotlib)
 
+### Exploratory Data Analysis
+
+Before training the model, we analyzed 30 days of mock metrics to identify patterns and inform feature engineering:
+
+**Time Series Patterns**
+
+![Time Series Patterns](ml_training/docs/time_seriese_patterns.png)
+
+*Fig 1. Raw CPU time series showing daily cycles, weekly seasonality (weekends lower), and occasional spikes (flash sales).*
+
+**Daily & Weekly Seasonality**
+
+![Daily Weekly Average](ml_training/docs/daily_weekly_avg.png)
+
+*Fig 2. Average CPU by hour (left) and day of week (right). Peak hours 9AM-9PM show ~40% higher CPU than off-peak. Weekends are ~30% lower than weekdays.*
+
+**Scaling Decision Analysis**
+
+![Scaling Decision Analysis](ml_training/docs/scaling_decistion_analysis.png)
+
+*Fig 3. CPU distribution by scaling decision. Scale-up decisions occur at higher CPU levels, while scale-down happens during sustained low CPU periods.*
+
+**Correlation Analysis**
+
+![Correlation Analysis](ml_training/docs/correlation_analysis.png)
+
+*Fig 4. Correlation heatmap showing CPU's relationship with other metrics. Memory (0.71) and pending_pods (0.52) are moderately correlated, making them useful regressors.*
+
+**Predictability Assessment**
+
+![Predictability Assessment](ml_training/docs/predictability_assessment.png)
+
+*Fig 5. Autocorrelation (ACF) and partial autocorrelation (PACF) plots. Strong correlation at lag 1-2 indicates past CPU values predict future values - justifying lag features.*
+
+### Model Performance (Mock Data Baseline)
+
+Tested with 30 days of synthetic metrics data generated to simulate realistic cluster patterns:
+
+**Overall Metrics**
+| Metric | Value | Target | Status |
+|--------|-------|--------|--------|
+| MAE | 8.76% | <10% | ✅ Pass |
+| RMSE | 12.10% | - | Baseline |
+| MAPE | 20.57% | <20% | ⚠️ Slightly above |
+| Coverage | 78.78% | 75-85% | ✅ Pass |
+| Bias | +0.45% | ~0% | Slight over-prediction |
+
+**Performance by Time Period**
+| Period | MAE | MAPE | Notes |
+|--------|-----|------|-------|
+| Peak Hours (9AM-9PM) | 8.01% | 13.59% | ✅ Best accuracy when it matters most |
+| Weekdays | 8.56% | 15.89% | ✅ Strong performance |
+| Off-Peak Hours | 9.51% | 27.55% | ⚠️ Higher error (low CPU variance) |
+| Weekends | 9.22% | 31.29% | ⚠️ Less training data |
+
+**Key Insights**
+- Model performs **better during peak hours and weekdays** - ideal for autoscaling use case
+- Off-peak and weekend periods show higher MAPE due to lower CPU values (higher relative variance)
+- Confidence interval coverage (78.8%) aligns with 80% target
+- Slight positive bias means model tends to over-predict, which is safer for autoscaling (scale up early rather than late)
+
+**Validation Visualizations**
+
+![Backtest Results](ml_training/docs/backtest_results.png)
+
+*Fig 1. Rolling backtest showing actual vs predicted CPU over 30 days. The model captures daily/weekly seasonality patterns with 80% confidence intervals (shaded area).*
+
+![Metrics by Period](ml_training/docs/metrics_by_period.png)
+
+*Fig 2. Model performance segmented by time period. Peak hours (9AM-9PM) and weekdays show lower error rates, which is ideal for autoscaling since high-load periods need the most accurate predictions.*
+
+> **Note**: These results are from synthetic data for pipeline validation. Production performance will vary based on actual workload patterns. Monitor MAE and coverage after deployment to establish production baseline.
+
 ### Success Criteria
 
 - **MAE < 10%**: Prediction error within 10 percentage points

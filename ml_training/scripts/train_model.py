@@ -17,6 +17,7 @@ import boto3
 import pandas as pd
 from prophet import Prophet
 from prophet.diagnostics import cross_validation, performance_metrics
+from prophet.serialize import model_to_json
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -87,18 +88,36 @@ class CPUForecaster:
         # Sort by timestamp
         df = df.sort_values('timestamp').reset_index(drop=True)
 
+        # Remove duplicate timestamps (keep first occurrence)
+        # Prophet requires unique timestamps
+        before_dedup = len(df)
+        df = df.drop_duplicates(subset=['timestamp'], keep='first')
+        if len(df) < before_dedup:
+            print(f"Removed {before_dedup - len(df)} duplicate timestamps")
+
+        # Reset index after deduplication to ensure clean index
+        df = df.reset_index(drop=True)
+
         # Create Prophet format (ds, y)
+        # Prophet requires timezone-naive datetime
+        timestamps = df['timestamp'].copy()
+        # Remove timezone info if present
+        if timestamps.dt.tz is not None:
+            timestamps = timestamps.dt.tz_localize(None)
+
         prophet_df = pd.DataFrame({
-            'ds': df['timestamp'],
-            'y': df[target_col]
+            'ds': timestamps,
+            'y': df[target_col].values
         })
 
         # Add additional regressors (optional features Prophet can use)
         # These are time-varying external features
+        # Use .values to avoid index alignment issues
         if 'pending_pods' in df.columns:
-            prophet_df['pending_pods'] = df['pending_pods'].fillna(0)
+            prophet_df['pending_pods'] = df['pending_pods'].fillna(0).values
         if 'worker_count' in df.columns:
-            prophet_df['worker_count'] = df['worker_count'].fillna(df['worker_count'].mode()[0] if len(df['worker_count'].mode()) > 0 else 2)
+            mode_val = df['worker_count'].mode()[0] if len(df['worker_count'].mode()) > 0 else 2
+            prophet_df['worker_count'] = df['worker_count'].fillna(mode_val).values
 
         # Engineer features for analysis
         feature_df = self.feature_engineer.create_feature_set(
@@ -133,6 +152,8 @@ class CPUForecaster:
 
         # Add regressors if available
         regressors = [col for col in df.columns if col not in ['ds', 'y']]
+        if regressors:
+            print(f"Adding regressors: {regressors}")
         for regressor in regressors:
             self.model.add_regressor(regressor, mode='additive')
 
@@ -144,7 +165,7 @@ class CPUForecaster:
         print("Validating model...")
         future = self.model.make_future_dataframe(
             periods=len(val_df),
-            freq='2T',  # 2-minute intervals
+            freq='2min',  # 2-minute intervals
             include_history=False
         )
 
@@ -157,7 +178,7 @@ class CPUForecaster:
                 how='left'
             )
             # Forward fill any missing values
-            future[regressor] = future[regressor].fillna(method='ffill').fillna(0)
+            future[regressor] = future[regressor].ffill().fillna(0)
 
         # Predict
         forecast = self.model.predict(future)
@@ -224,14 +245,14 @@ class CPUForecaster:
     def predict(
         self,
         periods: int,
-        freq: str = '2T',
+        freq: str = '2min',
         include_history: bool = False,
     ) -> pd.DataFrame:
         """Make future predictions.
 
         Args:
             periods: Number of periods to predict
-            freq: Frequency of predictions (e.g., '2T' for 2 minutes)
+            freq: Frequency of predictions (e.g., '2min' for 2 minutes)
             include_history: Include historical predictions
 
         Returns:
@@ -253,8 +274,8 @@ class CPUForecaster:
         """
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        # Serialize model to JSON
-        model_json = self.model.to_json()
+        # Serialize model to JSON using Prophet 1.2+ API
+        model_json = model_to_json(self.model)
 
         with open(output_path, 'w') as f:
             f.write(model_json)

@@ -16,6 +16,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from prophet import Prophet
+from prophet.serialize import model_from_json
 
 # Set style
 sns.set_style('whitegrid')
@@ -32,8 +33,10 @@ class ModelValidator:
             model_path: Path to saved Prophet model (JSON)
         """
         self.model_path = model_path
-        self.model = Prophet()
-        self.model = self.model.from_json(model_path)
+        # Load model using Prophet 1.2+ API
+        with open(model_path, 'r') as f:
+            model_json = f.read()
+        self.model = model_from_json(model_json)
 
         # Load training metrics if available
         metrics_path = model_path.replace('.json', '_metrics.json')
@@ -92,7 +95,7 @@ class ModelValidator:
             # Make future dataframe
             future = temp_model.make_future_dataframe(
                 periods=forecast_periods,
-                freq='2T',
+                freq='2min',
                 include_history=False
             )
 
@@ -414,13 +417,13 @@ def main():
     parser.add_argument(
         "--data-path",
         type=str,
-        default="ml_training/data/metrics_samples.csv",
+        default="data/metrics_samples.csv",
         help="Path to metrics CSV file",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="ml_training/validation",
+        default="validation/",
         help="Output directory for validation results",
     )
     parser.add_argument(
@@ -448,6 +451,11 @@ def main():
     df = df.rename(columns={'timestamp': 'ds', 'cpu_percent': 'y'})
     df = df[['ds', 'y']].dropna()
     df = df.sort_values('ds').reset_index(drop=True)
+
+    # Prophet requires timezone-naive datetime
+    if df['ds'].dt.tz is not None:
+        df['ds'] = df['ds'].dt.tz_localize(None)
+
     print(f"Loaded {len(df)} records")
 
     # Create validator

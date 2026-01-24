@@ -81,3 +81,9 @@ temp/
 .venv
 .claude
 .qodo
+
+# ML Training - ignore outputs but keep docs
+ml_training/validation/
+ml_training/data/
+ml_training/models/
+!ml_training/docs/

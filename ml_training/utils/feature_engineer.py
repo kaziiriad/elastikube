@@ -273,7 +273,7 @@ def main():
     dates = pd.date_range(
         start='2024-01-01',
         periods=1000,
-        freq='2T'  # 2-minute intervals
+        freq='2min'  # 2-minute intervals
     )
 
     sample_df = pd.DataFrame({
