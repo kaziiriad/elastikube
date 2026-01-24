@@ -641,6 +641,26 @@ These alarms detect operational issues with the cluster:
 | Node Count Below Min | CRITICAL | Nodes < 2 | 2 minutes |
 | WAL Stale Operations | WARNING | Incomplete > 10min | 5 minutes |
 | Master Memory | WARNING | Memory > 90% | 10 minutes |
+| Prometheus Health | CRITICAL | Unreachable for 4min | 4 minutes |
+
+**Prometheus Health - Design Challenge:**
+
+When Prometheus metrics are unavailable, the autoscaler must operate without visibility into cluster load:
+
+| Scenario | Risk | Mitigation |
+|----------|------|------------|
+| Scale-down blind | Under-provision during actual high load | **Blocked**: Conservative metrics (assume 100% CPU) |
+| Scale-up blind | Over-provision during low load | **Allowed**: Pending pods still trigger scale-up |
+| Stop all scaling | Cluster stuck at current capacity | **Avoided**: Degraded but functional |
+
+**Graceful Degradation Behavior:**
+- Publishes `PrometheusHealth = 0` metric (triggers alarm)
+- Uses conservative defaults: CPU=100%, Memory=100% (prevents scale-down)
+- State table sync continues (worker_count from DynamoDB)
+- Pending pods (≥1) still trigger scale-up via Kubernetes API
+- Auto-recovers when Prometheus reconnects
+
+**Operational Response:** Check Prometheus service, verify Lambda→Master network connectivity (port 30900), validate master node health.
 
 #### Existing Monitoring Alarms
 

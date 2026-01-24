@@ -58,7 +58,7 @@ def get_clients():
     return dynamodb_client, ec2_client
 
 
-def _publish_cloudwatch_metrics(metrics: ClusterMetrics, node_count: int) -> None:
+def _publish_cloudwatch_metrics(metrics: ClusterMetrics, node_count: int, prometheus_healthy: bool = True) -> None:
     """Publish cluster metrics to CloudWatch using PutMetricData API.
 
     This sends metrics directly to CloudWatch without embedding in logs.
@@ -66,6 +66,7 @@ def _publish_cloudwatch_metrics(metrics: ClusterMetrics, node_count: int) -> Non
     Args:
         metrics: Cluster metrics from Prometheus
         node_count: Current node count
+        prometheus_healthy: Whether Prometheus fetch succeeded (for health alarm)
     """
     import boto3
 
@@ -73,6 +74,13 @@ def _publish_cloudwatch_metrics(metrics: ClusterMetrics, node_count: int) -> Non
 
     # Build metric data list
     metric_data = [
+        # Health metric (1 = Prometheus reachable, 0 = failed)
+        {
+            "MetricName": "PrometheusHealth",
+            "Value": 1 if prometheus_healthy else 0,
+            "Unit": "None",
+            "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+        },
         # Worker metrics
         {
             "MetricName": "WorkerCPU",
@@ -311,10 +319,31 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
             # Step 4: Fetch cluster metrics
             logger.info("Fetching cluster metrics from Prometheus...")
-            metrics = prometheus.get_cluster_metrics()
-
-            # Step 4.5: Record periodic metrics sample for ML training
-            recorder.record_metrics_sample(metrics)
+            prometheus_healthy = True
+            try:
+                metrics = prometheus.get_cluster_metrics()
+                # Step 4.5: Record periodic metrics sample for ML training
+                recorder.record_metrics_sample(metrics)
+            except RuntimeError as e:
+                # Prometheus fetch failed - use degraded metrics
+                logger.error(f"Failed to fetch Prometheus metrics: {e}")
+                logger.warning("Using degraded metrics - scaling decisions may be suboptimal")
+                prometheus_healthy = False
+                # Create default metrics with conservative values (assume high CPU to prevent scale-down)
+                from datetime import datetime, timezone
+                metrics = ClusterMetrics(
+                    cpu_percent=100.0,  # Assume high CPU (conservative)
+                    memory_percent=100.0,  # Assume high memory (conservative)
+                    pending_pods=0,  # Unknown, use 0
+                    ready_nodes=state.node_count,  # Use state table value
+                    total_nodes=state.node_count,  # Use state table value
+                    worker_count=state.node_count,  # Use state table value
+                    worker_cpu_percent_avg=100.0,  # Assume high CPU
+                    worker_memory_percent_avg=100.0,  # Assume high memory
+                    master_cpu_percent=0.0,  # Not used in scaling
+                    master_memory_percent=0.0,  # Not used in scaling
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
 
             # Log to console
             logger.info(f"Worker Metrics: CPU={metrics.worker_cpu_percent_avg:.1f}%, "
@@ -325,8 +354,8 @@ def lambda_handler(event: dict, context: Any) -> dict:
             logger.info(f"Cluster: Pending Pods={metrics.pending_pods}, "
                        f"Ready Nodes={metrics.ready_nodes}/{metrics.total_nodes}")
 
-            # Publish metrics to CloudWatch using Embedded Metric Format
-            _publish_cloudwatch_metrics(metrics, state.node_count)
+            # Publish metrics to CloudWatch (include Prometheus health status)
+            _publish_cloudwatch_metrics(metrics, state.node_count, prometheus_healthy=prometheus_healthy)
 
             # Step 5: Evaluate scaling decision
             logger.info("Evaluating scaling decision...")

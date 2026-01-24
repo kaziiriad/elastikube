@@ -1586,6 +1586,26 @@ cleanup_lambda_errors_alarm = aws.cloudwatch.MetricAlarm(
 )
 
 # =============================================================================
+# Observability Health Alarms
+# =============================================================================
+
+# Prometheus Unreachable - detects when Prometheus metrics are not available
+# This is CRITICAL because without Prometheus, the autoscaler cannot make scaling decisions
+prometheus_health_alarm = aws.cloudwatch.MetricAlarm(
+    "k3s-prometheus-health-alarm",
+    comparison_operator="LessThanThreshold",
+    evaluation_periods=2,  # Trigger after 2 consecutive failures (4 minutes)
+    metric_name="PrometheusHealth",
+    namespace="K3sAutoscaler",
+    period=120,  # 2 minutes (aligns with EventBridge schedule)
+    statistic="Average",
+    threshold=1.0,  # Below 1 means PrometheusHealth = 0 (failed)
+    alarm_description="CRITICAL: Prometheus metrics unreachable for 4+ minutes. Autoscaler cannot make scaling decisions. Check Prometheus service and network connectivity from Lambda to master node.",
+    alarm_actions=[alarm_topic.arn],
+    tags={**common_tags, "Name": "k3s-prometheus-health-alarm", "Severity": "CRITICAL"}
+)
+
+# =============================================================================
 # Infrastructure Health Alarms
 # =============================================================================
 
