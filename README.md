@@ -134,12 +134,15 @@ The Decision Lambda evaluates scaling conditions in a specific order defined in 
 4. If scale-up not triggered, check scale-down cooldown (blocks only scale-down)
 5. Check scale-down conditions (CPU AND memory both low)
 
-#### Layer 3: Flash Sale Detection (Emergency Response)
+#### Layer 1: Data Collection (for Predictive Scaling)
 
-Before any cooldown checks, the system detects sudden CPU spikes:
-- **Trigger**: CPU increase > 30% within 2 minutes
-- **Action**: Immediate scale-up, bypasses all cooldowns
-- **Purpose**: Handle sudden traffic surges (e.g., flash sales, viral content)
+Before any scaling evaluation, the system continuously collects metrics and scaling decisions for future ML-based predictive scaling:
+
+- **Metrics Sampling**: Every 2 minutes, records CPU, memory, pending pods, worker count to `k3s-scaling-metrics-samples` DynamoDB table
+- **Scaling History**: Every scaling decision recorded to `k3s-scaling-history` DynamoDB table with full context (metrics, decision, reason)
+- **Data Retention**: 30 days (configurable via TTL)
+- **Purpose**: Historical data trains Prophet models to forecast CPU 15 minutes ahead, enabling proactive scaling
+- **Status**: Data collection active (v1.1), training pipeline complete, pending model integration
 
 #### Layer 2: Time-Aware Scaling
 
@@ -154,6 +157,13 @@ The autoscaler uses different CPU thresholds based on time of day:
 - Peak hours have higher baseline CPU (70-80%), so thresholds are raised
 - Prevents threshold thrashing (constant scale-up/down at boundary)
 - Off-peak hours use lower thresholds for faster response to increased load
+
+#### Layer 3: Flash Sale Detection (Emergency Response)
+
+Before any cooldown checks, the system detects sudden CPU spikes:
+- **Trigger**: CPU increase > 30% within 2 minutes
+- **Action**: Immediate scale-up, bypasses all cooldowns
+- **Purpose**: Handle sudden traffic surges (e.g., flash sales, viral content)
 
 #### Standard Scaling Logic
 
@@ -215,21 +225,24 @@ The scale-down operation uses **LIFO (Last In, First Out)**:
 flowchart TD
     subgraph "Triggers"
         EB1["EventBridge<br/>(5 minute interval)"]
+        EBSD["EventBridge<br/>(ScaleDown Event)"]
         EB2["EventBridge<br/>(Variable: 15 minutes(default))"]
+        EBSU["EventBridge<br/>(ScaleUp Event)"]
         EBSpot["EventBridge<br/>(Spot Interruption<br/>2 min before termination)"]
     end
 
     subgraph "Decision Flow"
         Decision["Decision Lambda<br/>k3s-autoscaler-function"]
-        State1["DynamoDB<br/>(Cluster State)"]
-        WAL["DynamoDB<br/>(WAL)"]
-        Lock["DynamoDB<br/>(Distributed Lock)"]
+        subgraph "State & Lock"
+            State1["DynamoDB<br/>(Cluster State)"]
+            WAL["DynamoDB<br/>(WAL)"]
+            Lock["DynamoDB<br/>(Distributed Lock)"]
+        end
         Prom["Prometheus<br/>(Cluster Metrics)"]
         CW["CloudWatch<br/>(Metrics)"]
     end
 
     subgraph "Scale-Up Flow"
-        EBSU["EventBridge<br/>(ScaleUp Event)"]
         ScaleUp["Scale-Up Lambda<br/>scale-up-lambda"]
         EC2Up["EC2 API<br/>(Launch Instance)"]
         SSM1["SSM<br/>(Verify Join)"]
@@ -237,7 +250,6 @@ flowchart TD
     end
 
     subgraph "Scale-Down Flow"
-        EBSD["EventBridge<br/>(ScaleDown Event)"]
         ScaleDown["Scale-Down Lambda<br/>scale-down-lambda"]
         Drain["kubectl drain<br/>(via SSM)"]
         EC2Down["EC2 API<br/>(Terminate Instance)"]
@@ -245,8 +257,9 @@ flowchart TD
 
     subgraph "Cleanup Flow"
         Cleanup["Cleanup Lambda<br/>cleanup-lambda"]
-        K8sClean["kubectl delete node<br/>(NotReady nodes)"]
+        K8sClean["kubectl delete node<br/>(NotReady nodes)</br>(via SSM)"]
         SpotDrain["kubectl drain<br/>(via SSM)"]
+        OrphanedEC2["EC2 API<br/>(Terminate Failed Instances)"]
     end
 
     %% Decision Lambda Flow
@@ -274,11 +287,11 @@ flowchart TD
     %% Cleanup Flow
     EB2 --> Cleanup
     EBSpot --> Cleanup
-    Cleanup --> K8sClean
+    Cleanup --> OrphanedEC2
     Cleanup --> SpotDrain
+    Cleanup --> K8sClean 
 
     %% Styling
-
     class EB1,EBSU,EBSD,EB2,EBSpot trigger
     class Decision,ScaleUp,ScaleDown,Cleanup lambda
     class EC2Up,EC2Down,SSM1,Drain,S3,CW,K8sClean,SpotDrain aws
@@ -1040,6 +1053,19 @@ production/
 ├── cleanup-lambda/            # Stale node cleanup
 │   ├── main.py               # Lambda entry point
 │   └── build.sh
+├── ml_training/               # ML pipeline for predictive scaling
+│   ├── pyproject.toml        # uv dependencies
+│   ├── data/                 # Extracted training data (CSV)
+│   ├── models/               # Trained Prophet models
+│   ├── validation/           # Backtest results & plots
+│   ├── scripts/              # Training/validation scripts
+│   │   ├── extract_data.py   # DynamoDB → CSV
+│   │   ├── train_model.py    # Train Prophet model
+│   │   └── validate_model.py # Backtesting & validation
+│   ├── utils/                # Feature engineering
+│   │   └── feature_engineer.py
+│   └── notebooks/            # Jupyter notebooks for EDA
+│       └── 01_exploratory_analysis.ipynb
 ├── monitoring/
 │   ├── dashboards/           # CloudWatch dashboard JSON
 │   │   ├── k3s-cluster-dashboard.json
@@ -1210,14 +1236,151 @@ AWS_PROFILE=k3s-temp-user aws dynamodb scan \
 
 
 
+## Predictive Scaling (Layer 4: Pipeline Complete, Pending Integration)
+
+The predictive scaling feature uses machine learning to forecast future CPU usage and proactively scale workers before traffic spikes occur. This completes the layered autoscaling architecture:
+
+- **Layer 1 (v1.1)**: Data Collection - Gathers metrics and scaling history for ML training
+- **Layer 2 (v1.1)**: Time-Aware Scaling - Different thresholds for peak/off-peak hours
+- **Layer 3 (v1.1)**: Flash Sale Detection - Emergency response to sudden CPU spikes
+- **Layer 4 (v1.2 - Roadmap)**: Predictive Scaling - Forecast CPU 15 minutes ahead using Prophet models
+
+This predictive layer complements the existing reactive scaling (Layers 2-3) by adding proactive pre-scaling before traffic spikes occur.
+
+### Training Pipeline Architecture
+
+```mermaid
+flowchart LR
+    subgraph Data["Data Sources (v1.1)"]
+        DynamoDB1["DynamoDB<br/>k3s-scaling-metrics-samples<br/>(CPU, Memory, Pending Pods)"]
+        DynamoDB2["DynamoDB<br/>k3s-scaling-history<br/>(Scaling Decisions)"]
+    end
+
+    subgraph Extract["Data Extraction"]
+        ExtractScript["extract_data.py<br/>(DynamoDB → CSV)"]
+        CSV["CSV Files<br/>(data/*.csv)"]
+    end
+
+    subgraph Analysis["Exploratory Analysis"]
+        Notebook["01_exploratory_analysis.ipynb<br/>(Seasonality, Autocorrelation,<br/>Feature Correlations)"]
+    end
+
+    subgraph Features["Feature Engineering"]
+        Temporal["Temporal Features<br/>(hour_sin, hour_cos,<br/>dow_sin, dow_cos)"]
+        Lag["Lag Features<br/>(cpu_lag_1, lag_3, lag_5)"]
+        Rolling["Rolling Statistics<br/>(rolling_mean, std, min, max)"]
+        Trend["Trend Features<br/>(diff, pct_change)"]
+        Leading["Leading Indicators<br/>(pending_pods)"]
+    end
+
+    subgraph Train["Model Training"]
+        Prophet["Prophet Model<br/>(Multiplicative Seasonality,<br/>Daily/Weekly Patterns,<br/>80% Confidence Interval)"]
+        CrossVal["Time-Series<br/>Cross-Validation"]
+    end
+
+    subgraph Validate["Validation & Backtesting"]
+        Backtest["Rolling Window Backtest<br/>(Train 1 day, Predict 15 min)"]
+        Metrics["MAE, RMSE, MAPE<br/>Coverage Analysis"]
+        Segment["Time-Segment Analysis<br/>(Peak/Off-Peak,<br/>Weekday/Weekend)"]
+    end
+
+    subgraph Deploy["Deployment (v1.2 Roadmap)"]
+        ModelJSON["Prophet Model JSON<br/>(models/*.json)"]
+        S3["S3 Bucket<br/>(Optional)"]
+        Lambda["Decision Lambda Integration<br/>(Predict CPU 15min ahead)"]
+    end
+
+    %% Flow
+    DynamoDB1 --> ExtractScript
+    DynamoDB2 --> ExtractScript
+    ExtractScript --> CSV
+    CSV --> Notebook
+    CSV --> Temporal
+    CSV --> Lag
+    CSV --> Rolling
+    CSV --> Trend
+    CSV --> Leading
+
+    Temporal --> Prophet
+    Lag --> Prophet
+    Rolling --> Prophet
+    Trend --> Prophet
+    Leading --> Prophet
+
+    Prophet --> CrossVal
+    CrossVal --> Backtest
+    Backtest --> Metrics
+    Backtest --> Segment
+
+    Prophet --> ModelJSON
+    ModelJSON --> S3
+    ModelJSON --> Lambda
+
+    %% Styling
+    class DynamoDB1,DynamoDB2 dataSource
+    class ExtractScript,CSV process
+    class Notebook analysis
+    class Temporal,Lag,Rolling,Trend,Leading feature
+    class Prophet,CrossVal model
+    class Backtest,Metrics,Segment validation
+    class ModelJSON,S3,Lambda deploy
+```
+
+### Implementation Overview
+
+**Training Pipeline** (builds on Layer 1 data collection)
+- Extracts historical data from DynamoDB to CSV files
+- Exploratory analysis (Jupyter notebook) identifies patterns: daily/weekly seasonality, autocorrelation, feature correlations
+- Feature engineering creates temporal features (cyclical hour/day encoding), lag features (past CPU values), rolling statistics, trends, and leading indicators (pending pods)
+- Prophet model trained with multiplicative seasonality (scales with load magnitude), daily/weekly patterns, 80% confidence intervals
+- Time-series cross-validation prevents data leakage
+- Model artifacts saved as JSON (portable, version-controllable)
+
+**Validation & Backtesting**
+- Rolling window backtest simulates real-time forecasting (train on 1 day, predict 15 min, roll forward)
+- Metrics calculated: MAE, RMSE, MAPE, prediction interval coverage
+- Segmented analysis by time period (peak vs off-peak, weekday vs weekend, hourly breakdown)
+- Visualization of actual vs predicted, error distribution, metrics by period
+- Validates that model performs consistently across all time periods
+
+**Deployment Integration**
+- Trained model loaded from S3 or local storage into Decision Lambda memory
+- At each evaluation cycle (every 2 minutes), model predicts CPU 15 minutes ahead
+- Prediction used as additional signal in scaling decision logic
+- Graceful fallback to reactive scaling if model prediction fails or confidence low
+- Model version tracked in DynamoDB state for rollbacks
+
+**Monitoring & Retraining**
+- Model performance monitored via CloudWatch metrics (prediction error, coverage)
+- Retrain weekly with latest 30 days of data to capture pattern changes
+- Drift detection: alert if MAE increases by >20% from baseline
+- A/B testing: compare predictive vs reactive scaling before full rollout
+
+### Files and Structure
+
+Located in `ml_training/` directory:
+- `scripts/extract_data.py` - Pulls historical data from DynamoDB
+- `scripts/train_model.py` - Trains Prophet model with cross-validation
+- `scripts/validate_model.py` - Backtesting and performance analysis
+- `utils/feature_engineer.py` - Temporal, lag, rolling, and trend features
+- `notebooks/01_exploratory_analysis.ipynb` - EDA for seasonality analysis
+- `pyproject.toml` - uv dependencies (prophet, pandas, boto3, matplotlib)
+
+### Success Criteria
+
+- **MAE < 10%**: Prediction error within 10 percentage points
+- **Coverage 75-85%**: Actual values fall within 80% confidence interval at expected rate
+- **No time-period degradation**: Peak-hour MAE within 20% of overall MAE
+- **Positive ROI**: Pre-scaling reduces SLA violations enough to justify ML infrastructure cost
+
 ## Future Improvements
 
 | Feature | Description | Benefit |
 |---------|-------------|---------|
-| **Predictive Scaling (with Fallback)** | ML model trained on historical data predicts scaling needs. Automatically falls back to current time-aware + flash sale detection if predictions fail or confidence is low. Data collection infrastructure already in place. | Pre-scales before traffic spikes, graceful degradation ensures reliability |
 | **Custom App Metrics** | Incorporate application-level metrics (queue depth, latency, error rates) into scaling decisions | More accurate scaling based on actual load |
 | **GitOps Configuration** | Version-controlled configuration with auditable rollbacks via Git | Change management, traceability, safer deployments |
 | **Slack Notifications** | Concise alerts for scale actions, drains, failures with troubleshooting context | Faster incident response, better operational awareness |
+| **Deploy Predictive Scaling** | Integrate trained ML model into Decision Lambda for proactive scaling (see "Predictive Scaling" section above) | Pre-scales before traffic spikes, reduces SLA violations |
 
 **Note:** Spot Instance Fallback with automatic On-Demand fallback and Multi-AZ worker distribution are already implemented (see "Implemented Optimizations" in Cost Analysis section and "VPC & Networking" for multi-AZ details).
 
@@ -1225,17 +1388,28 @@ AWS_PROFILE=k3s-temp-user aws dynamodb scan \
 
 **High Priority:**
 - Slack Notifications (operational visibility)
+- Deploy Predictive Scaling (infrastructure complete, pending integration)
 
 **Medium Priority:**
 - Custom App Metrics (scaling accuracy)
 - GitOps Configuration (operational excellence)
 
-**Lower Priority:**
-- Predictive Scaling (advanced optimization)
-
 ## Recent Enhancements
 
-**v1.1 - Layered Autoscaling Architecture (Latest)**
+
+**v1.2 - ML Training Pipeline (Latest)**
+
+| Feature | Description |
+|---------|-------------|
+| **Data Extractor** | DynamoDB extraction script (`ml_training/scripts/extract_data.py`) pulls historical metrics and scaling decisions to CSV for training |
+| **Feature Engineering** | Creates temporal features (cyclical encoding), lag features, rolling statistics, trends, and leading indicators (`ml_training/utils/feature_engineer.py`) |
+| **Prophet Model Trainer** | Time-series forecasting model with multiplicative seasonality, daily/weekly patterns, 80% confidence intervals (`ml_training/scripts/train_model.py`) |
+| **Validation & Backtesting** | Rolling window backtest, time-segmented analysis (peak/off-peak, weekday/weekend), prediction interval coverage (`ml_training/scripts/validate_model.py`) |
+| **EDA Notebook** | Exploratory analysis for seasonality, autocorrelation, and feature correlations (`ml_training/notebooks/01_exploratory_analysis.ipynb`) |
+
+**Status**: Training pipeline complete. Pending integration into Decision Lambda (Layer 4 deployment).
+
+**v1.1 - Layered Autoscaling Architecture**
 
 | Feature | Description |
 |---------|-------------|
@@ -1245,5 +1419,19 @@ AWS_PROFILE=k3s-temp-user aws dynamodb scan \
 | **Permanent Worker Protection** | Fixed bug where autoscaler used `total_nodes` instead of `worker_count`, preventing scale-down of permanent workers. |
 | **Fixed CloudWatch Log Groups** | Explicit LogGroup resources with fixed names for stable dashboard references. |
 
+**v1.0 - Initial Release**
+
+| Feature | Description |
+|---------|-------------|
+| **Event-Driven Lambda Architecture** | Decision Lambda triggered every 2 minutes via EventBridge, with Scale-Up/Down/Cleanup Lambdas chained via events |
+| **DynamoDB State Management** | Cluster state, WAL for crash recovery, and distributed locking using conditional writes |
+| **Multi-AZ Worker Distribution** | Round-robin subnet selection across 3 availability zones for high availability |
+| **LIFO Scale-Down Strategy** | Last In, First Out removal with permanent worker protection (k3s-worker-1, k3s-worker-2) |
+| **Spot Instances with Fallback** | Automatic On-Demand fallback when spot capacity unavailable (InsufficientInstanceCapacity, SpotInstanceCapacityNotAvailable, MaxSpotInstanceCountExceeded) |
+| **Graceful Node Drain** | kubectl drain with 120s timeout via SSM before terminating workers |
+| **Cleanup Lambda** | Removes failed EC2 instances (JoinStatus not verified after 5 min) and stale Kubernetes nodes (NotReady) |
+| **CloudWatch Alarms** | 17 alarms for Lambda health, infrastructure metrics, EventBridge failures, and DLQ monitoring |
+| **Prometheus Integration** | Queries in-cluster Prometheus (NodePort 30900) for worker CPU/memory metrics |
+| **Standard Scaling Logic** | Scale-up on CPU OR pending pods; Scale-down on CPU AND memory with cooldowns (5min up, 15min down) |
 ## License
 MIT
