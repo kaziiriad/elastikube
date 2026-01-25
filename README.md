@@ -695,9 +695,11 @@ All alarms are configured to send notifications to an SNS topic for alerting:
 | Resource | Purpose |
 |----------|---------|
 | SNS Topic | `k3s-autoscaler-alarms` (created during deployment) |
-| Subscription | Email (must be configured - see below) |
+| Subscription | Email, Slack webhook, or other endpoints |
 
 **To receive alarm notifications:**
+
+**Option 1: Email Subscription**
 
 1. **During deployment** (automatic):
    ```bash
@@ -712,6 +714,35 @@ All alarms are configured to send notifications to an SNS topic for alerting:
    ```
 
 3. **Verify subscription**: You'll receive a confirmation email. Click the link to activate notifications.
+
+**Option 2: Slack Webhook Subscription**
+
+1. Create an Incoming Webhook in Slack (Apps → Incoming Webhooks → Add to Workspace)
+2. Copy the webhook URL (format: `https://hooks.slack.com/services/T000/B000/XXXX`)
+3. Add HTTPS subscription to SNS topic:
+   ```bash
+   # Get SNS topic ARN
+   SNS_TOPIC_ARN=$(aws sns list-topics --region ap-southeast-1 \
+       --query "Topics[?contains(Topic, 'k3s-autoscaler-alarms')].TopicArn | [0]" \
+       --output text)
+
+   # Subscribe Slack webhook to SNS topic
+   aws sns subscribe \
+       --topic-arn "$SNS_TOPIC_ARN" \
+       --protocol https \
+       --notification-endpoint https://hooks.slack.com/services/T000/B000/XXXX \
+       --region ap-southeast-1
+   ```
+
+4. **Test notification**:
+   ```bash
+   aws sns publish \
+       --topic-arn "$SNS_TOPIC_ARN" \
+       --message '{"AlarmName":"Test Alarm","NewStateValue":"ALARM"}' \
+       --region ap-southeast-1
+   ```
+
+All 17 CloudWatch alarms will post to Slack when the subscription is active. Messages arrive in raw CloudWatch alarm JSON format.
 
 ### Other Resources
 
@@ -1623,14 +1654,10 @@ Tested with 30 days of synthetic metrics data generated to simulate realistic cl
 |---------|-------------|---------|
 | **Custom App Metrics** | Incorporate application-level metrics (queue depth, latency, error rates) into scaling decisions | More accurate scaling based on actual load |
 | **GitOps Configuration** | Version-controlled configuration with auditable rollbacks via Git | Change management, traceability, safer deployments |
-| **Slack Notifications** | Concise alerts for scale actions, drains, failures with troubleshooting context | Faster incident response, better operational awareness |
 
-**Note:** Spot Instance Fallback with automatic On-Demand fallback, Multi-AZ worker distribution, and Predictive Scaling (Layer 4) with automated model retraining are already implemented.
+**Note:** Spot Instance Fallback with automatic On-Demand fallback, Multi-AZ worker distribution, Predictive Scaling (Layer 4) with automated model retraining, and Slack webhook subscription are already implemented.
 
 ### Implementation Priority
-
-**High Priority:**
-- Slack Notifications (operational visibility)
 
 **Medium Priority:**
 - Custom App Metrics (scaling accuracy)
