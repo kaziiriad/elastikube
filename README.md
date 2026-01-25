@@ -1624,15 +1624,13 @@ Tested with 30 days of synthetic metrics data generated to simulate realistic cl
 | **Custom App Metrics** | Incorporate application-level metrics (queue depth, latency, error rates) into scaling decisions | More accurate scaling based on actual load |
 | **GitOps Configuration** | Version-controlled configuration with auditable rollbacks via Git | Change management, traceability, safer deployments |
 | **Slack Notifications** | Concise alerts for scale actions, drains, failures with troubleshooting context | Faster incident response, better operational awareness |
-| **Deploy Predictive Scaling** | Integrate trained ML model into Decision Lambda for proactive scaling (see "Predictive Scaling" section above) | Pre-scales before traffic spikes, reduces SLA violations |
 
-**Note:** Spot Instance Fallback with automatic On-Demand fallback and Multi-AZ worker distribution are already implemented (see "Implemented Optimizations" in Cost Analysis section and "VPC & Networking" for multi-AZ details).
+**Note:** Spot Instance Fallback with automatic On-Demand fallback, Multi-AZ worker distribution, and Predictive Scaling (Layer 4) with automated model retraining are already implemented.
 
 ### Implementation Priority
 
 **High Priority:**
 - Slack Notifications (operational visibility)
-- Deploy Predictive Scaling (infrastructure complete, pending integration)
 
 **Medium Priority:**
 - Custom App Metrics (scaling accuracy)
@@ -1641,7 +1639,7 @@ Tested with 30 days of synthetic metrics data generated to simulate realistic cl
 ## Recent Enhancements
 
 
-**v1.2 - ML Training Pipeline (Latest)**
+**v1.2 - ML Training Pipeline + Predictive Scaling (Latest)**
 
 | Feature | Description |
 |---------|-------------|
@@ -1650,8 +1648,10 @@ Tested with 30 days of synthetic metrics data generated to simulate realistic cl
 | **Prophet Model Trainer** | Time-series forecasting model with multiplicative seasonality, daily/weekly patterns, 80% confidence intervals (`ml_training/scripts/train_model.py`) |
 | **Validation & Backtesting** | Rolling window backtest, time-segmented analysis (peak/off-peak, weekday/weekend), prediction interval coverage (`ml_training/scripts/validate_model.py`) |
 | **EDA Notebook** | Exploratory analysis for seasonality, autocorrelation, and feature correlations (`ml_training/notebooks/01_exploratory_analysis.ipynb`) |
+| **CronJob Deployment** | Kubernetes CronJob runs weekly (Sunday 2 AM UTC) on permanent workers, uploads trained models to S3 |
+| **Decision Lambda Integration** | Asymmetric predictive scaling: predicted CPU for scale-up (proactive), current CPU for scale-down (conservative) |
 
-**Status**: Training pipeline complete. Pending integration into Decision Lambda (Layer 4 deployment).
+**Status**: Layer 4 complete and deployed. CronJob schedules automated training, Decision Lambda uses predictions for proactive scaling.
 
 **v1.1 - Layered Autoscaling Architecture**
 
