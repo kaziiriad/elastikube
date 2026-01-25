@@ -1,0 +1,38 @@
+---
+# ML Training CronJob Deployment Role
+# This role deploys the ML training CronJob to the K3s cluster
+#
+# This role is typically called from site.yml with specific task files:
+# - build-image.yml: Builds the Docker image and saves to tar
+# - distribute-image.yml: Copies and loads image on worker nodes
+# - deploy-cronjob.yml: Deploys the CronJob to K3s cluster
+#
+# Usage:
+#   # Build image only
+#   - include_role:
+#       name: ml-training-cronjob
+#       tasks_from: build-image.yml
+#
+#   # Distribute to workers
+#   - include_role:
+#       name: ml-training-cronjob
+#       tasks_from: distribute-image.yml
+#
+#   # Deploy CronJob
+#   - include_role:
+#       name: ml-training-cronjob
+#       tasks_from: deploy-cronjob.yml
+
+- name: Display ML Training CronJob role information
+  ansible.builtin.debug:
+    msg: |
+      ╔══════════════════════════════════════════════════════════════╗
+      ║          ML Training CronJob Role                             ║
+      ╠══════════════════════════════════════════════════════════════╣
+      ║  This role should be called with specific task files:         ║
+      ║    - build-image.yml                                           ║
+      ║    - distribute-image.yml                                      ║
+      ║    - deploy-cronjob.yml                                        ║
+      ║                                                                 ║
+      ║  See site.yml for the complete deployment flow.                ║
+      ╚══════════════════════════════════════════════════════════════╝

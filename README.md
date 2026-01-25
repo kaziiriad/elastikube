@@ -1097,9 +1097,24 @@ SCALE_DOWN_THRESHOLD=30
 SCALE_UP_COOLDOWN=300
 SCALE_DOWN_COOLDOWN=900
 
+# Layer 4: Predictive Scaling (Optional)
+PREDICTIVE_SCALING_ENABLED=false
+PROPHET_MODEL_S3_BUCKET=k3s-models
+PROPHET_MODEL_S3_KEY=models/cpu_prophet_model.json
+PREDICTION_HORIZON_MINUTES=15
+
 # Other
 DRY_RUN=false
 ```
+
+**Predictive Scaling Configuration:**
+
+| Variable | Description | Default | Notes |
+|----------|-------------|---------|-------|
+| `PREDICTIVE_SCALING_ENABLED` | Enable ML-based predictive scaling | `false` | Set to `true` to enable Layer 4 |
+| `PROPHET_MODEL_S3_BUCKET` | S3 bucket containing trained model | Required | Must be public or Lambda needs S3 read access |
+| `PROPHET_MODEL_S3_KEY` | S3 key path to model JSON | Required | Example: `models/cpu_prophet_model.json` |
+| `PREDICTION_HORIZON_MINUTES` | How far ahead to predict CPU | `15` | Must match training horizon |
 
 ### Scale-Up/Down Lambda Environment Variables
 
@@ -1236,7 +1251,7 @@ AWS_PROFILE=k3s-temp-user aws dynamodb scan \
 
 
 
-## Predictive Scaling (Layer 4: Pipeline Complete, Pending Integration)
+## Predictive Scaling (Layer 4: Pipeline Complete, Deployed via CronJob)
 
 The predictive scaling feature uses machine learning to forecast future CPU usage and proactively scale workers before traffic spikes occur. This completes the layered autoscaling architecture:
 
@@ -1254,6 +1269,7 @@ flowchart LR
     subgraph Data["Data Sources (v1.1)"]
         DynamoDB1["DynamoDB<br/>k3s-scaling-metrics-samples<br/>(CPU, Memory, Pending Pods)"]
         DynamoDB2["DynamoDB<br/>k3s-scaling-history<br/>(Scaling Decisions)"]
+        
     end
 
     subgraph Extract["Data Extraction"]
@@ -1324,6 +1340,161 @@ flowchart LR
     class Prophet,CrossVal model
     class Backtest,Metrics,Segment validation
     class ModelJSON,S3,Lambda deploy
+```
+
+### Production CronJob Deployment
+
+The ML training pipeline runs as a **Kubernetes CronJob** on the K3s cluster, automating model retraining every week.
+
+#### Deployment Architecture
+
+```mermaid
+flowchart TB
+    subgraph Ansible["Ansible Deployment (localhost)"]
+        Build["Phase 1: Build Image"]
+        Save["Save to tar file"]
+    end
+
+    subgraph Workers["Worker Nodes (k3s-worker-1, k3s-worker-2)"]
+        Dist1["Phase 2: Distribute Image"]
+        Dist2["Verify image available"]
+    end
+
+    subgraph K8s["K3s Cluster"]
+        CronJob["CronJob: ml-training-job<br/>Schedule: Sun 2AM UTC"]
+        Pod["Training Pod<br/>nodeSelector: k3s-worker-1,2"]
+    end
+
+    subgraph Pipeline["Training Pipeline"]
+        Extract["1. Extract from DynamoDB<br/>30 days metrics"]
+        Train["2. Train Prophet Model<br/>cross-validation"]
+        Validate["3. Validate Model<br/>MAE, RMSE, Coverage"]
+        Upload["4. Upload to S3<br/>models/*.json"]
+    end
+
+    subgraph S3["S3 Bucket"]
+        Model["cpu_prophet_model.json<br/>(latest)"]
+        Version["cpu_prophet_model_YYYYMMDD.json<br/>(versioned)"]
+        Metrics["model_metrics.json"]
+    end
+
+    Build --> Save
+    Save --> Dist1
+    Dist1 --> Dist2
+    Dist2 --> CronJob
+    CronJob --> Pod
+    Pod --> Extract
+    Extract --> Train
+    Train --> Validate
+    Validate --> Upload
+    Upload --> Model
+    Upload --> Version
+    Upload --> Metrics
+
+    class Ansible deploy
+    class Workers dist
+    class CronJob,Pod k8s
+    class Extract,Train,Validate,Upload pipeline
+    class Model,Version,Metrics storage
+```
+
+#### Three-Phase Ansible Deployment
+
+**Phase 1: Build Docker Image (localhost)**
+1. Build `k3s-ml-training:latest` from `ml_training/Dockerfile`
+2. Include AWS CLI v2, Python dependencies, training scripts
+3. Save image to tar file (`ml-training-image.tar`)
+4. Store temp directory path as Ansible fact for distribution
+
+**Phase 2: Distribute to Workers (worker nodes, `serial: 1`)**
+Using `serial: 1` (one worker at a time for safety):
+1. Copy tar file from localhost to each worker
+2. Load image with `docker load`
+3. Verify image availability
+4. Cleanup tar file
+
+**Phase 3: Deploy CronJob (localhost)**
+1. Create `k3s-autoscaler` namespace
+2. Create `ml-training-sa` ServiceAccount
+3. Create AWS credentials secret (if not using instance profile)
+4. Apply CronJob manifest with node selector
+5. Verify deployment
+
+#### Node Selector Strategy
+
+**Critical Design**: ML training pods are pinned to **permanent worker nodes** to prevent interruption during scale-down operations.
+
+| Worker Type | Scale-Down Protection | ML Training |
+|-------------|----------------------|-------------|
+| `k3s-worker-1` | ✅ Permanent | ✅ Eligible |
+| `k3s-worker-2` | ✅ Permanent | ✅ Eligible |
+| `k3s-worker-3+` | ❌ Temporary (LIFO) | ❌ Not eligible |
+
+This ensures:
+- Training jobs never interrupted by autoscaler
+- Round-robin scheduling between permanent workers
+- Predictable resource allocation
+
+#### CronJob Configuration
+
+The CronJob runs on a weekly schedule (Sunday 2 AM UTC) with:
+- **Concurrency Policy**: Forbid (don't start if previous job running)
+- **Backoff Limit**: 1 retry on failure
+- **Timeout**: 90 minutes maximum
+- **Resource Limits**: 500m-2000m CPU, 2Gi-4Gi memory
+- **History**: Keeps 3 successful and 3 failed job records
+
+#### Training Pipeline Steps
+
+**Step 1: Extract Data from DynamoDB**
+Extracts 30 days of cluster metrics from DynamoDB:
+- CPU utilization history
+- Memory usage patterns
+- Worker count changes
+- Scaling events
+
+**Step 2: Train Prophet Model**
+Trains Facebook Prophet model with:
+- Daily and weekly seasonality
+- Changepoint detection for workload shifts
+- Cross-validation (rolling forecast)
+- MAE/RMSE metrics
+
+**Step 3: Validate Model**
+Validates model performance:
+- Forecast accuracy metrics
+- Residual analysis
+- Trend detection
+- Coverage intervals
+
+**Step 4: Upload to S3**
+- Upload versioned model with timestamp
+- Upload as latest (for Decision Lambda)
+- Upload validation metrics
+- Publish MAE/RMSE to CloudWatch
+
+#### Integration with Decision Lambda
+
+The trained model is automatically used by the Decision Lambda for predictive scaling:
+1. Lambda loads model from S3 (`cpu_prophet_model.json`)
+2. At each evaluation cycle, model predicts CPU 15 minutes ahead
+3. Prediction used for scale-up decisions (proactive)
+4. Current CPU still used for scale-down (conservative)
+5. Graceful fallback to reactive scaling if model fails
+
+#### Monitoring
+
+**CloudWatch Metrics:**
+- Namespace: `K3sAutoscalerML`
+- Metrics: TrainingMAE, TrainingRMSE
+- Dimension: ModelVersion
+
+**S3 Model Storage:**
+```
+s3://k3s-models/models/
+├── cpu_prophet_model.json                    # Latest model
+├── cpu_prophet_model_YYYYMMDD.json          # Versioned model
+└── cpu_prophet_model_YYYYMMDD_metrics.json  # Validation metrics
 ```
 
 ### Implementation Overview

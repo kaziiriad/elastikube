@@ -1,0 +1,37 @@
+---
+# ML Training CronJob - Default Variables
+
+# Kubernetes namespace
+ml_training_namespace: k3s-autoscaler
+
+# ML training container image
+ml_training_image: k3s-ml-training:latest
+
+# Docker build configuration
+# Relative paths from the ansible playbook directory
+ml_training_context_path: ../../ml_training
+ml_training_dockerfile_path: ../../ml_training/Dockerfile
+
+# Node selector - pin to permanent workers to prevent termination during training
+# Options:
+#   - "k3s-worker-1,k3s-worker-2" - Pin to both permanent workers (round-robin)
+#   - "k3s-worker-1" - Pin to specific worker
+#   - "" - Allow scheduling on any worker (not recommended)
+ml_training_node_selector: "k3s-worker-1,k3s-worker-2"
+
+# AWS configuration
+aws_region: ap-southeast-1
+# Optional: AWS access keys (only used if not using IRSA/instance profile)
+# aws_access_key_id: ""
+# aws_secret_access_key: ""
+
+# DynamoDB tables
+state_table_name: k3s-cluster-state
+wal_table_name: k3s-scaling-wal
+
+# S3 bucket for model storage
+s3_bucket_name: k3s-models
+
+# Training parameters
+ml_training_days: 30
+ml_skip_validation: false

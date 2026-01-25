@@ -1,0 +1,12 @@
+---
+# Ansible Collections Requirements
+# Install with: ansible-galaxy collection install -r requirements.yml
+
+collections:
+  # Kubernetes module for deploying resources to K3s cluster
+  - name: kubernetes.core
+    version: ">=4.0.0"
+
+  # Docker modules for building and managing container images
+  - name: community.docker
+    version: ">=3.0.0"

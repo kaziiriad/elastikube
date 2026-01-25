@@ -1,0 +1,129 @@
+---
+# Deploy CronJob to K3s cluster
+# This task file deploys the ML training CronJob after the image has been distributed
+
+- name: Display ML Training CronJob deployment configuration
+  ansible.builtin.debug:
+    msg: |
+      ╔══════════════════════════════════════════════════════════════╗
+      ║          Deploying ML Training CronJob                           ║
+      ╠══════════════════════════════════════════════════════════════╣
+      ║  Schedule: Every Sunday at 2 AM UTC                             ║
+      ║  Image: {{ ml_training_image }}                                 ║
+      ║  Namespace: {{ ml_training_namespace }}                          ║
+      ║  S3 Bucket: {{ s3_bucket_name }}                                ║
+      ╚══════════════════════════════════════════════════════════════╝
+
+- name: Ensure kubectl is available
+  ansible.builtin.command: which kubectl
+  register: kubectl_check
+  changed_when: false
+  failed_when: false
+
+- name: Install kubectl if not present
+  become: true
+  ansible.builtin.shell: |
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    chmod +x kubectl
+    mv kubectl /usr/local/bin/
+  when: kubectl_check.rc != 0
+
+- name: Check kubectl version
+  ansible.builtin.command: kubectl version --client
+  register: kubectl_version
+  changed_when: false
+
+- name: Display kubectl version
+  ansible.builtin.debug:
+    msg: "kubectl {{ kubectl_version.stdout_lines[0] }}"
+
+- name: Create namespace for ML training
+  kubernetes.core.k8s:
+    name: "{{ ml_training_namespace }}"
+    api_version: v1
+    kind: Namespace
+    state: present
+  register: namespace_result
+
+- name: Create ServiceAccount for ML training
+  kubernetes.core.k8s:
+    name: ml-training-sa
+    namespace: "{{ ml_training_namespace }}"
+    api_version: v1
+    kind: ServiceAccount
+    state: present
+
+# Note: For IRSA (IAM Roles for Service Accounts), the annotation would be added
+# when the cluster is set up with the IAM role. This ServiceAccount will work
+# with EC2 instance profile if running on EC2-based K3s nodes.
+
+- name: Create Secret for AWS credentials (if using access keys)
+  kubernetes.core.k8s:
+    name: aws-credentials
+    namespace: "{{ ml_training_namespace }}"
+    api_version: v1
+    kind: Secret
+    state: present
+    type: Opaque
+    data:
+      AWS_ACCESS_KEY_ID: "{{ aws_access_key_id | default('') | b64encode }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key | default('') | b64encode }}"
+  when:
+    - aws_access_key_id is defined
+    - aws_access_key_id | length > 0
+  no_log: true
+
+- name: Template and deploy CronJob
+  ansible.builtin.template:
+    src: cronjob.yml.j2
+    dest: /tmp/ml-training-cronjob.yml
+    mode: '0644'
+  register: template_result
+
+- name: Apply CronJob to cluster
+  ansible.builtin.command:
+    cmd: kubectl apply -f /tmp/ml-training-cronjob.yml
+  register: apply_result
+  changed_when: "'created' in apply_result.stdout or 'configured' in apply_result.stdout"
+
+- name: Verify CronJob deployment
+  ansible.builtin.command:
+    cmd: kubectl get cronjob -n "{{ ml_training_namespace }}" ml-training-job
+  register: verify_result
+  changed_when: false
+
+- name: Display CronJob status
+  ansible.builtin.debug:
+    msg: "{{ verify_result.stdout }}"
+
+- name: Cleanup temporary files
+  ansible.builtin.file:
+    path: /tmp/ml-training-cronjob.yml
+    state: absent
+
+- name: Cleanup image tar file from localhost
+  ansible.builtin.file:
+    path: "{{ ml_training_image_temp_dir }}/ml-training-image.tar"
+    state: absent
+  when: ml_training_image_temp_dir is defined
+
+- name: Display deployment summary
+  ansible.builtin.debug:
+    msg: |
+      ╔══════════════════════════════════════════════════════════════╗
+      ║          ML Training CronJob Deployed ✓                        ║
+      ╠══════════════════════════════════════════════════════════════╣
+      ║  Namespace: {{ ml_training_namespace }}                        ║
+      ║  Schedule: Every Sunday at 2 AM UTC                             ║
+      ║  Image: {{ ml_training_image }}                                ║
+      ║                                                                 ║
+      ║  Next Training Run: Next Sunday 2 AM UTC                       ║
+      ║                                                                 ║
+      ║  To run manually now:                                           ║
+      ║    kubectl create job --from=cronjob/ml-training-job \\         ║
+      ║      --name=ml-manual-$(date +%s) -n {{ ml_training_namespace }}  ║
+      ║                                                                 ║
+      ║  To view logs:                                                  ║
+      ║    kubectl logs -n {{ ml_training_namespace }} \\               ║
+      ║      -l app=ml-training --tail=-f                               ║
+      ╚══════════════════════════════════════════════════════════════╝

@@ -1,0 +1,78 @@
+---
+# Distribute Docker image to K3s worker nodes
+# This task file runs on worker nodes to load the ML training image
+
+- name: Display node information
+  ansible.builtin.debug:
+    msg: |
+      ╔══════════════════════════════════════════════════════════════╗
+      ║  Distributing ML Training Image to Worker Node                ║
+      ╠══════════════════════════════════════════════════════════════╣
+      ║  Target Node: {{ inventory_hostname }}                        ║
+      ║  Image: {{ ml_training_image }}                                ║
+      ╚══════════════════════════════════════════════════════════════╝
+
+- name: Check if Docker is available on worker
+  ansible.builtin.command: which docker
+  register: docker_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if Docker is not available
+  ansible.builtin.fail:
+    msg: "Docker is not installed on {{ inventory_hostname }}. Cannot load ML training image."
+  when: docker_check.rc != 0
+
+- name: Create temporary directory for image transfer
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: _ml_image_transfer
+  register: worker_temp_dir
+
+- name: Copy image tar file to worker
+  ansible.builtin.copy:
+    src: "{{ hostvars['localhost']['ml_training_image_temp_dir'] }}/ml-training-image.tar"
+    dest: "{{ worker_temp_dir.path }}/ml-training-image.tar"
+    mode: '0644'
+  register: copy_result
+
+- name: Display transfer result
+  ansible.builtin.debug:
+    msg: "Image transferred to {{ worker_temp_dir.path }}/ml-training-image.tar"
+
+- name: Load Docker image on worker
+  ansible.builtin.command:
+    cmd: docker load -i {{ worker_temp_dir.path }}/ml-training-image.tar
+  register: docker_load
+  changed_when: "'Loaded image' in docker_load.stdout"
+
+- name: Display load result
+  ansible.builtin.debug:
+    msg: "{{ docker_load.stdout }}"
+
+- name: Verify image is available on worker
+  ansible.builtin.command:
+    cmd: docker images {{ ml_training_image }} --format "{{ '{{.Repository}}:{{.Tag}} ({{.Size}})' }}"
+  register: image_verify
+  changed_when: false
+
+- name: Display verified image
+  ansible.builtin.debug:
+    msg: "Image available on {{ inventory_hostname }}: {{ image_verify.stdout }}"
+
+- name: Cleanup temporary files on worker
+  ansible.builtin.file:
+    path: "{{ worker_temp_dir.path }}/ml-training-image.tar"
+    state: absent
+
+- name: Display distribution complete message
+  ansible.builtin.debug:
+    msg: |
+      ╔══════════════════════════════════════════════════════════════╗
+      ║  Image Distribution Complete ✓                               ║
+      ╠══════════════════════════════════════════════════════════════╣
+      ║  Node: {{ inventory_hostname }}                               ║
+      ║  Image: {{ ml_training_image }}                                ║
+      ║                                                                 ║
+      ║  This node can now run ML training jobs.                       ║
+      ╚══════════════════════════════════════════════════════════════╝

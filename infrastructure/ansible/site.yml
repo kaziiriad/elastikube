@@ -4,6 +4,7 @@
 # - K3s master with Prometheus (NodePort 30900 for Lambda access)
 # - K3s worker nodes
 # - S3 integration for autoscaler Lambda (bootstrap script deployment)
+# - ML Training CronJob (optional, when deploy_ml_training flag is set)
 
 - hosts: k3s_cluster
   become: true
@@ -37,3 +38,50 @@
     s3_key: user-data/worker-bootstrap.sh
   roles:
     - k3s-worker-bootstrap
+
+# Deploy ML Training CronJob (optional - only runs when deploy_ml_training=true)
+# PHASE 1: Build Docker image on localhost
+- hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    cluster_name: production-k3s
+    aws_region: ap-southeast-1
+    s3_bucket_name: k3s-models
+    ml_training_days: 30
+  tasks:
+    - name: Build ML Training Docker image
+      ansible.builtin.include_role:
+        name: ml-training-cronjob
+        tasks_from: build-image.yml
+  when: deploy_ml_training | default(false) | bool
+
+# PHASE 2: Distribute image to worker nodes
+- hosts: workers
+  become: true
+  gather_facts: true
+  vars:
+    ml_training_image: k3s-ml-training:latest
+  tasks:
+    - name: Include image distribution tasks
+      ansible.builtin.include_role:
+        name: ml-training-cronjob
+        tasks_from: distribute-image.yml
+  when: deploy_ml_training | default(false) | bool
+  serial: 1  # Distribute to workers one at a time
+
+# PHASE 3: Deploy CronJob to cluster
+- hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    cluster_name: production-k3s
+    aws_region: ap-southeast-1
+    s3_bucket_name: k3s-models
+    ml_training_days: 30
+  tasks:
+    - name: Deploy ML Training CronJob
+      ansible.builtin.include_role:
+        name: ml-training-cronjob
+        tasks_from: deploy-cronjob.yml
+  when: deploy_ml_training | default(false) | bool

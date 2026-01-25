@@ -1,0 +1,103 @@
+---
+# Build Docker image for ML Training
+# This task file builds the image and saves it to a tar file for distribution
+
+- name: Display ML Training Image Build configuration
+  ansible.builtin.debug:
+    msg: |
+      ╔══════════════════════════════════════════════════════════════╗
+      ║          Building ML Training Docker Image                     ║
+      ╠══════════════════════════════════════════════════════════════╣
+      ║  Image: {{ ml_training_image }}                                 ║
+      ║  Context: {{ ml_training_context_path }}                        ║
+      ║  Dockerfile: {{ ml_training_dockerfile_path }}                  ║
+      ╚══════════════════════════════════════════════════════════════╝
+
+- name: Check if Docker is available
+  ansible.builtin.command: which docker
+  register: docker_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if Docker is not available
+  ansible.builtin.fail:
+    msg: "Docker is not installed on localhost. Please install Docker to build the ML training image."
+  when: docker_check.rc != 0
+
+- name: Display Docker version
+  ansible.builtin.command: docker --version
+  register: docker_version
+  changed_when: false
+
+- name: Display Docker version
+  ansible.builtin.debug:
+    msg: "{{ docker_version.stdout }}"
+
+# TODO(human): Add logic to detect if image rebuild is needed
+# For now, we'll always rebuild to ensure latest code is included
+# In production, you might want to check if the image already exists
+# and only rebuild if the Dockerfile or source files have changed.
+# Consider using: docker images --format "{{ '{{.ID}}'}}" k3s-ml-training:latest
+# and comparing file modification times.
+
+- name: Build ML Training Docker image
+  ansible.builtin.command:
+    cmd: >
+      docker build
+      -f {{ ml_training_dockerfile_path }}
+      -t {{ ml_training_image }}
+      {{ ml_training_context_path }}
+  args:
+    chdir: "{{ playbook_dir }}/../.."
+  register: docker_build
+  # TODO(human): Add changed_when logic to detect if image was actually rebuilt
+  # You can parse the docker build output to check if "Successfully built" appears
+  # or compare image digests before and after build
+
+- name: Display build result
+  ansible.builtin.debug:
+    msg: |
+      Docker image build completed:
+      Image: {{ ml_training_image }}
+      {{ docker_build.stdout_lines | select('search', '(Successfully|Step|>|->)') | list | join('\n') }}
+
+- name: Create temporary directory for image export
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: _ml_training_image
+  register: temp_dir
+
+- name: Save Docker image to tar file
+  ansible.builtin.command:
+    cmd: docker save {{ ml_training_image }} -o {{ temp_dir.path }}/ml-training-image.tar
+  register: docker_save
+
+- name: Display saved image size
+  ansible.builtin.shell: |
+    SIZE_BYTES=$(stat -c%s {{ temp_dir.path }}/ml-training-image.tar)
+    SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+    echo "Image archive size: ${SIZE_MB}MB"
+  register: image_size
+  changed_when: false
+
+- name: Display image size
+  ansible.builtin.debug:
+    msg: "{{ image_size.stdout }}"
+
+- name: Display build complete message
+  ansible.builtin.debug:
+    msg: |
+      ╔══════════════════════════════════════════════════════════════╗
+      ║  Image Build Complete ✓                                      ║
+      ╠══════════════════════════════════════════════════════════════╣
+      ║  Image: {{ ml_training_image }}                                ║
+      ║  Archive: {{ temp_dir.path }}/ml-training-image.tar         ║
+      ║  {{ image_size.stdout }}                                              ║
+      ║                                                                 ║
+      ║  Next: Image will be distributed to worker nodes...            ║
+      ╚══════════════════════════════════════════════════════════════╝
+
+- name: Set fact for temp directory path (used by distribute-image.yml)
+  ansible.builtin.set_fact:
+    ml_training_image_temp_dir: "{{ temp_dir.path }}"
+    cacheable: true
