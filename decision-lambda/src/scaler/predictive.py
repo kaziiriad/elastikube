@@ -10,10 +10,9 @@ Environment variables:
     PREDICTION_HORIZON_MINUTES: Minutes ahead to predict (default: 15)
 """
 
-import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 import boto3
@@ -42,7 +41,7 @@ class CPUPredictor:
         """
         try:
             from prophet import Prophet
-            from prophet.serializers import model_from_json
+            from prophet.serialize import model_from_json
         except ImportError:
             raise ImportError(
                 "prophet package not found. Add 'prophet' to Lambda dependencies. "
