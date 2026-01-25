@@ -1,14 +1,16 @@
 """Scaling decision engine.
 
 Determines when to scale up or down based on:
-- CPU usage
+- CPU usage (current and predicted)
 - Memory usage
 - Pending pods
 - Cooldown periods
 - Min/max node limits
 - Time of day (Layer 2: Time-Aware Scaling)
+- ML prediction (Layer 4: Predictive Scaling)
 """
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime, timezone
@@ -18,6 +20,15 @@ from state.cluster_state import ClusterState
 from utils.config import get_config
 from scaler.time_aware import get_time_period, get_thresholds_for_period
 from scaler.flash_sale import FlashSaleDetector
+
+# Layer 4: Predictive Scaling (optional, lazy-loaded)
+try:
+    from scaler.predictive import get_cpu_prediction
+    PREDICTIVE_AVAILABLE = True
+except ImportError:
+    PREDICTIVE_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 
 class ScalingAction(str, Enum):
@@ -119,6 +130,30 @@ class ScalingEngine:
                 f"scale_down_threshold={scale_down_threshold}%"
             )
 
+        # Layer 4: Predictive Scaling - Get CPU prediction
+        # Use predicted CPU for scale-up decisions (proactive)
+        # Use current CPU for scale-down decisions (conservative)
+        predicted_cpu = None
+        cpu_for_scale_up = metrics.worker_cpu_percent_avg  # Default to current
+
+        if PREDICTIVE_AVAILABLE:
+            prediction = get_cpu_prediction(current_timestamp=now)
+            if prediction:
+                predicted_cpu = prediction["predicted_cpu"]
+                cpu_for_scale_up = predicted_cpu
+
+                # Log prediction vs current
+                cpu_diff = predicted_cpu - metrics.worker_cpu_percent_avg
+                logger.info(
+                    f"Layer 4 Predictive Scaling: Current CPU={metrics.worker_cpu_percent_avg:.1f}%, "
+                    f"Predicted CPU (+{prediction['horizon_minutes']}min)={predicted_cpu:.1f}% "
+                    f"(Δ{cpu_diff:+.1f}%)"
+                )
+            else:
+                logger.debug("Predictive scaling not available, using current CPU")
+        else:
+            logger.debug("Predictive scaling module not available")
+
         # Check cooldown periods
         # Scale-up cooldown blocks ALL scale-up operations
         if state.is_in_cooldown(self._config.scale_up_cooldown):
@@ -134,7 +169,8 @@ class ScalingEngine:
 
         # Check scale-up conditions FIRST (before scale-down cooldown)
         # Pending pods should ALWAYS trigger scale-up, regardless of scale-down cooldown
-        cpu_trigger = metrics.worker_cpu_percent_avg >= scale_up_threshold
+        # Layer 4: Use predicted CPU for scale-up decisions (proactive scaling)
+        cpu_trigger = cpu_for_scale_up >= scale_up_threshold
         pods_trigger = metrics.pending_pods >= 1
 
         if (cpu_trigger or pods_trigger) and current_nodes < self._config.max_nodes:
@@ -143,17 +179,21 @@ class ScalingEngine:
                 reason = f"Pending pods ({metrics.pending_pods}) >= 1"
             else:
                 period_info = f" [{period}]" if period else ""
+                # Indicate if prediction was used
+                cpu_source = "Predicted CPU" if predicted_cpu is not None else "Worker CPU"
                 reason = (
-                    f"Worker CPU ({metrics.worker_cpu_percent_avg:.1f}%) >= threshold "
+                    f"{cpu_source} ({cpu_for_scale_up:.1f}%) >= threshold "
                     f"({scale_up_threshold}%){period_info}"
                 )
+                if predicted_cpu is not None:
+                    reason += f" [Current: {metrics.worker_cpu_percent_avg:.1f}%]"
 
             return ScalingDecision(
                 action=ScalingAction.SCALE_UP,
                 reason=reason,
                 current_nodes=current_nodes,
                 target_nodes=current_nodes + 1,
-                cpu_percent=metrics.worker_cpu_percent_avg,
+                cpu_percent=cpu_for_scale_up,  # Record the CPU value that triggered
                 memory_percent=metrics.worker_memory_percent_avg,
                 pending_pods=metrics.pending_pods,
             )
