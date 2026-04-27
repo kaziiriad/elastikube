@@ -1,0 +1,64 @@
+---
+# K3s Worker Preinstall Role
+# Installs base tools: awscli, curl, jq, ca-certificates, SSM Agent (via snap)
+# These are pre-baked into AMI for fast worker bootstrap
+# Assumes Ubuntu (Debian-based) - no conditional checks needed
+
+- name: Update apt cache
+  become: true
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install utility tools
+  become: true
+  ansible.builtin.apt:
+    name:
+      - curl
+      - jq
+      - ca-certificates
+    state: present
+
+- name: Install awscli
+  become: true
+  ansible.builtin.apt:
+    name:
+      - awscli
+    state: present
+  ignore_errors: true
+
+- name: Check if awscli is available
+  ansible.builtin.command:
+    cmd: which aws
+  register: aws_check
+  changed_when: false
+  failed_when: false
+
+- name: Install awscli via pip if apt fails
+  become: true
+  ansible.builtin.pip:
+    name: awscli
+    executable: pip3
+  when: aws_check.rc != 0
+
+- name: Install Amazon SSM Agent via snap
+  become: true
+  community.general.snap:
+    name: amazon-ssm-agent
+    state: present
+  ignore_errors: true
+
+- name: Start SSM Agent service
+  become: true
+  ansible.builtin.service:
+    name: snap.amazon-ssm-agent.amazon-ssm-agent
+    state: started
+    enabled: true
+
+- name: Check SSM Agent status
+  ansible.builtin.command:
+    cmd: snap list amazon-ssm-agent
+  register: ssm_status
+  changed_when: false
+  failed_when: false
+  ignore_errors: true

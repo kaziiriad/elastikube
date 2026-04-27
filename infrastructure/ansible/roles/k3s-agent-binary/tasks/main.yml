@@ -1,0 +1,66 @@
+---
+# K3s Agent Binary Role
+# Installs K3s binary only (does NOT start service or join cluster)
+# Binary ready for user-data to start k3s-agent at launch time
+
+- name: Stop and disable all k3s services
+  become: true
+  ansible.builtin.shell: |
+    systemctl stop k3s-agent 2>/dev/null || true
+    systemctl stop k3s 2>/dev/null || true
+    systemctl disable k3s-agent 2>/dev/null || true
+    systemctl disable k3s 2>/dev/null || true
+    systemctl mask k3s-agent 2>/dev/null || true
+    systemctl mask k3s 2>/dev/null || true
+  changed_when: false
+  failed_when: false
+
+- name: Kill any existing k3s processes
+  become: true
+  ansible.builtin.shell: pkill -9 -f "k3s" 2>/dev/null || true
+  changed_when: false
+  failed_when: false
+
+- name: Remove all k3s state and service files
+  become: true
+  ansible.builtin.shell: |
+    rm -rf /var/lib/rancher/k3s/agent/lib/k3s/agent-statefile 2>/dev/null || true
+    rm -rf /var/lib/rancher/k3s/agent/lib/k3s/data 2>/dev/null || true
+    rm -f /etc/systemd/system/k3s-agent.service 2>/dev/null || true
+    rm -f /etc/systemd/system/k3s.service 2>/dev/null || true
+    rm -f /etc/systemd/system/k3s-agent.env 2>/dev/null || true
+    rm -f /etc/systemd/system/k3s.service.env 2>/dev/null || true
+    rm -rf /run/k3s 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+  changed_when: false
+  failed_when: false
+
+- name: Download and install K3s binary as agent (not server)
+  ansible.builtin.shell: |
+    curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_SKIP_START=true \
+      INSTALL_K3S_NAME=k3s-agent \
+      INSTALL_K3S_BIN_DIR=/usr/local/bin \
+      INSTALL_K3S_SYSTEMD_NAME=k3s-agent \
+      sh -
+  args:
+    creates: /usr/local/bin/k3s
+  environment:
+    K3S_CHANNEL: stable
+
+- name: Verify K3s binary exists
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: Set K3s binary executable
+  ansible.builtin.file:
+    path: /usr/local/bin/k3s
+    mode: '0755'
+  when: k3s_binary.stat.exists
+
+- name: Verify K3s version
+  ansible.builtin.command:
+    cmd: k3s --version
+  register: k3s_version
+  changed_when: false

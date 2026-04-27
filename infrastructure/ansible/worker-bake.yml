@@ -1,0 +1,134 @@
+---
+# K3s Worker AMI Bake Playbook
+# Launches temporary instance, provisions it, creates AMI, writes SSM Parameter, terminates
+
+- name: Bake K3s Worker AMI
+  hosts: localhost
+  gather_facts: true
+  vars:
+    cluster_name: "production-k3s"
+    base_ami_id: "ami-0c687e8f5c4e54af5"
+    instance_type: "t3.small"
+    region: "ap-southeast-1"
+    ssh_key_name: "MyKeyPair"
+  environment:
+    AWS_PROFILE: "{{ aws_profile | default('k3s-temp-user') }}"
+    AWS_REGION: "{{ region }}"
+
+  tasks:
+    - name: Get current date for AMI naming
+      ansible.builtin.shell: date +%Y%m%d-%H%M%S
+      register: ami_date_output
+      changed_when: false
+
+    - name: Get security group ID from SSM Parameter
+      ansible.builtin.shell: |
+        aws ssm get-parameter --name "/k3s/{{ cluster_name }}/security-group-id" \
+          --query "Parameter.Value" --output text --region {{ region }}
+      register: sg_param
+      changed_when: false
+
+    - name: Get subnet IDs from SSM Parameter
+      ansible.builtin.shell: |
+        aws ssm get-parameter --name "/k3s/{{ cluster_name }}/worker-subnet-ids" \
+          --query "Parameter.Value" --output text --region {{ region }}
+      register: subnet_param
+      changed_when: false
+
+    - name: Parse subnet IDs from JSON
+      ansible.builtin.set_fact:
+        subnet_ids: "{{ subnet_param.stdout | from_json }}"
+        security_group_id: "{{ sg_param.stdout }}"
+
+    - name: Display fetched infrastructure IDs
+      ansible.builtin.debug:
+        msg:
+          - "Security Group: {{ security_group_id }}"
+          - "Subnet IDs: {{ subnet_ids }}"
+          - "Using first subnet for bake: {{ subnet_ids[0] }}"
+
+    - name: Launch temporary instance for baking
+      amazon.aws.ec2_instance:
+        name: "k3s-bake-temp"
+        image_id: "{{ base_ami_id }}"
+        instance_type: "{{ instance_type }}"
+        state: running
+        wait: true
+        wait_timeout: 300
+        key_name: "{{ ssh_key_name }}"
+        security_group: "{{ security_group_id }}"
+        vpc_subnet_id: "{{ subnet_ids[0] }}"
+        user_data: |
+          #!/bin/bash
+          # Cloud-init handles provisioning automatically
+        tags:
+          BakePurpose: "ami-bake"
+          Name: "k3s-bake-temp"
+      register: bake_instance
+
+    - name: Wait for SSH connection
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 120
+        sleep: 5
+
+    - name: Run k3s-worker-preinstall role on bake instance
+      ansible.builtin.shell: |
+        ansible all -i "{{ bake_instance.instances[0].private_ip_address }}," \
+          --ssh-common-args='-o StrictHostKeyChecking=no -o ProxyJump=k3s-bastion' \
+          -u ubuntu \
+          --private-key=~/.ssh/{{ ssh_key_name }}.pem \
+          -m include_role -a "name=k3s-worker-preinstall"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Run k3s-agent-binary role on bake instance
+      ansible.builtin.shell: |
+        ansible all -i "{{ bake_instance.instances[0].private_ip_address }}," \
+          --ssh-common-args='-o StrictHostKeyChecking=no -o ProxyJump=k3s-bastion' \
+          -u ubuntu \
+          --private-key=~/.ssh/{{ ssh_key_name }}.pem \
+          -m include_role -a "name=k3s-agent-binary"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Create AMI from bake instance
+      amazon.aws.ec2_ami:
+        instance_id: "{{ bake_instance.instances[0].instance_id }}"
+        name: "k3s-worker-{{ cluster_name }}-{{ ami_date_output.stdout }}"
+        description: "K3s worker AMI with pre-installed SSM Agent, awscli, curl, jq, k3s binary"
+        state: present
+        wait: true
+        wait_timeout: 600
+        tags:
+          Name: "k3s-worker-{{ cluster_name }}-{{ ami_date_output.stdout }}"
+          Cluster: "{{ cluster_name }}"
+          CreatedBy: "ansible-bake"
+          Date: "{{ ami_date_output.stdout }}"
+      register: ami_result
+
+    - name: Write AMI ID to SSM Parameter
+      community.aws.ssm_parameter:
+        name: "/k3s/{{ cluster_name }}/worker-ami-id"
+        value: "{{ ami_result.image_id }}"
+        string_type: String
+        overwrite_value: always
+      register: ssm_result
+
+    - name: Display bake results
+      ansible.builtin.debug:
+        msg:
+          - "AMI ID: {{ ami_result.image_id }}"
+          - "AMI Name: k3s-worker-{{ cluster_name }}-{{ ami_date_output.stdout }}"
+          - "SSM Parameter: /k3s/{{ cluster_name }}/worker-ami-id updated"
+          - "Instance ID: {{ bake_instance.instances[0].instance_id }}"
+
+    - name: Terminate bake instance
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ bake_instance.instances[0].instance_id }}"
+        state: terminated
+        wait: true
+        wait_timeout: 300
