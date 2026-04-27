@@ -1,0 +1,55 @@
+---
+# K3s AMI Lifecycle Playbook
+# Deregisters AMIs older than 2 most recent per cluster
+# Deletes associated EBS snapshots
+
+- name: K3s AMI Lifecycle Management
+  hosts: localhost
+  gather_facts: true
+  vars:
+    cluster_name: "production-k3s"
+    region: "ap-southeast-1"
+    ami_retain_count: 2
+  environment:
+    AWS_PROFILE: "{{ aws_profile | default('k3s-temp-user') }}"
+    AWS_REGION: "{{ region }}"
+
+  tasks:
+    - name: Describe all AMIs for cluster
+      amazon.aws.ec2_ami_info:
+        filters:
+          tag:Cluster: "{{ cluster_name }}"
+          tag:CreatedBy: "ansible-bake"
+        owners: "self"
+      register: all_amis
+
+    - name: Sort AMIs by creation date (newest first)
+      ansible.builtin.set_fact:
+        sorted_amis: "{{ all_amis.images | sort(attribute='creation_date', reverse=true) }}"
+
+    - name: Identify AMIs to deregister
+      ansible.builtin.set_fact:
+        amis_to_delete: "{{ sorted_amis[ami_retain_count:] | default([]) }}"
+
+    - name: Display AMI lifecycle info
+      ansible.builtin.debug:
+        msg:
+          - "Total AMIs found: {{ all_amis.images | length }}"
+          - "Retaining: {{ ami_retain_count }} newest AMIs"
+          - "Will deregister: {{ amis_to_delete | length }} AMIs"
+          - "AMIs to keep: {{ sorted_amis[:ami_retain_count] | map(attribute='name') | list }}"
+
+    - name: Deregister old AMIs
+      amazon.aws.ec2_ami:
+        image_id: "{{ item.image_id }}"
+        state: absent
+        delete_snapshot: true
+      loop: "{{ amis_to_delete }}"
+      when: amis_to_delete | length > 0
+
+    - name: Display deregistration results
+      ansible.builtin.debug:
+        msg:
+          - "Deregistered {{ amis_to_delete | length }} old AMIs"
+          - "Retained {{ ami_retain_count }} newest AMIs"
+      when: amis_to_delete | length > 0

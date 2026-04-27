@@ -28,6 +28,7 @@ flowchart TB
         EC2API["EC2 API<br/>(Launch/Terminate Instances)"]
     end
 
+
     %% Main Flow
     EventBridge -->|"Trigger"| Lambdas
     Prometheus <-->|"Query metrics<br/>(HTTP:30900)"| Lambdas
@@ -61,7 +62,7 @@ flowchart TB
 | **WAL** | Write-Ahead Log for crash recovery | DynamoDB |
 | **EventBridge** | Orchestrates Lambda chaining | AWS EventBridge |
 | **Metrics Collection** | Cluster metrics scraping | Prometheus (in-cluster) |
-| **Token Storage** | K3s join token & bootstrap scripts | AWS S3 |
+| **Token Storage** | K3s join token, master IP, bootstrap scripts | AWS Secrets Manager, SSM Parameter Store, S3 |
 | **Monitoring** | Logs, metrics, dashboards | CloudWatch |
 
 
@@ -1665,6 +1666,23 @@ Tested with 30 days of synthetic metrics data generated to simulate realistic cl
 
 ## Recent Enhancements
 
+
+**v1.3 - Fast Worker Bootstrap with Pre-Baked AMI**
+
+| Feature | Description |
+|---------|-------------|
+| **Pre-Baked AMI** | K3s binary, SSM Agent, awscli, curl, jq, ca-certificates pre-installed. Bootstrap downloads nothing. |
+| **k3s-worker-preinstall role** | Ansible role installs all dependencies except k3s binary |
+| **k3s-agent-binary role** | Ansible role installs k3s as agent (not server) to avoid port 6443 conflicts |
+| **worker-bake.yml** | Standalone playbook: launch temp instance → provision → snapshot AMI → write SSM → terminate |
+| **Bake integrated in site.yml** | AMI bake section in main playbook, enabled via `bake_ami=true` flag |
+| **Bootstrap ~91s → ~30s** | Eliminates curl\|sh install step per launch |
+| **Auto-detect network iface** | `PRIMARY_IFACE=$(ip route show default \| awk '{print $5}')` handles both ens5 and eth0 |
+| **Lambda SSM-only AMI** | Removed `AMI_ID` env var fallback; reads from `/k3s/{cluster_name}/worker-ami-id` only |
+
+**Key fixes:** `unable to find interface eth0` (ens5 on ENA) · `token must not be empty` (wrong Secrets Manager query, removed `--token-file=/dev/null`)
+
+**Bake:** `AWS_PROFILE=k3s-temp-user ansible-playbook site.yml -i inventory/hosts.ini -e bake_ami=true`
 
 **v1.2 - ML Training Pipeline + Predictive Scaling (Latest)**
 
