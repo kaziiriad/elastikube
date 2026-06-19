@@ -21,7 +21,7 @@
         "metrics": [
           ["K3sAutoscaler", "WorkerCPU", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "gauge",
+        "view": "timeSeries",
         "region": "ap-southeast-1",
         "period": 60,
         "yAxis": {"left": {"min": 0, "max": 100}}
@@ -38,7 +38,7 @@
         "metrics": [
           ["K3sAutoscaler", "WorkerMemory", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "gauge",
+        "view": "timeSeries",
         "region": "ap-southeast-1",
         "period": 60,
         "yAxis": {"left": {"min": 0, "max": 100}}
@@ -56,10 +56,9 @@
           ["K3sAutoscaler", "ReadyNodes", "Cluster", "k3s-cluster", {"stat": "Average"}],
           ["K3sAutoscaler", "TotalNodes", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "singleValue",
+        "view": "timeSeries",
         "region": "ap-southeast-1",
-        "period": 60,
-        "yAxis": {"left": {"min": 0}}
+        "period": 60
       }
     },
     {
@@ -73,7 +72,7 @@
         "metrics": [
           ["K3sAutoscaler", "WorkerCount", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "singleValue",
+        "view": "timeSeries",
         "region": "ap-southeast-1",
         "period": 60
       }
@@ -89,7 +88,7 @@
         "metrics": [
           ["K3sAutoscaler", "PendingPods", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "singleValue",
+        "view": "timeSeries",
         "region": "ap-southeast-1",
         "period": 60,
         "annotations": {
@@ -112,7 +111,7 @@
         "metrics": [
           ["K3sAutoscaler", "MasterCPU", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "gauge",
+        "view": "timeSeries",
         "region": "ap-southeast-1",
         "period": 60,
         "yAxis": {"left": {"min": 0, "max": 100}}
@@ -129,7 +128,7 @@
         "metrics": [
           ["K3sAutoscaler", "MasterMemory", "Cluster", "k3s-cluster", {"stat": "Average"}]
         ],
-        "view": "gauge",
+        "view": "timeSeries",
         "region": "ap-southeast-1",
         "period": 60,
         "yAxis": {"left": {"min": 0, "max": 100}}
@@ -163,7 +162,7 @@
         "metrics": [
           ["AWS/Lambda", "Errors"]
         ],
-        "view": "singleValue",
+        "view": "timeSeries",
         "region": "ap-southeast-1",
         "period": 300,
         "stat": "Sum"
@@ -197,7 +196,7 @@
         "metrics": [
           ["AWS/Lambda", "ConcurrentExecutions"]
         ],
-        "view": "singleValue",
+        "view": "timeSeries",
         "region": "ap-southeast-1",
         "period": 300,
         "stat": "Maximum"
@@ -326,8 +325,8 @@
       "width": 24,
       "height": 6,
       "properties": {
-        "title": "Cleanup Lambda Logs (Failed Instance Removal)",
-        "query": "SOURCE '/aws/lambda/k3s-autoscaler-cleanup'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 30",
+        "title": "All Lambda Logs (Recent)",
+        "query": "fields @timestamp, @logStream, @message\n| filter @logStream like /k3s|scale/\n| sort @timestamp desc\n| limit 50",
         "region": "ap-southeast-1"
       }
     }

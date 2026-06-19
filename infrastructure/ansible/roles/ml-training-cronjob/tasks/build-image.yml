@@ -47,8 +47,6 @@
       -f {{ ml_training_dockerfile_path }}
       -t {{ ml_training_image }}
       {{ ml_training_context_path }}
-  args:
-    chdir: "{{ playbook_dir }}/../.."
   register: docker_build
   # TODO(human): Add changed_when logic to detect if image was actually rebuilt
   # You can parse the docker build output to check if "Successfully built" appears

@@ -194,6 +194,33 @@ def lambda_handler(event: dict, context: Any) -> dict:
         }
 
 
+def _get_worker_ami_id(cluster_name: str, region: str) -> str:
+    """Fetch baked AMI ID from SSM Parameter.
+
+    The AMI is baked by Ansible playbook and written to SSM Parameter
+    /k3s/{cluster_name}/worker-ami-id.
+
+    Args:
+        cluster_name: K3s cluster name
+        region: AWS region
+
+    Returns:
+        AMI ID (e.g., ami-0xxxxxxxxx)
+
+    Raises:
+        RuntimeError: If AMI ID cannot be fetched or is PENDING
+    """
+    ssm_client = boto3.client("ssm", region_name=region)
+    ami_param = ssm_client.get_parameter(
+        Name=f"/k3s/{cluster_name}/worker-ami-id"
+    )
+    ami_id = ami_param["Parameter"]["Value"]
+    if ami_id == "PENDING":
+        raise RuntimeError(f"AMI ID not ready: /k3s/{cluster_name}/worker-ami-id is PENDING")
+    logger.info(f"✓ Fetched baked AMI ID from SSM: {ami_id}")
+    return ami_id
+
+
 def _get_config() -> dict:
     """Get configuration from environment variables."""
     # Parse SUBNET_IDS JSON array if available
@@ -204,18 +231,32 @@ def _get_config() -> dict:
         logger.warning(f"Failed to parse SUBNET_IDS JSON: {subnet_ids_str}")
         subnet_ids = []
 
+    cluster_name = os.environ.get("CLUSTER_NAME", "production-k3s")
+    region = os.environ.get("AWS_REGION", "ap-southeast-1")
+
+    # Try to get AMI from SSM Parameter (baked AMI approach)
+    ami_id = None
+    try:
+        ami_id = _get_worker_ami_id(cluster_name, region)
+    except Exception as e:
+        logger.warning(f"Could not fetch AMI from SSM, using env var: {e}")
+
+    # Fallback to env var if SSM fetch fails
+    if not ami_id:
+        ami_id = os.environ.get("AMI_ID")
+
     config = {
         "subnet_ids": subnet_ids,  # Multi-AZ subnets for round-robin
         "subnet_id": os.environ.get("SUBNET_ID"),  # Primary subnet (backward compat)
         "security_group_id": os.environ.get("SECURITY_GROUP_ID"),
         "iam_instance_profile": os.environ.get("IAM_INSTANCE_PROFILE"),
-        "ami_id": os.environ.get("AMI_ID"),
+        "ami_id": ami_id,
         "instance_type": os.environ.get("INSTANCE_TYPE", "t3.small"),
         "key_name": os.environ.get("KEY_NAME"),  # SSH key pair for debugging
         "s3_bucket": os.environ.get("USER_DATA_S3_BUCKET"),
         "s3_key": os.environ.get("USER_DATA_S3_KEY"),
         "state_table_name": os.environ.get("STATE_TABLE_NAME"),
-        "cluster_name": os.environ.get("CLUSTER_NAME", "production-k3s"),
+        "cluster_name": cluster_name,
         "use_spot_instances": os.environ.get("USE_SPOT_INSTANCES", "false").lower() == "true",
         "bootstrap_timeout": int(os.environ.get("BOOTSTRAP_TIMEOUT_SECONDS", "180")),
     }

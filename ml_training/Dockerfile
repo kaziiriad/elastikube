@@ -9,6 +9,7 @@ WORKDIR /app
 # - awscli: For S3 operations (uploading trained models)
 RUN apt-get update && apt-get install -y \
     curl \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install AWS CLI for S3 operations
@@ -21,7 +22,7 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2
 RUN pip install uv
 
 # Copy ML training scripts and dependencies
-COPY ml_training/ /app/
+COPY . /app/
 
 # Install Python dependencies (uv creates .venv automatically)
 RUN uv sync --frozen
