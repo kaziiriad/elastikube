@@ -42,12 +42,11 @@ spec:
           #           values: ["permanent"]
           containers:
           - name: ml-trainer
-              image: {{ ml_training_image }}
-              imagePullPolicy: IfNotPresent
-              command:
-                - /bin/bash
-                -c
-                - |
+            image: {{ ml_training_image }}
+            imagePullPolicy: IfNotPresent
+            command: [/bin/bash, -c]
+            args:
+              - |
                   set -e
 
                   # Display node info for debugging
@@ -64,9 +63,7 @@ spec:
                   echo "[1/4] Extracting data from DynamoDB..."
                   uv run scripts/extract_data.py \
                     --days {{ ml_training_days | default(30) }} \
-                    --state-table {{ state_table_name }} \
-                    --wal-table {{ wal_table_name }} \
-                    --output-path data/metrics_samples.csv
+                    --output-dir data
 
                   # Train model
                   echo ""
@@ -152,6 +149,11 @@ spec:
               # Add node selector environment variable for logging
               - name: PERMANENT_WORKERS
                 value: "k3s-worker-1,k3s-worker-2"
+              {% if aws_access_key_id is defined and aws_access_key_id %}
+              envFrom:
+              - secretRef:
+                  name: aws-credentials
+              {% endif %}
               resources:
                 requests:
                   cpu: "500m"
@@ -167,16 +169,3 @@ spec:
             emptyDir:
               sizeLimit: "5Gi"
 
-{% if aws_access_key_id is defined and aws_access_key_id %}
----
-# AWS credentials Secret (only created if access keys provided)
-apiVersion: v1
-kind: Secret
-metadata:
-  name: aws-credentials
-  namespace: {{ ml_training_namespace }}
-type: Opaque
-data:
-  AWS_ACCESS_KEY_ID: {{ aws_access_key_id | b64encode }}
-  AWS_SECRET_ACCESS_KEY: {{ aws_secret_access_key | b64encode }}
-{% endif %}

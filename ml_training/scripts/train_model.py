@@ -192,6 +192,9 @@ class CPUForecaster:
             mape = self._calculate_mape(val_df_merged['y'], val_df_merged['yhat'])
 
             self.training_metrics = {
+                'validation_mae': mae,
+                'validation_rmse': rmse,
+                'validation_mape': mape,
                 'mae': mae,
                 'rmse': rmse,
                 'mape': mape,

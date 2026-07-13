@@ -1,5 +1,10 @@
 ---
 # ML Training CronJob - Default Variables
+# Paths are anchored to the role's own location (role_path), which is
+# infrastructure/ansible/roles/ml-training-cronjob/. From there, the
+# project root is at ../../../ and ml_training/ is at ../../../ml_training.
+# This makes the role work regardless of where the playbook is invoked
+# (e.g. from infrastructure/pulumi/, infrastructure/ansible/, or ./).
 
 # Kubernetes namespace
 ml_training_namespace: k3s-autoscaler
@@ -8,9 +13,8 @@ ml_training_namespace: k3s-autoscaler
 ml_training_image: k3s-ml-training:latest
 
 # Docker build configuration
-# Relative paths from the ansible playbook directory
-ml_training_context_path: ../../ml_training
-ml_training_dockerfile_path: ../../ml_training/Dockerfile
+ml_training_context_path: "{{ role_path }}/../../../../ml_training"
+ml_training_dockerfile_path: "{{ role_path }}/../../../../ml_training/Dockerfile"
 
 # Node selector - pin to permanent workers to prevent termination during training
 # Options:
