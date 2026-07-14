@@ -163,11 +163,9 @@ class CPUForecaster:
 
         # Make predictions on validation set
         print("Validating model...")
-        future = self.model.make_future_dataframe(
-            periods=len(val_df),
-            freq='2min',  # 2-minute intervals
-            include_history=False
-        )
+        # Use the actual validation timestamps as the future dataframe so that
+        # `ds` aligns with `val_df` even when input cadence differs from `freq`.
+        future = val_df[['ds']].copy()
 
         # Add regressor values to future dataframe
         for regressor in regressors:
@@ -464,9 +462,15 @@ def main():
     print("=" * 60)
     print(f"Model: {model_filename}")
     print(f"Prediction horizon: {args.horizon_minutes} minutes")
-    print(f"Validation MAE: {metrics.get('mae', 'N/A'):.2f} percentage points")
-    print(f"Validation RMSE: {metrics.get('rmse', 'N/A'):.2f} percentage points")
-    print(f"Validation MAPE: {metrics.get('mape', 'N/A'):.2f}%")
+    def _fmt(name: str, unit: str) -> str:
+        value = metrics.get(name)
+        if isinstance(value, (int, float)):
+            return f"{value:.2f} {unit}"
+        return f"{value} {unit}"
+
+    print(f"Validation MAE: {_fmt('mae', 'percentage points')}")
+    print(f"Validation RMSE: {_fmt('rmse', 'percentage points')}")
+    print(f"Validation MAPE: {_fmt('mape', '%')}")
     print("\nModel training complete!")
 
 

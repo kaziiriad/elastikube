@@ -40,20 +40,25 @@ Pulumi (Python) in `infrastructure/pulumi/__main__.py`. Creates VPC, EC2 instanc
 
 ## Common Commands
 
+> All commands below assume your working directory is the repository root. The repo is
+> named `elastikube/` on GitHub but lives under `production/` on the original author's
+> local checkout — both layouts share the same internal structure, so paths like
+> `decision-lambda/` and `infrastructure/pulumi/` work in either setup.
+
 ### Building Lambdas
 
 ```bash
 # Decision Lambda
-cd production/decision-lambda && ./build.sh
+cd decision-lambda && ./build.sh
 
 # Scale-Up Lambda
-cd production/scale-up-lambda && ./build.sh
+cd scale-up-lambda && ./build.sh
 
 # Scale-Down Lambda
-cd production/scale-down-lambda && ./build.sh
+cd scale-down-lambda && ./build.sh
 
 # Cleanup Lambda
-cd production/cleanup-lambda && ./build.sh
+cd cleanup-lambda && ./build.sh
 ```
 
 Each `build.sh` creates a `build/lambda.zip` deployment package using `uv` for dependency management.
@@ -61,7 +66,7 @@ Each `build.sh` creates a `build/lambda.zip` deployment package using `uv` for d
 ### Infrastructure Deployment
 
 ```bash
-cd production/infrastructure/pulumi
+cd infrastructure/pulumi
 
 # Install dependencies
 uv sync
@@ -79,7 +84,7 @@ pulumi destroy
 ### Running Decision Lambda Tests
 
 ```bash
-cd production/decision-lambda
+cd decision-lambda
 uv sync --frozen --no-dev
 pytest tests/
 ```
@@ -87,7 +92,7 @@ pytest tests/
 ### ML Training
 
 ```bash
-cd production/ml_training
+cd ml_training
 uv sync
 # Notebooks in notebooks/
 # Models in models/, data in data/, validation in validation/
@@ -179,17 +184,60 @@ Weekly CronJob that trains a Prophet model on the last 30 days of CPU/memory met
   ```
 - To test the inner pipeline (extract → train → S3 push) without k3s:
   ```sh
+  # Pin region to ap-southeast-1 so it matches extract_data.py's default and the
+  # DynamoDB tables created above. Use a floci profile (no k3s-temp-user locally).
   docker run --rm --network=host \
     -e AWS_ENDPOINT_URL=http://localhost:4566 \
     -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
     -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
-    -e AWS_DEFAULT_REGION=us-east-1 \
+    -e AWS_DEFAULT_REGION=ap-southeast-1 \
     -v $(pwd)/ml_training:/app \
     -v /tmp/ml-test:/workspace \
     k3s-ml-training:latest bash <pipeline.sh>
   ```
+  Inside the container, write a minimal floci profile so `extract_data.py --profile floci`
+  resolves:
+  ```sh
+  mkdir -p /root/.aws
+  printf '[floci]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
+    "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" > /root/.aws/credentials
+  printf '[profile floci]\nregion = %s\noutput = json\n' "$AWS_DEFAULT_REGION" \
+    > /root/.aws/config
+  ```
 
 ### Outstanding
-- DynamoDB seeding script for floci (`/tmp/populate_tables.py`) is not committed — for local tests only
-- A pandas 2.x quirk in `extract_data.py` rejects ISO timestamps with microseconds (`+00:00.123456`) — use second-precision timestamps when seeding test data
-- CloudWatch `put-metric-data` against floci silently no-ops; not validated end-to-end here
+- **Validated end-to-end against floci (this session):** `s3://k3s-models` bucket creation,
+  DynamoDB tables (`k3s-scaling-metrics-samples`, `k3s-scaling-history`) in
+  `ap-southeast-1`, `extract_data.py` → CSV → `train_model.py` → 3× `aws s3 cp`
+  (versioned model + `cpu_prophet_model.json` latest + versioned `_metrics.json`).
+  Final listing: `cpu_prophet_model.json`, `cpu_prophet_model_<UTC ts>.json`,
+  `<UTC ts>_metrics.json`.
+- **Fixed in this session:**
+  - `train_model.py` validation step used `make_future_dataframe(freq='2min')`, which
+    produced zero matches against validation rows at any cadence other than 2 min,
+    silently writing an empty `_metrics.json`. Now uses `val_df[['ds']]` directly so
+    real MAE/RMSE/MAPE are computed for whatever cadence the input has.
+  - `train_model.py` final summary used `f"{metrics.get(k, 'N/A'):.2f}"`, which crashed
+    with `ValueError: Unknown format code 'f' for object of type 'str'` whenever the
+    metric was missing. Now guarded with a small `_fmt()` helper that handles strings.
+- **Open issues (still pending):**
+  - DynamoDB seeding script for floci (`/tmp/seed_dynamo.py` on host, regenerated each
+    run) is not committed — for local tests only. Lives at `/tmp/seed_dynamo.py`; uses
+    `Decimal` for floats (boto3 rejects `float`).
+  - Pandas 2.x quirk in `extract_data.py` rejects ISO timestamps with microseconds
+    (`+00:00.123456`). Seed data must use second-precision timestamps.
+  - `extract_data.py` defaults `--profile=k3s-temp-user`. For local runs without a
+    real `k3s-temp-user` profile, create a profile in `/root/.aws/{credentials,config}`
+    inside the container (e.g. `[profile floci]`) and pass `--profile floci`.
+  - CloudWatch `put-metric-data` against floci silently no-ops; not validated
+    end-to-end here. Requires real AWS.
+  - `infrastructure/pulumi/__main__.py` does not create the `k3s-models` S3 bucket and
+    does not wire `PROPHET_MODEL_S3_BUCKET` / `PROPHET_MODEL_S3_KEY` /
+    `PREDICTIVE_SCALING_ENABLED` into the decision Lambda env, so `predictive.py`
+    always returns `None`. Decision Lambda predictive scaling is therefore disabled
+    in production until this is added.
+  - CronJob `nodeSelector: k3s-worker: "k3s-worker-1,k3s-worker-2"` is invalid —
+    `nodeSelector` matches one label value, not a comma list. Pods stay `Pending`.
+    Use `nodeAffinity` (already commented in the template) for real two-node pinning.
+  - Ansible inventory and `ansible.cfg` hard-code `MyKeyPair` / `~/.ssh/MyKeyPair.pem`;
+    blocks portability for non-localhost runs.

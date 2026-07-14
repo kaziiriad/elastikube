@@ -120,7 +120,6 @@ Installs K3s binary without joining cluster:
 ## File Structure
 
 ```
-production/
 ├── scale-up-lambda/
 │   └── main.py                           # [MODIFIED] Read AMI from SSM
 │

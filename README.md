@@ -1055,7 +1055,6 @@ cd monitoring/scripts
 ## Directory Structure
 
 ```
-production/
 ├── .github/workflows.disabled/  # Disabled GitHub Actions workflows
 ├── infrastructure/
 │   ├── pulumi/                 # Pulumi IaC for AWS resources
