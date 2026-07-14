@@ -170,8 +170,9 @@ Weekly CronJob that trains a Prophet model on the last 30 days of CPU/memory met
 - **extract_data.py arg mismatch**: CronJob passed `--state-table`/`--wal-table`/`--output-path`, but the script accepts `--metrics-table`/`--history-table`/`--output-dir`. Removed the bogus overrides so the script's defaults (`k3s-scaling-metrics-samples`, `k3s-scaling-history`) are used.
 - **train_model.py metric keys**: CronJob read `.validation_mae`/`.validation_rmse` from metrics JSON, but the script only saved `mae`/`rmse`. Added `validation_mae`/`validation_rmse`/`validation_mape` keys alongside the originals.
 - **Docker context path brittleness**: `defaults/main.yml` had hardcoded `../../ml_training` (broken from any cwd other than `infrastructure/ansible/`). Changed to `{{ role_path }}/../../../../ml_training` so paths resolve from the role's location, regardless of where the playbook is invoked (pulumi/, ansible/, ./).
-- **CronJob nodeSelector → nodeAffinity**: `nodeSelector: k3s-worker: "k3s-worker-1,k3s-worker-2"` matched nothing (nodeSelector takes one value, not a comma list). Swapped to `nodeAffinity` with `operator: In` and a Jinja-rendered values list parsed from the existing `ml_training_node_selector` Ansible var via `split(',')`. Note: still won't schedule until the `k3s-worker` Kubernetes label is actually applied to nodes (open issue).
+- **CronJob nodeSelector → nodeAffinity**: `nodeSelector: k3s-worker: "k3s-worker-1,k3s-worker-2"` matched nothing (nodeSelector takes one value, not a comma list). Swapped to `nodeAffinity` with `operator: In` and a Jinja-rendered values list parsed from the existing `ml_training_node_selector` Ansible var via `split(',')`.
 - **predict_future_cpu tz-strip + regressor pass-through** (`decision-lambda/src/scaler/predictive.py`): the trained model uses `pending_pods` and `worker_count` as extra regressors; predict() was crashing with `Regressor X missing from dataframe` and `Column ds has timezone specified`. `predict_future_cpu()` now strips tz from the future dataframe and accepts a `regressor_values` dict that is forward-filled onto every future row. `scaling.py` callsite passes `metrics.pending_pods` and `metrics.worker_count`. Backward compatible: callers that don't pass regressors still get None via the existing try/except.
+- **Worker bootstrap → `k3s agent --node-label` for permanent workers** (`infrastructure/ansible/roles/k3s-worker-bootstrap/templates/user-data.sh.j2`): once the `nodeAffinity` fix shipped, no node actually carried the `k3s-worker` Kubernetes label — Pulumi-launched permanent workers (`k3s-worker-1`, `k3s-worker-2`) registered with `k3s agent --node-name="ip-$LOCAL_IP"` and nothing else, so the CronJob still couldn't schedule. The bootstrap now reads its own EC2 `Name` and `Permanent` tags via `aws ec2 describe-tags` (already permitted by the worker role policy at `infrastructure/pulumi/__main__.py:762-763`), and when `Permanent=true` it conditionally passes `--node-label "k3s-worker=$NAME"` to `k3s agent`. Labels are applied at registration time (no post-boot `kubectl label`/`SSM send-command` needed) and the path is identical for both Pulumi-launched permanent workers and any future Lambda-launched workers that happen to carry a `Permanent=true` tag. Step numbering renamed `[1/5]..[5/5]` → `[1/6]..[6/6]` for the inserted identity-tag step.
 
 ### Local Simulation (floci-cli)
 - `floci start --pull always` boots a local AWS emulator on `:4566`
@@ -239,11 +240,9 @@ Weekly CronJob that trains a Prophet model on the last 30 days of CPU/memory met
     `values: [k3s-worker-1, k3s-worker-2]` (the comma-split list is parsed
     from the existing `ml_training_node_selector` Ansible var via Jinja
     `split(',')`).
-    Syntactically valid now — but **no node actually carries the
-    `k3s-worker` Kubernetes label today**: `k3s agent` registers with
-    `--node-name="ip-$LOCAL_IP"` and no `kubectl label` step adds the
-    matching label, so pods still won't schedule until a separate change
-    labels the two permanent workers (Pulumi + bootstrap follow-up).
+    Syntactically valid now, and the `k3s-worker=<name>` label is now
+    applied at registration time by the worker bootstrap (see
+    "Worker bootstrap `--node-label` fix" below).
   - Ansible inventory and `ansible.cfg` hard-code `MyKeyPair` / `~/.ssh/MyKeyPair.pem`;
     blocks portability for non-localhost runs.
 
