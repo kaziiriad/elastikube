@@ -137,7 +137,16 @@ class ScalingEngine:
         cpu_for_scale_up = metrics.worker_cpu_percent_avg  # Default to current
 
         if PREDICTIVE_AVAILABLE:
-            prediction = get_cpu_prediction(current_timestamp=now)
+            # Pass current regressor values so predict_future_cpu can populate
+            # them in the future dataframe (model was trained with these as
+            # extra regressors; predict() rejects missing columns).
+            prediction = get_cpu_prediction(
+                current_timestamp=now,
+                regressor_values={
+                    "pending_pods": metrics.pending_pods,
+                    "worker_count": metrics.worker_count,
+                },
+            )
             if prediction:
                 predicted_cpu = prediction["predicted_cpu"]
                 cpu_for_scale_up = predicted_cpu
