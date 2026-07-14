@@ -231,13 +231,70 @@ Weekly CronJob that trains a Prophet model on the last 30 days of CPU/memory met
     inside the container (e.g. `[profile floci]`) and pass `--profile floci`.
   - CloudWatch `put-metric-data` against floci silently no-ops; not validated
     end-to-end here. Requires real AWS.
-  - `infrastructure/pulumi/__main__.py` does not create the `k3s-models` S3 bucket and
-    does not wire `PROPHET_MODEL_S3_BUCKET` / `PROPHET_MODEL_S3_KEY` /
-    `PREDICTIVE_SCALING_ENABLED` into the decision Lambda env, so `predictive.py`
-    always returns `None`. Decision Lambda predictive scaling is therefore disabled
-    in production until this is added.
   - CronJob `nodeSelector: k3s-worker: "k3s-worker-1,k3s-worker-2"` is invalid —
     `nodeSelector` matches one label value, not a comma list. Pods stay `Pending`.
     Use `nodeAffinity` (already commented in the template) for real two-node pinning.
   - Ansible inventory and `ansible.cfg` hard-code `MyKeyPair` / `~/.ssh/MyKeyPair.pem`;
     blocks portability for non-localhost runs.
+
+### Predictive Scaling Wiring (Pulumi → Decision Lambda)
+Added so the Decision Lambda can actually fetch the Prophet model uploaded by
+the ml-training CronJob. All four changes are in
+`infrastructure/pulumi/__main__.py`:
+
+- **`k3s_models_bucket = s3.Bucket(...)`** — new bucket named `k3s-models` with
+  `versioning={"enabled": True}` (training pipeline emits versioned artifacts
+  + a `cpu_prophet_model.json` "latest" pointer). Name matches the CronJob's
+  `defaults/main.yml` hardcode, no Pulumi↔Ansible handoff needed.
+- **IAM `pulumi.Output.all(...)`** — extended with `k3s_models_bucket_arn`;
+  new statement grants `s3:GetObject` scoped to `models/*` only (Lambda can't
+  read other prefixes). Mirror of the existing userdata-bucket statement.
+- **Decision Lambda env vars** (`k3s-autoscaler-function`, the one
+  `predictive.py` consumes):
+  - `PREDICTIVE_SCALING_ENABLED` = `str(config.get_bool("predictive_scaling_enabled", False)).lower()` →
+    defaults `"false"` (opt-in via `pulumi config set predictive_scaling_enabled true`).
+  - `PROPHET_MODEL_S3_BUCKET` = `k3s_models_bucket.bucket`
+  - `PROPHET_MODEL_S3_KEY` = `models/cpu_prophet_model.json`
+- **Stack output** `pulumi.export("k3s_models_bucket", ...)` for diagnostic
+  parity with the other exports.
+
+`predictive.py` (`decision-lambda/src/scaler/predictive.py`) was already
+complete — it just needed these env vars to do anything useful. The
+`scaling.py:140` callsite (`get_cpu_prediction`) already falls back to current
+CPU when `predictive.py` returns `None`, so the change is safe even when the
+opt-in flag is off.
+
+### Pulumi + floci Validation (this session)
+- `pulumi preview` against `floci start` → 97 resources, plan includes the new
+  `k3s-models` bucket and `k3s_models_bucket` stack output. The bucket resource
+  emits one deprecation **warning** about the inline `versioning={...}` shape
+  (v7 prefers a separate `aws_s3_bucket_versioning` resource); benign, not
+  blocking.
+- `pulumi up` against floci → bucket created. Full apply failed at an
+  unrelated `AWSSecretsManagerClientReadOnlyAccess` managed-policy
+  attachment (floci doesn't simulate AWS-managed policies). Not caused by
+  this diff.
+- `boto3.client("s3").get_object(Bucket="k3s-models",
+  Key="models/cpu_prophet_model.json")` round-trip against floci → confirmed
+  working, same code path `predictive.py:load_model_from_s3()` uses.
+- Static introspection (parsing `__main__.py`) confirmed all three env vars
+  sit inside the decision Lambda's `variables` dict with the expected
+  source expressions (`config.get_bool(...)`, `k3s_models_bucket.bucket`,
+  literal string).
+- Note: the existing dev stack and `k3s-temp-user` stack at
+  `infrastructure/pulumi/Pulumi.{dev,k3s-temp-user}.yaml` were left in place
+  (untouched). A separate `floci-test` stack was used for this validation.
+
+### Local Pulumi workflow with floci
+- `pip3 install --break-system-packages uv` if `/usr/local/bin/uv` is missing.
+- `eval "$(floci env)"` exports `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, etc.
+  Region defaults to `us-east-1` from `floci env`, but `extract_data.py`
+  expects `ap-southeast-1` for DynamoDB tables — override with
+  `export AWS_DEFAULT_REGION=ap-southeast-1`.
+- Backend: `pulumi login --local` (file://~), stack passphrase via
+  `export PULUMI_CONFIG_PASSPHRASE=floci-test` (or any string).
+- Stub-`build/lambda.zip` files (empty zips) are **not** committed; the real
+  builds live behind `decision-lambda/build.sh` etc. and require the Lambda
+  to actually execute, which floci does not support. For pure infra
+  diffs, `touch */build/lambda.zip` lets `pulumi preview` finish past the
+  archive-hash step.

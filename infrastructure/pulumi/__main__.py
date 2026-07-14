@@ -494,6 +494,18 @@ worker_userdata_bucket = s3.Bucket(
     tags={**common_tags, "Name": "k3s-worker-userdata", "Purpose": "worker-bootstrap-scripts"}
 )
 
+# S3 Bucket for Prophet ML model artifacts
+# Uploaded by ml-training CronJob (infrastructure/ansible/roles/ml-training-cronjob/).
+# Read by Decision Lambda for predictive scaling (Layer 4 in decision-lambda/src/scaler/scaling.py).
+# Hardcoded name to match the CronJob's defaults/main.yml (s3_bucket_name: k3s-models).
+k3s_models_bucket = s3.Bucket(
+    "k3s-models",
+    bucket="k3s-models",
+    versioning={"enabled": True},  # Training pipeline emits versioned artifacts + a "latest" pointer
+    force_destroy=True,  # Mirror worker_userdata_bucket; needed for `pulumi destroy`
+    tags={**common_tags, "Name": "k3s-models", "Purpose": "prophet-model-store"}
+)
+
 # =============================================================================
 # IAM Roles
 # =============================================================================
@@ -541,6 +553,7 @@ autoscaler_policy = iam.RolePolicy(
         scaling_history_table_arn=scaling_history_table.arn,
         metrics_samples_table_arn=metrics_samples_table.arn,
         userdata_bucket_arn=worker_userdata_bucket.arn,
+        k3s_models_bucket_arn=k3s_models_bucket.arn,
     ).apply(lambda args: iam.get_policy_document(
         statements=[
             # EC2 Permissions
@@ -689,6 +702,14 @@ autoscaler_policy = iam.RolePolicy(
             {
                 "actions": ["s3:GetObject"],
                 "resources": [f"{args['userdata_bucket_arn']}/*"],
+                "effect": "Allow",
+            },
+            # S3 Permissions - Read Prophet model artifacts from k3s-models
+            # Scoped to models/* prefix only — CronJob uploads here, nothing else.
+            # Used by Decision Lambda (Layer 4 predictive scaling, decision-lambda/src/scaler/predictive.py).
+            {
+                "actions": ["s3:GetObject"],
+                "resources": [f"{args['k3s_models_bucket_arn']}/models/*"],
                 "effect": "Allow",
             },
         ],
@@ -1016,6 +1037,13 @@ lambda_function = lambda_.Function(
             # S3 Configuration for worker bootstrap script
             "USER_DATA_S3_BUCKET": worker_userdata_bucket.bucket,
             "USER_DATA_S3_KEY": "user-data/worker-bootstrap.sh",
+            # Predictive Scaling (Layer 4) - Prophet model fetch
+            # Opt-in: `pulumi config set predictive_scaling_enabled true` to enable.
+            # Bucket populated by ml-training CronJob
+            # (infrastructure/ansible/roles/ml-training-cronjob/).
+            "PREDICTIVE_SCALING_ENABLED": str(config.get_bool("predictive_scaling_enabled", False)).lower(),
+            "PROPHET_MODEL_S3_BUCKET": k3s_models_bucket.bucket,
+            "PROPHET_MODEL_S3_KEY": "models/cpu_prophet_model.json",
         }
     ),
     code=lambda_archive,
@@ -1764,6 +1792,7 @@ pulumi.export("worker_2_private_ip", worker_instance_2.private_ip)
 pulumi.export("config_min_nodes", min_nodes)
 pulumi.export("config_max_nodes", max_nodes)
 pulumi.export("config_scale_up_threshold", scale_up_threshold)
+pulumi.export("k3s_models_bucket", k3s_models_bucket.bucket)
 pulumi.export("config_scale_down_threshold", scale_down_threshold)
 pulumi.export("config_scale_up_cooldown", scale_up_cooldown)
 pulumi.export("config_scale_down_cooldown", scale_down_cooldown)
