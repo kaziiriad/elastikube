@@ -26,20 +26,27 @@ spec:
         spec:
           serviceAccountName: ml-training-sa
           restartPolicy: OnFailure
-          # CRITICAL: Pin to permanent workers to prevent termination during training
-          nodeSelector:
-            k3s-worker: "{{ ml_training_node_selector | default('k3s-worker-1,k3s-worker-2') }}"
-          # Alternative: Use node affinity for more flexibility
-          # affinity:
-          #   nodeAffinity:
-          #     requiredDuringSchedulingIgnoredDuringExecution:
-          #       nodeSelectorTerms:
-          #       - matchExpressions:
-          #         - key: node-role.kubernetes.io/control-plane
-          #           operator: DoesNotExist
-          #         - key: worker-type
-          #           operator: In
-          #           values: ["permanent"]
+          # CRITICAL: Pin to permanent workers to prevent termination during training.
+          # Uses nodeAffinity (not nodeSelector) because nodeSelector matches one
+          # label value, not a comma-separated list. The ml_training_node_selector
+          # var holds "k3s-worker-1,k3s-worker-2" by default and is split on ','.
+          #
+          # NOTE: no node actually carries the `k3s-worker` Kubernetes label today —
+          # workers register via `k3s agent --node-name="ip-$LOCAL_IP"` and no
+          # `kubectl label` step adds the matching label. So this affinity is
+          # syntactically correct but won't actually schedule until a follow-up
+          # adds the label to the two permanent workers (Pulumi + bootstrap).
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: k3s-worker
+                    operator: In
+                    values:
+                    {% for w in (ml_training_node_selector | default('k3s-worker-1,k3s-worker-2')).split(',') %}
+                    - {{ w.strip() }}
+                    {% endfor %}
           containers:
           - name: ml-trainer
             image: {{ ml_training_image }}
