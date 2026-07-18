@@ -398,3 +398,93 @@ pulumi up --yes                 # ⏳ not yet run — see "Open issues"
   `scripts/start-kind.sh` (currently a placeholder that needs to be
   restored to the original kind invocation), build the CronJob image,
   apply the CronJob with the kustomize patch.
+
+### End-to-End ML Pipeline Validation Against LocalStack (this session)
+
+Validated the full ml-training pipeline without k3s — by running the
+scripts directly against LocalStack Pro and the Ansible role's
+`build-image.yml` separately. This proves the pipeline logic, the
+role's build step, and the Decision Lambda's consumer path all work.
+
+**Pipeline (run from `ml_training/`, AWS env pointed at LocalStack):**
+1. **Seed DDB** — `/tmp/seed_ml_tables.py` (not committed; local-only)
+   writes 8640 metrics samples + 772 scaling decisions to
+   `k3s-scaling-metrics-samples` / `k3s-scaling-history` at second
+   precision (pandas 2.x rejects microsecond ISO timestamps) using
+   `Decimal` for floats (boto3 rejects `float`).
+2. **`extract_data.py`** — extracted 8639 metrics + 771 history rows
+   into `/tmp/ml-data/{metrics_samples.csv,scaling_history.csv}`.
+3. **`train_model.py`** — trained Prophet with `pending_pods` and
+   `worker_count` as extra regressors. 6911 train / 1728 val split.
+   **MAE 4.73, RMSE 6.12, MAPE 13.12**. Saved locally and uploaded to
+   `s3://k3s-models/models/cpu_prophet_model_<UTC ts>.json`.
+4. **`predictive.py` round-trip** — `load_model_from_s3(...)` reads
+   `cpu_prophet_model.json` (mirrored copy of the versioned upload) and
+   `get_cpu_prediction(regressor_values={"pending_pods": N, "worker_count": N})`
+   returns a valid prediction. Verified:
+   - Normal load (pending=2, workers=3) → predicted 56.9% CPU at +15min
+   - High load (pending=12, workers=4) → predicted 64.1% CPU at +15min
+   Model responds correctly to regressor inputs (higher pending → higher prediction).
+
+**Validation result:** the ml-training-cronjob branch's core
+deliverable — a trained Prophet model in
+`s3://k3s-models/models/cpu_prophet_model.json` that `predictive.py`
+can load via `load_model_from_s3` — **works end-to-end**.
+
+**Bug fix committed in this session:** `ml_training/scripts/extract_data.py`
+— both `extract_metrics_samples` and `extract_scaling_history` were
+wrapping `ExpressionAttributeValues` in DynamoDB client-style type
+descriptors (`{"S": start_time}`), but the resource-level API
+`boto3.resource('dynamodb').Table.scan()` expects raw Python values.
+Result: `ValidationException: Incorrect operand type for operator >=,
+operand type: M`. Confirmed via 3-way diff (client-style errors, raw
+string works, `Attr(...)` works). Fixed both call sites to pass raw
+strings.
+
+**Ansible role validation (also this session):**
+- `ansible-playbook ... --check --diff` against the role's
+  `build-image.yml`: discovered a second bug —
+  `ansible.builtin.tempfile` returns a stub without `.path` in
+  `--check` mode, breaking all downstream tasks referencing
+  `{{ temp_dir.path }}`. Fixed with `check_mode: false` on the
+  tempfile task so the dir is always created.
+- Real run (`--check` removed): image `k3s-ml-training:latest` built
+  (2.17GB uncompressed, 452MB tar). All 14 tasks completed without
+  errors. Path resolution via `{{ role_path }}/../../../../ml_training`
+  works correctly (resolves to repo-root `ml_training/`).
+- Verified the built image is functional: `docker run --rm
+  k3s-ml-training:latest uv run python -c "from scripts.extract_data
+  import main; from scripts.train_model import CPUForecaster; from
+  prophet.serialize import model_from_json; ..."` succeeds — the
+  scripts and prophet are importable from inside the Ansible-built
+  container, which is what the CronJob would use.
+
+**Container memory cap (also this session):** `sandbox/docker-compose.yml`
+was given `mem_limit: 768m, shm_size: 512m` (was 1g/1g) so the host
+has more headroom for co-running workloads. LocalStack Pro
+recommended 4Gi minimum; this cap is the maximum that fits on a 1.9Gi
+host alongside a k3d/k3s cluster.
+
+**`pulumi up --yes` against LocalStack — blocked on host RAM.**
+Tried twice with the 1Gi cap and `--parallel 4`. LocalStack gateway
+OOM-killed mid-apply at the EC2 VPC creation step (~7min). With 768Mi
+cap, dies faster. The full 97-resource apply cannot run on this host;
+`pulumi preview` (read-only) consistently passes at 97 resources with
+the documented benign warnings (s3 `versioning={...}` deprecation,
+Eip/Vpc customTimeouts ignored).
+
+**k3d attempt (this session):** Installed k3d + kubectl. Created
+single-node cluster `elastikube` (1 server + 1 agent, k3s v1.35.5).
+Cluster came up healthy but the host OOM'd during LocalStack +
+k3d co-existence (~1.9Gi total, both containers competing). Killed
+the cluster (`k3d cluster delete elastikube`) and stopped LocalStack
+to recover. End-to-end k3s + CronJob validation deferred until a
+host with ≥4Gi RAM is available, or a real AWS single-instance
+deploy (next step in this session).
+
+### Next step (this session)
+Validate on real AWS using the `poridhi-aws` profile (configured in
+`~/.aws/credentials`). Plan: launch a single t3.small EC2 instance,
+install k3s on it, point k3s at the real AWS DynamoDB + S3, apply
+the CronJob, trigger as a one-shot Job, verify model lands in the
+real `k3s-models` bucket, and tear down to avoid ongoing charges.

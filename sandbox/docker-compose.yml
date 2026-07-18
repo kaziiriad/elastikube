@@ -32,6 +32,11 @@ services:
     # -p 4566:4566 -p 4510-4560:4510-4560 and rely on host.docker.internal from
     # other containers.
     network_mode: host
+    # Host has only ~1.9Gi RAM total; cap LocalStack so it can't OOM-kill the
+    # whole host under pulumi's parallel resource creation. shm_size bumped
+    # because LAMBDA_RUNTIME_EXECUTOR=docker writes lambda containers to /dev/shm.
+    mem_limit: 768m
+    shm_size: 512m
     environment:
       # ---- Pro license ----
       # LOCALSTACK_AUTH_TOKEN is the canonical env var. We pass it directly so

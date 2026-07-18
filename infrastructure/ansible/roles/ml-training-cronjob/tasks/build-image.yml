@@ -64,6 +64,10 @@
     state: directory
     suffix: _ml_training_image
   register: temp_dir
+  # Always create the dir even in --check mode so downstream tasks that
+  # reference temp_dir.path can resolve the variable. Otherwise `ansible.builtin.command`
+  # finalizer fails with "object of type 'dict' has no attribute 'path'".
+  check_mode: false
 
 - name: Save Docker image to tar file
   ansible.builtin.command:
