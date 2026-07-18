@@ -307,3 +307,94 @@ opt-in flag is off.
   to actually execute, which floci does not support. For pure infra
   diffs, `touch */build/lambda.zip` lets `pulumi preview` finish past the
   archive-hash step.
+
+## Local Sandbox with LocalStack Pro (this session)
+
+`floci` was abandoned in favor of **LocalStack Pro** (`localstack/localstack-pro:dev`),
+which the user already has licensed via `~/.localstack/auth.json` and which
+provides much better coverage of the AWS APIs the Pulumi stack uses (IAM
+managed-policy attachments, Lambda execution, etc.). Goal: validate
+`infrastructure/pulumi/__main__.py` end-to-end against LocalStack without
+touching real AWS.
+
+### What's in the repo (sandbox scaffolding)
+
+| Path | Purpose |
+|---|---|
+| `sandbox/docker-compose.yml` | `localstack-main` container. `network_mode: host` so the host reaches it as `localhost:4566`. `EXTRA_CORS_ALLOWED_ORIGINS` allowlists the remote dev IDE (`https://66dbf2d46722fdb9097e9e42_aeb98e1e.vscode.poridhi.io`) so the Swagger UI no longer blocks CORS preflights. `LOCALSTACK_AUTH_TOKEN` is loaded from `sandbox/.env`. |
+| `sandbox/.env` | `LOCALSTACK_AUTH_TOKEN` extracted from `~/.localstack/auth.json`. **Not committed** (gitignored via the existing `sandbox/` rule once the directory is added — the token is also already readable from `~/.localstack/auth.json` so the security posture is unchanged). |
+| `sandbox/localstack-init/` | Drop-in dir mounted at `/etc/localstack/init/ready.d/` for future startup hooks. Currently empty. |
+| `scripts/localstack-env.sh` | Sourceable shell snippet exporting `AWS_ENDPOINT_URL=http://localhost:4566`, dummy creds, region, Pulumi local-backend passphrase. Also defines an `awslocal()` shell function so `awscli-local` isn't a hard pip dependency. Replaces `eval "$(floci env)"` from the floci workflow above. |
+| `scripts/bootstrap-localstack.sh` | Pre-creates the 2 S3 buckets (`k3s-models`, `k3s-userdata-production-k3s`), 4 DynamoDB tables (matches the key schemas `__main__.py` uses at lines 324, 353, 379, 396), and pre-claims the 6 AWS-managed-policy ARNs that floci rejected. Idempotent. |
+| `scripts/verify-sandbox.sh` | 10-item pass/fail checklist for the LocalStack + Pulumi half (no kind/kubectl). Calls `pulumi stack output`, `awslocal lambda get-function`, S3 round-trip, etc. |
+| `scripts/start-kind.sh` | Placeholder — original full-sandbox design (kind cluster + CronJob apply) deferred. See `/home/poridhian/.puku-cli/plans/graceful-purring-bengio.md` for the unused plan. |
+| `infrastructure/pulumi/Pulumi.localstack.yaml` | New Pulumi stack config — region + the 3 `aws:skip*` flags that tell pulumi-aws to not call STS / metadata APIs LocalStack can't fully answer. |
+
+### Lifecycle (current status: Phase 3 partial)
+
+```sh
+# 1. Start the container (pro license auto-loaded from ~/.localstack/auth.json)
+cd /home/poridhian/code/elastikube
+docker compose -f sandbox/docker-compose.yml up -d
+
+# 2. Bootstrap resources the Pulumi stack expects
+source scripts/localstack-env.sh
+./scripts/bootstrap-localstack.sh
+
+# 3. (already done) install uv + stub the 4 lambda zips
+pip3 install --break-system-packages uv
+for dir in decision-lambda scale-up-lambda scale-down-lambda cleanup-lambda; do
+  python3 -c "import zipfile; zipfile.ZipFile('$dir/build/lambda.zip','w').writestr('main.py','def lambda_handler(e,c): return {\"statusCode\":200,\"body\":\"stub\"}\n')"
+done
+
+# 4. Init stack + run pulumi preview / up
+cd infrastructure/pulumi
+pulumi stack init localstack   # already done
+pulumi preview                  # ✅ 97 resources plan, see "Validations" below
+pulumi up --yes                 # ⏳ not yet run — see "Open issues"
+```
+
+### Validations (this session)
+
+- **LocalStack health**: `curl -s http://localhost:4566/_localstack/health` returns
+  all 12 needed services (`s3, dynamodb, iam, lambda, ssm, secretsmanager,
+  cloudwatch, ec2, sts, events, sns, sqs`) as `available`.
+- **CORS fix**: `EXTRA_CORS_ALLOWED_ORIGINS=...vscode.poridhi.io` →
+  response headers now include `Access-Control-Allow-Origin: https://66dbf2d46722fdb9097e9e42_aeb98e1e.vscode.poridhi.io`.
+  Swagger UI loads cleanly from the remote IDE.
+- **pulumi preview**: 97 resources planned, only the same benign warnings
+  the floci run hit (s3 `versioning={...}` deprecation in favor of
+  `aws_s3_bucket_versioning`; `Eip`/`Vpc` `customTimeouts` ignored). No
+  unexpected failures.
+- **S3 round-trip via awslocal**: `awslocal s3 cp ... s3://k3s-models/...`
+  returns 200 (verified by `scripts/verify-sandbox.sh` check #11).
+- **Pulumi state backend**: `pulumi login --local` (file://~), passphrase
+  via `PULUMI_CONFIG_PASSPHRASE=localstack`. The `dev` and `k3s-temp-user`
+  stacks are untouched.
+
+### Open issues
+
+- **`pulumi up` not yet executed.** Preview succeeded; we paused before
+  the apply to commit progress. The plan should run cleanly given Pro
+  accepts the managed-policy attachments Pro pre-created in
+  `bootstrap-localstack.sh`. **Next session: run `pulumi up --yes` from
+  `infrastructure/pulumi/` with `scripts/localstack-env.sh` sourced and
+  watch for any resource-creation errors. EC2 instances will be accepted
+  but won't actually run (LocalStack EC2 is metadata-only) — that's
+  expected and OK for infra validation.**
+- **Container crashed once** during the preview run — gateway process
+  stopped responding on 4566 while DynamoDB-local kept running. Cause
+  unconfirmed; fixed by `docker compose -f sandbox/docker-compose.yml
+  restart`. If it recurs, try `docker compose down && up -d`. The
+  healthcheck should catch this automatically going forward.
+- **`uv` was missing** on the host. Installed via
+  `pip3 install --break-system-packages uv` — required because
+  `Pulumi.yaml` declares `runtime.options.toolchain: uv` and the
+  Python pulumi engine invokes it on first run.
+- **Original kind-cluster / CronJob / kustomize-patch validation**
+  (full ML training pipeline end-to-end) was deferred — see
+  `/home/poridhian/.puku-cli/plans/graceful-purring-bengio.md` for the
+  unused design. To resume later: install `kind` + `kubectl`, run
+  `scripts/start-kind.sh` (currently a placeholder that needs to be
+  restored to the original kind invocation), build the CronJob image,
+  apply the CronJob with the kustomize patch.

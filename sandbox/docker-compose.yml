@@ -1,0 +1,85 @@
+# LocalStack Pro sandbox for elastikube
+#
+# Brings up localstack/localstack-pro with the right plumbing for the
+# ML-training-CronJob branch to deploy end-to-end against a local AWS mock.
+#
+# Why compose over `docker run`:
+#   - CORS allowlist: the swagger UI was blocking requests from the remote
+#     dev IDE origin (vscode.poridhi.io). EXTRA_CORS_ALLOWED_ORIGINS fixes that.
+#   - Port binding to 0.0.0.0 instead of 127.0.0.1, so kind containers can reach
+#     the endpoint via host.docker.internal:4566 (without --network=host).
+#   - LocalStack auth.json auto-mount from ~/.localstack/auth.json so the Pro
+#     license is picked up without exporting tokens in the shell.
+#   - Persistent volume + init-script drop-in for one-shot bootstrap.
+#
+# Usage:
+#   docker compose -f sandbox/docker-compose.yml up -d
+#   docker compose -f sandbox/docker-compose.yml logs -f   # follow
+#   docker compose -f sandbox/docker-compose.yml down       # stop + remove
+#
+# Then point AWS CLI / pulumi at it:
+#   source scripts/localstack-env.sh
+#   awslocal s3 ls
+
+services:
+  localstack:
+    # Pin to the same tag the previous standalone container was using. Bump
+    # deliberately; Pro images move fast.
+    image: localstack/localstack-pro:dev
+    container_name: localstack-main
+    # host networking means we drop the explicit ports block; the container
+    # listens on the host's 4566 directly. Alternative: use bridge network with
+    # -p 4566:4566 -p 4510-4560:4510-4560 and rely on host.docker.internal from
+    # other containers.
+    network_mode: host
+    environment:
+      # ---- Pro license ----
+      # LOCALSTACK_AUTH_TOKEN is the canonical env var. We pass it directly so
+      # we don't rely on the auth.json file-mount mechanism (which the pro
+      # image appears to ignore when the env var is also set). The token is
+      # read from ~/.localstack/auth.json via the host shell; users who want a
+      # different token can override in a .env file or on the CLI:
+      #   LOCALSTACK_AUTH_TOKEN=ls-xxx docker compose -f sandbox/docker-compose.yml up -d
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN:?set LOCALSTACK_AUTH_TOKEN in your shell or .env}
+      # ---- CORS for the remote dev IDE swagger UI ----
+      - EXTRA_CORS_ALLOWED_ORIGINS=66dbf2d46722fdb9097e9e42_c16a1d19.lb.poridhi.io
+      # ---- Services used by infrastructure/pulumi/__main__.py ----
+      - SERVICES=s3,dynamodb,iam,ssm,secretsmanager,cloudwatch,lambda,sts,ec2,events,sns,sqs
+      # ---- Region (matches Pulumi config + extract_data.py defaults) ----
+      - DEFAULT_REGION=ap-southeast-1
+      # ---- Lambda v2 executor: real Docker containers, DNS-based endpoint
+      #      injection so s3.amazonaws.com resolves to localhost from inside
+      #      the lambda container. ----
+      - LAMBDA_RUNTIME_EXECUTOR=docker
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # ---- Bind to 0.0.0.0 inside the container (host network means this is
+      #      moot, but keep it explicit so logs show the intent) ----
+      - GATEWAY_LISTEN=:4566,:443
+      - EXTERNAL_SERVICE_PORTS_START=4510
+      - EXTERNAL_SERVICE_PORTS_END=4560
+      # ---- Misc ----
+      - DEBUG=0
+      - PERSISTENCE=1   # keep state across restarts (S3 objects, DDB rows)
+    volumes:
+      # Pro license — LocalStack reads /etc/localstack/auth.json on startup.
+      # If the file is missing the container falls back to LOCALSTACK_AUTH_TOKEN.
+      - ${HOME}/.localstack/auth.json:/etc/localstack/auth.json:ro
+      # Persistent state directory so a `docker compose down && up` doesn't
+      # wipe the world. Lives at /var/lib/localstack inside the container.
+      - localstack-data:/var/lib/localstack
+      # Init hooks — any *.sh / *.py in this dir runs once on startup.
+      - ./localstack-init:/etc/localstack/init/ready.d:ro
+      # Required for the Lambda v2 docker executor
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      # LocalStack exposes /_localstack/health with per-service status; use that.
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  localstack-data:
+    name: elastikube-localstack-data
