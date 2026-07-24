@@ -1,0 +1,15 @@
+# Prophet-free deps. The Dockerfile installs this first with normal
+# dependency resolution, then installs `prophet` with `--no-deps`.
+# This skips the matplotlib hard dep in prophet's METADATA and saves
+# ~140MB on the image (PIL, pillow.libs, matplotlib, kiwisolver,
+# fontTools, contourpy, mpl_toolkits are not pulled in).
+#
+# Keep this in sync with the non-prophet lines in requirements.txt.
+boto3>=1.34.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+numpy>=1.24.0,<3.0.0
+joblib>=1.3.0,<2.0.0
+cmdstanpy>=1.0.4
+tqdm>=4.36.1
+importlib_resources
+holidays>=0.25,<1

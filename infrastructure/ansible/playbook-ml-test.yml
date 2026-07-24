@@ -1,0 +1,36 @@
+---
+# Test playbook for the ml-training-cronjob role.
+# Runs the role end-to-end: build, distribute, deploy.
+#
+# Usage:
+#   ANSIBLE_CONFIG=/tmp/ansible-test.cfg ansible-playbook \
+#     -i infrastructure/ansible/inventory/test-hosts.ini \
+#     infrastructure/ansible/playbook-ml-test.yml
+#
+# `tasks_from:` requires `include_role:`, not the bare `roles:` key —
+# otherwise only the role's main.yml is run.
+
+- name: Build ML training image on localhost
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - include_role:
+        name: ml-training-cronjob
+        tasks_from: build-image.yml
+
+- name: Distribute ML training image to worker nodes
+  hosts: workers
+  gather_facts: false
+  tasks:
+    - include_role:
+        name: ml-training-cronjob
+        tasks_from: distribute-image.yml
+
+- name: Deploy ML training CronJob to k3s cluster
+  hosts: master
+  gather_facts: false
+  tasks:
+    - include_role:
+        name: ml-training-cronjob
+        tasks_from: deploy-cronjob.yml

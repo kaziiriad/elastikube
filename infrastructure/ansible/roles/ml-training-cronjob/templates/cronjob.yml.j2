@@ -30,12 +30,6 @@ spec:
           # Uses nodeAffinity (not nodeSelector) because nodeSelector matches one
           # label value, not a comma-separated list. The ml_training_node_selector
           # var holds "k3s-worker-1,k3s-worker-2" by default and is split on ','.
-          #
-          # NOTE: no node actually carries the `k3s-worker` Kubernetes label today —
-          # workers register via `k3s agent --node-name="ip-$LOCAL_IP"` and no
-          # `kubectl label` step adds the matching label. So this affinity is
-          # syntactically correct but won't actually schedule until a follow-up
-          # adds the label to the two permanent workers (Pulumi + bootstrap).
           affinity:
             nodeAffinity:
               requiredDuringSchedulingIgnoredDuringExecution:
@@ -43,136 +37,45 @@ spec:
                 - matchExpressions:
                   - key: k3s-worker
                     operator: In
-                    values:
-                    {% for w in (ml_training_node_selector | default('k3s-worker-1,k3s-worker-2')).split(',') %}
-                    - {{ w.strip() }}
-                    {% endfor %}
+                    values: {{ (ml_training_node_selector | default('k3s-worker-1,k3s-worker-2')).split(',') | map('trim') | map('string') | list | to_json }}
           containers:
           - name: ml-trainer
             image: {{ ml_training_image }}
             imagePullPolicy: IfNotPresent
-            command: [/bin/bash, -c]
-            args:
-              - |
-                  set -e
-
-                  # Display node info for debugging
-                  echo "═════════════════════════════════════════════════════════"
-                  echo "  ML Model Training - Kubernetes Job"
-                  echo "═════════════════════════════════════════════════════════"
-                  echo "Running on node: $(hostname)"
-                  echo "Node labels:"
-                  kubectl get node $(hostname) -o jsonpath='{.metadata.labels}' || true
-                  echo "Started at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-                  echo ""
-
-                  # Extract data from DynamoDB
-                  echo "[1/4] Extracting data from DynamoDB..."
-                  uv run scripts/extract_data.py \
-                    --days {{ ml_training_days | default(30) }} \
-                    --output-dir data
-
-                  # Train model
-                  echo ""
-                  echo "[2/4] Training Prophet model..."
-                  uv run scripts/train_model.py \
-                    --data-path data/metrics_samples.csv \
-                    --cross-validate \
-                    --output-dir models
-
-                  # Find generated model
-                  MODEL_FILE=$(ls -t models/cpu_prophet_model_*.json 2>/dev/null | head -1)
-                  MODEL_VERSION=$(basename $MODEL_FILE .json)
-                  echo ""
-                  echo "[3/4] Model trained: $MODEL_VERSION"
-
-                  # Validate model
-                  echo ""
-                  echo "[4/4] Validating model..."
-                  {% if not ml_skip_validation | default(false) %}
-                  uv run scripts/validate_model.py \
-                    --model-path $MODEL_FILE \
-                    --output-dir validation
-
-                  # Read metrics
-                  METRICS_FILE="${MODEL_FILE}_metrics.json"
-                  MAE=$(cat $METRICS_FILE | jq -r '.validation_mae // .mae')
-                  RMSE=$(cat $METRICS_FILE | jq -r '.validation_rmse // .rmse')
-                  echo "Validation MAE: $MAE%"
-                  echo "Validation RMSE: $RMSE%"
-                  {% else %}
-                  echo "Validation skipped (skip_validation=true)"
-                  {% endif %}
-
-                  # Upload to S3
-                  echo ""
-                  echo "Uploading to S3..."
-                  TRAINED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-                  S3_BUCKET={{ s3_bucket_name }}
-
-                  # Upload versioned model
-                  aws s3 cp $MODEL_FILE \
-                    s3://${S3_BUCKET}/models/${MODEL_VERSION}.json \
-                    --metadata "trained_at=${TRAINED_AT},version=${MODEL_VERSION}"
-
-                  # Upload as latest
-                  aws s3 cp $MODEL_FILE \
-                    s3://${S3_BUCKET}/models/cpu_prophet_model.json \
-                    --metadata "trained_at=${TRAINED_AT},version=${MODEL_VERSION}"
-
-                  # Upload metrics
-                  {% if not ml_skip_validation | default(false) %}
-                  aws s3 cp $METRICS_FILE \
-                    s3://${S3_BUCKET}/models/${MODEL_VERSION}_metrics.json
-
-                  # Publish metrics to CloudWatch
-                  aws cloudwatch put-metric-data \
-                    --namespace "K3sAutoscalerML" \
-                    --metric-data \
-                      "MetricName=TrainingMAE,Value=${MAE},Unit=Percent" \
-                      "MetricName=TrainingRMSE,Value=${RMSE},Unit=Percent" \
-                    --dimensions "ModelVersion=${MODEL_VERSION}"
-                  {% endif %}
-
-                  echo ""
-                  echo "═════════════════════════════════════════════════════════"
-                  echo "  Training Complete ✓"
-                  echo "═════════════════════════════════════════════════════════"
-                  echo "Model Version: $MODEL_VERSION"
-                  echo "S3 Location: s3://${S3_BUCKET}/models/cpu_prophet_model.json"
-                  echo "Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-                  echo ""
-              env:
-              - name: AWS_REGION
-                value: {{ aws_region | default("ap-southeast-1") }}
-              - name: AWS_DEFAULT_REGION
-                value: {{ aws_region | default("ap-southeast-1") }}
-              - name: STATE_TABLE
-                value: {{ state_table_name }}
-              - name: WAL_TABLE
-                value: {{ wal_table_name }}
-              - name: S3_BUCKET
-                value: {{ s3_bucket_name }}
-              # Add node selector environment variable for logging
-              - name: PERMANENT_WORKERS
-                value: "k3s-worker-1,k3s-worker-2"
-              {% if aws_access_key_id is defined and aws_access_key_id %}
-              envFrom:
-              - secretRef:
-                  name: aws-credentials
-              {% endif %}
-              resources:
-                requests:
-                  cpu: "500m"
-                  memory: "2Gi"
-                limits:
-                  cpu: "2000m"
-                  memory: "4Gi"
-              volumeMounts:
-              - name: workspace
-                mountPath: /workspace
+            # The bash pipeline is base64-encoded to avoid YAML literal-block
+            # whitespace issues. Encoded here with a Jinja filter; container
+            # decodes + execs at runtime.
+            command: [/bin/bash, -c, "echo {{ ml_training_b64_script }} | base64 -d | bash"]
+            env:
+            - name: AWS_REGION
+              value: {{ aws_region | default("ap-southeast-1") }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ aws_region | default("ap-southeast-1") }}
+            - name: STATE_TABLE
+              value: {{ state_table_name }}
+            - name: WAL_TABLE
+              value: {{ wal_table_name }}
+            - name: S3_BUCKET
+              value: {{ s3_bucket_name }}
+            # Add node selector environment variable for logging
+            - name: PERMANENT_WORKERS
+              value: "k3s-worker-1,k3s-worker-2"
+{% if aws_access_key_id is defined and aws_access_key_id %}
+            envFrom:
+            - secretRef:
+                name: aws-credentials
+{% endif %}
+            resources:
+              requests:
+                cpu: "500m"
+                memory: "1Gi"
+              limits:
+                cpu: "1500m"
+                memory: "1500Mi"
+            volumeMounts:
+            - name: workspace
+              mountPath: /workspace
           volumes:
           - name: workspace
             emptyDir:
               sizeLimit: "5Gi"
-

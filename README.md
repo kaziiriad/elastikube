@@ -1668,6 +1668,20 @@ Tested with 30 days of synthetic metrics data generated to simulate realistic cl
 ## Recent Enhancements
 
 
+**v1.4 - ML Image Slimming + Real-AWS Validation (Latest)**
+
+| Feature | Description |
+|---------|-------------|
+| **Multi-stage Dockerfile** | `builder` stage holds build-essential + the AWS CLI v2 bundle + pip cache; `runtime` stage is a clean `python:3.11-slim` that only copies `/app/.venv`. No build toolchain ships in the runtime image. |
+| **Drop AWS CLI + jq from the image** | Pipeline was rewritten to use `boto3.client('s3').upload_file(...)` and `boto3.client('cloudwatch').put_metric_data(...)` instead of `aws s3 cp` / `aws cloudwatch put-metric-data`. JSON parsing moved from `jq` to the stdlib `json` module. |
+| **`prophet` installed with `--no-deps`** | Bypasses the matplotlib hard dependency in prophet's METADATA so PIL / pillow.libs / kiwisolver / fontTools / contourpy / mpl_toolkits are not pulled in. Prophet's forecasting pipeline (`fit`, `predict`, `cross_validation`, `model_to_json`/`model_from_json`) doesn't need matplotlib. |
+| **Image size 1.45 GB → 566 MB** | ~61% reduction. Compressed tar drops from 235 MB → 125 MB. Same forecasting output, headless container. |
+| **3-way Ansible role runtime fix** | `kubernetes.core.k8s` and `kubectl apply` now respect a `kubeconfig_path` var (default `/etc/rancher/k3s/k3s.yaml`); needed because k3s installs the kubeconfig as `0600 root:root` and the Ansible user can't read it. |
+| **Pipeline runs on real AWS** | Manual 1+2 cluster (master + 2 permanent workers, `t3.small`) in `poridhi-aws` account. CronJob `ml-training-job` schedules weekly retraining; `kubectl create job --from=cronjob/ml-training-job` triggers an on-demand run. Pod scheduled via `nodeAffinity` against the `k3s-worker=<name>` label applied by the worker bootstrap `--node-label` fix. |
+| **`extract_data.py` profile fix** | Default `--profile=k3s-temp-user` doesn't exist inside the container; pipeline now passes `--profile ""` so boto3 falls back to the `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars injected from the `aws-credentials` k8s Secret. |
+
+**Key fixes (this session):** `kubernetes.core.k8s` rejected `data:`/`type:` keys → use `definition:` · `kubectl apply` `0600` kubeconfig → copy to `~/.ssh` with `chmod 600` and pass `--kubeconfig=` · `extract_data.py` flaky profile resolution → `--profile ""` works against the container's env vars · `nodeSelector` comma list → `nodeAffinity` with `operator: In` plus a Jinja `split(',')` list · worker bootstrap now reads its own `Name` tag and conditionally passes `--node-label "k3s-worker=$NAME"` to `k3s agent`.
+
 **v1.3 - Fast Worker Bootstrap with Pre-Baked AMI**
 
 | Feature | Description |

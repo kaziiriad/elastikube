@@ -39,3 +39,9 @@ s3_bucket_name: k3s-models
 # Training parameters
 ml_training_days: 30
 ml_skip_validation: false
+
+# Base64-encoded bash pipeline that the CronJob container executes.
+# Encoded so the YAML doesn't have to nest a literal block inside a list
+# inside a list (which has known whitespace issues with multi-line shell).
+# The script is regenerated here so all logic stays in one place.
+ml_training_b64_script: "{{ lookup('template', 'ml-training-script.sh.j2') | b64encode }}"

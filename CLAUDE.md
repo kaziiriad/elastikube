@@ -488,3 +488,191 @@ Validate on real AWS using the `poridhi-aws` profile (configured in
 install k3s on it, point k3s at the real AWS DynamoDB + S3, apply
 the CronJob, trigger as a one-shot Job, verify model lands in the
 real `k3s-models` bucket, and tear down to avoid ongoing charges.
+
+### Real AWS Validation — 1+2 k3s Cluster (this session)
+
+Switched from the single-instance plan to a proper 1 master + 2 workers
+setup to match the project's existing topology
+(`infrastructure/ansible/playbooks/k3s-cluster.yml`). All three
+`t3.small` instances live in the `elastikube-sg` security group and
+share the same VPC as the Pulumi-launched workers from previous sessions.
+
+**Cluster (1+2):**
+| Node | IP | Role | EC2 tags |
+|------|----|------|----------|
+| k3s-master | 47.129.153.189 | control-plane | `Role=k3s-master, Permanent=true` |
+| k3s-worker-1 | 54.255.239.221 | permanent worker | `Role=k3s-worker, Permanent=true, Name=k3s-worker-1` |
+| k3s-worker-2 | 54.179.145.98 | permanent worker | `Role=k3s-worker, Permanent=true, Name=k3s-worker-2` |
+
+The `Name` tag is what the new `k3s agent --node-label` bootstrap reads
+to apply the `k3s-worker=<name>` Kubernetes label at registration time
+(see "Worker bootstrap `--node-label` fix" above).
+
+**AWS resources (re-used from previous sessions, confirmed via
+`poridhi-aws` profile):**
+- DynamoDB tables: `k3s-cluster-state`, `k3s-scaling-wal`,
+  `k3s-scaling-metrics-samples` (8641 rows), `k3s-scaling-history`
+  (962 rows). Tables exist in `ap-southeast-1`.
+- S3 bucket: `k3s-models` (versioning enabled).
+- IAM role: `k3s-worker` instance profile attached to all 3 EC2s.
+  Worker bootstrap assumes this profile is reachable from the SSM
+  agent / `aws ec2 describe-tags` calls in `user-data.sh.j2`.
+
+**Cluster bring-up (manual, not via Pulumi):**
+- Master: `curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server
+  --disable=traefik --disable=servicelb --tls-san=$(curl -169.254.169.254/latest/meta-data/public-ipv4)" sh -`
+  → started in ~30s, kubeconfig at `/etc/rancher/k3s/k3s.yaml` (root-only).
+- Workers: pulled join token from SSM (`/k3s/production-k3s/join-token`),
+  ran `k3s agent --server https://<MASTER_IP>:6443 --token-file
+  /tmp/k3s-token --node-label "k3s-worker=$NAME"`. Joined cleanly with
+  the `k3s-worker=<name>` label already applied — verified via
+  `kubectl get nodes --show-labels`.
+
+**Role end-to-end (all 3 task files):**
+- `playbook-ml-test.yml` (`hosts: localhost / workers / master`) runs
+  build-image → distribute-image → deploy-cronjob in sequence. The
+  bare `roles:` key only ran `main.yml`; switched to `include_role:
+  tasks_from:` blocks per role's README.
+- `build-image.yml`: local docker build, save to tar under
+  `ansible.<rand>_ml_training_image/`.
+- `distribute-image.yml`: rsync tar → `docker load` on each worker.
+- `deploy-cronjob.yml`: `kubectl apply` after templating the CronJob.
+
+**Bugs hit and fixed mid-test:**
+- `kubernetes.core.k8s` rejected `data:` / `type:` keys under `definition:`.
+  Switched to the documented `definition:` shape with `data:` nested
+  inside the Secret body.
+- `ansible_python_interpreter=/usr/bin/python3` on the master had no
+  `kubernetes` client lib. Fixed with
+  `curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py &&
+  sudo python3 /tmp/get-pip.py --break-system-packages &&
+  sudo python3 -m pip install kubernetes --break-system-packages`.
+- `kubernetes.core.k8s` and `kubectl apply` both failed with
+  "Invalid kube-config file. No configuration found." on the master
+  because `/etc/rancher/k3s/k3s.yaml` is `0600 root:root`. Fixed by:
+  (a) `sudo cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/k3s.yaml &&
+  sudo chown ubuntu:ubuntu /home/ubuntu/k3s.yaml && sudo chmod 600
+  /home/ubuntu/k3s.yaml`, and (b) adding a `kubeconfig` parameter to
+  every `kubernetes.core.k8s` call plus `--kubeconfig=...` to the
+  `kubectl apply` / `kubectl get` calls in `deploy-cronjob.yml`. The
+  `kubeconfig_path` var defaults to `/etc/rancher/k3s/k3s.yaml` but
+  can be overridden via `--extra-vars "kubeconfig_path=..."` for
+  non-root runs.
+- `extract_data.py` defaulted to `--profile=k3s-temp-user` which
+  doesn't exist inside the container. The pipeline runs with
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` injected from the
+  `aws-credentials` k8s Secret. Fixed by passing `--profile ""` from
+  the bash pipeline (the script's `boto3.Session(profile_name=profile)
+  if profile else ...` ternary treats empty string as falsy and falls
+  through to the env-var path).
+
+**Image-size optimization (the bulk of this session's work):**
+Original `k3s-ml-training:latest` was **1.45 GB**. The user asked why
+it was so heavy and what could be cut. Three passes:
+
+1. **Strip dev/plotting deps from prod** — split the `uv` lockfile
+   into `requirements.txt` (boto3, pandas, numpy, prophet, joblib) +
+   `requirements-dev.txt` (jupyter, matplotlib, plotly, seaborn, pillow,
+   pytest). Deleted `ml_training/uv.lock`. Image dropped to **1.05 GB**.
+
+2. **Multi-stage Dockerfile** — `builder` stage holds build-essential
+   + the AWS CLI v2 bundle + pip cache; `runtime` stage is a clean
+   `python:3.11-slim` that only copies `/app/.venv` from the builder.
+   Image dropped to **697 MB**.
+
+3. **Drop AWS CLI + jq from the image entirely** — replaced `aws s3 cp`
+   and `aws cloudwatch put-metric-data` in the bash pipeline with
+   inline `boto3.client('s3').upload_file(...)` and
+   `boto3.client('cloudwatch').put_metric_data(...)`. Replaced `jq -r
+   '.mae'` parsing with `python -c "import json; ..."`. Removed the AWS
+   CLI v2 installer from the builder. Dropped the `apt-get install jq`
+   from the runtime. Image dropped to **566 MB** (61% smaller than
+   baseline, **125 MB compressed**).
+
+4. **Install prophet with `--no-deps`** — prophet's METADATA declares a
+   hard `matplotlib>=2.0.0` dependency, which transitively pulls in
+   `pillow`, `kiwisolver`, `fontTools`, `contourpy`, `mpl_toolkits`
+   (~140 MB combined). None of those are used by the forecasting
+   pipeline — the only code paths the CronJob touches are
+   `Prophet().fit()`, `.predict()`, `model_to_json()`, `model_from_json()`,
+   and `cross_validation()`. None of them import matplotlib.
+   Added `requirements-deps.txt` (prophet-free subset, installed with
+   normal dependency resolution) and a separate `--no-deps` install of
+   `prophet` itself. Verified: prophet emits a benign "Importing
+   matplotlib failed" warning at import time, but `Prophet() → fit →
+   serialize → deserialize → predict` all work end-to-end on a 30-row
+   sample. Image stayed at **566 MB** (no further reduction —
+   matplotlib was already gone from the drop-aws-cli pass) but the
+   Dockerfile is more honest about what's needed and the `--no-deps`
+   trick is documented for anyone trying to slim further.
+
+**Disk pressure on t3.small (7.6 GB root):**
+- Workers had `/dev/root` at 72% with the 1.45 GB image loaded. The
+  image-pull that brought in the 1.05 GB version pushed it to ~95% and
+  k3s started failing image GC → `imagefs` pressure → pods stuck in
+  `ContainerCreating`.
+- Workflow fix: `docker rmi k3s-ml-training:latest && docker load -i
+  k3s-ml-training.tar && sudo k3s ctr images import k3s-ml-training.tar`
+  removes the old image before loading the new one. After swapping in
+  the 566 MB image: `/dev/root` is at **69%** with headroom.
+
+**Files touched / created this session:**
+```
+modified  ml_training/Dockerfile                  (single → multi-stage, --no-deps)
+modified  ml_training/pyproject.toml               (stripped)
+modified  ml_training/scripts/validate_model.py    (headless, no plotting)
+deleted   ml_training/uv.lock                      (uv replaced by pip)
+new       ml_training/setup.py                     (minimal, for `pip install .`)
+new       ml_training/requirements.txt             (boto3/pandas/numpy/joblib + prophet deps)
+new       ml_training/requirements-deps.txt        (prophet-free subset for --no-deps install)
+new       ml_training/requirements-dev.txt         (jupyter/matplotlib/plotly/seaborn/pillow)
+
+modified  infrastructure/ansible/roles/ml-training-cronjob/defaults/main.yml
+modified  infrastructure/ansible/roles/ml-training-cronjob/tasks/deploy-cronjob.yml
+                                               (kubeconfig param, kubectl --kubeconfig=)
+modified  infrastructure/ansible/roles/ml-training-cronjob/templates/cronjob.yml.j2
+                                               (nodeAffinity, base64-encoded script)
+new       infrastructure/ansible/roles/ml-training-cronjob/templates/ml-training-script.sh.j2
+                                               (extracted bash pipeline, pure-Python upload)
+
+new       infrastructure/ansible/inventory/test-hosts.ini
+                                               (master + 2 workers, poridhi-aws key)
+new       infrastructure/ansible/playbook-ml-test.yml
+                                               (full role runner, localhost → workers → master)
+new       infrastructure/ansible/playbook-deploy-only.yml
+                                               (just deploy-cronjob.yml, for re-runs)
+```
+
+**Local validation artefacts (NOT committed, host-only):**
+- `/tmp/ansible-test.cfg` — `private_key_file=/tmp/elastikube-test.pem`
+- `/tmp/seed_dynamo.py` — re-seeds `k3s-scaling-metrics-samples` (8641
+  rows) + `k3s-scaling-history` (962 rows) on each test restart. Uses
+  `Decimal` for floats (boto3 rejects `float`).
+- `/tmp/elastikube-test.pem` — SSH key for the test cluster
+  (poridhi-aws account).
+- `/home/ubuntu/k3s.yaml` on master — copy of the k3s kubeconfig with
+  ubuntu ownership so `kubernetes.core.k8s` and `kubectl --kubeconfig=`
+  work without `sudo`.
+
+**CronJob end-to-end status (this session):**
+- `kubectl create job --from=cronjob/ml-training-job ml-run-<ts> -n
+  k3s-autoscaler` triggers the pipeline.
+- Pod scheduled on `k3s-worker-2` via nodeAffinity (verified:
+  `pod.spec.nodeName` matches).
+- `extract_data.py` extracts 8641 metrics samples successfully.
+- Pipeline stalls at the DynamoDB S3 / CloudWatch calls in step
+  `[1/3]` because the worker can't reach AWS public endpoints
+  from inside the cluster pod (the EC2 security group restricts
+  outbound). **Open issue** — needs an IGW + NAT or VPC endpoint for
+  DynamoDB / S3 / CloudWatch before the pipeline can complete
+  against real AWS.
+
+### Next step (this session, current)
+Open issue: pod-to-AWS networking. Either add a NAT Gateway to the
+k3s VPC, or carve out VPC endpoints for DynamoDB / S3 / CloudWatch.
+Once the pipeline completes, verify:
+- `s3://k3s-models/models/cpu_prophet_model.json` exists + matches
+  expected MAE/RMSE from the LocalStack validation.
+- `K3sAutoscalerML/ValidationMAE` and `ValidationRMSE` metrics
+  appear in CloudWatch.
+- Then tear down the 3 EC2s and the supporting infra to stop charges.

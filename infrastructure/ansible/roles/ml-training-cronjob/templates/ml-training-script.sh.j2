@@ -1,0 +1,140 @@
+#!/bin/bash
+# ML model training pipeline executed by the CronJob container.
+# Extracted into its own template so the CronJob YAML can stay clean.
+#
+# The whole pipeline is driven by Python via boto3 — no AWS CLI, no jq.
+# Only two bash steps remain: the python invocations themselves and the
+# wrapping set -e / echo banners. S3 upload + CloudWatch metrics are
+# done with boto3 so the image doesn't need to ship the AWS CLI bundle.
+
+set -e
+
+# Display node info for debugging
+echo "═════════════════════════════════════════════════════════"
+echo "  ML Model Training - Kubernetes Job"
+echo "═════════════════════════════════════════════════════════"
+echo "Running on node: $(hostname)"
+echo "Started at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo ""
+
+# Extract data from DynamoDB.
+# Pass --profile "" so boto3 uses env vars (AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY injected from the k8s secret) instead of trying
+# to resolve a profile that does not exist inside the container.
+echo "[1/3] Extracting data from DynamoDB..."
+python /app/scripts/extract_data.py \
+  --profile "" \
+  --days {{ ml_training_days | default(30) }} \
+  --output-dir data
+
+# Train model
+echo ""
+echo "[2/3] Training Prophet model..."
+python /app/scripts/train_model.py \
+  --data-path data/metrics_samples.csv \
+  --output-dir models
+
+# Find generated model
+MODEL_FILE=$(ls -t models/cpu_prophet_model_*.json 2>/dev/null | head -1)
+MODEL_VERSION=$(basename "$MODEL_FILE" .json)
+echo ""
+echo "[3/3] Model trained: $MODEL_VERSION"
+
+# Backtest & validate against the original data — writes validation
+# metrics next to the model file as <model>_metrics.json.
+python /app/scripts/validate_model.py \
+  --model-path "$MODEL_FILE" \
+  --history-path data/metrics_samples.csv \
+  --output-dir validation
+
+# Upload to S3 + push CloudWatch metrics, all via boto3 (no aws CLI).
+# Bucket name is templated in from the Ansible role's defaults.
+TRAINED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+S3_BUCKET={{ s3_bucket_name }}
+
+METRICS_FILE="${MODEL_FILE}_metrics.json"
+echo ""
+echo "Uploading model + metrics to s3://${S3_BUCKET}/..."
+python - "$MODEL_FILE" "$MODEL_VERSION" "$METRICS_FILE" "$TRAINED_AT" "$S3_BUCKET" <<'PYEOF'
+import json
+import sys
+
+import boto3
+
+model_file, model_version, metrics_file, trained_at, bucket = sys.argv[1:]
+
+s3 = boto3.client("s3")
+cw = boto3.client("cloudwatch")
+
+# Upload versioned model + alias as `cpu_prophet_model.json` (latest).
+# S3 object metadata is the same metadata the bash script used to set
+# via `aws s3 cp --metadata ...`.
+s3.upload_file(
+    model_file,
+    bucket,
+    f"models/{model_version}.json",
+    ExtraArgs={"Metadata": {"trained_at": trained_at, "version": model_version}},
+)
+s3.upload_file(
+    model_file,
+    bucket,
+    "models/cpu_prophet_model.json",
+    ExtraArgs={"Metadata": {"trained_at": trained_at, "version": model_version}},
+)
+
+# Upload metrics file alongside the model.
+s3.upload_file(
+    metrics_file,
+    bucket,
+    f"models/{model_version}_metrics.json",
+)
+
+# Parse MAE / RMSE and push to CloudWatch. Metrics may be NaN if the
+# backtest had no samples; CloudWatch rejects NaN, so coerce to 0.0.
+with open(metrics_file) as f:
+    metrics = json.load(f)
+
+
+def _coerce(name):
+    val = metrics.get(name, 0.0)
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+mae = _coerce("mae")
+rmse = _coerce("rmse")
+
+cw.put_metric_data(
+    Namespace="K3sAutoscalerML",
+    MetricData=[
+        {
+            "MetricName": "ValidationMAE",
+            "Value": mae,
+            "Unit": "Percent",
+            "Dimensions": [{"Name": "ModelVersion", "Value": model_version}],
+        },
+        {
+            "MetricName": "ValidationRMSE",
+            "Value": rmse,
+            "Unit": "Percent",
+            "Dimensions": [{"Name": "ModelVersion", "Value": model_version}],
+        },
+    ],
+)
+
+print(f"  Uploaded models/{model_version}.json")
+print(f"  Uploaded models/cpu_prophet_model.json (latest)")
+print(f"  Uploaded models/{model_version}_metrics.json")
+print(f"  CloudWatch MAE={mae} RMSE={rmse}")
+PYEOF
+
+echo ""
+echo "═════════════════════════════════════════════════════════"
+echo "  Training Complete ✓"
+echo "═════════════════════════════════════════════════════════"
+echo "Model Version: $MODEL_VERSION"
+echo "S3 Location: s3://${S3_BUCKET}/models/cpu_prophet_model.json"
+echo "Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo ""
