@@ -667,6 +667,138 @@ new       infrastructure/ansible/playbook-deploy-only.yml
   DynamoDB / S3 / CloudWatch before the pipeline can complete
   against real AWS.
 
+### Manual 1+2 k3s Cluster Bring-Up (this session)
+
+To validate the `ml-training-cronjob` Ansible role end-to-end against
+real AWS, we built a 1-master / 2-worker cluster by hand rather than
+running `pulumi up`. The Pulumi stack also deploys 4 Lambdas, EventBridge
+rules, IAM, CloudWatch alarms and a VPC — none of which are needed to
+test the CronJob, and all of which would consume an hour of apply time
+plus ongoing cost on resources that aren't exercised.
+
+**Topology:** 3× `t3.small` instances (master + 2 permanent workers),
+in the same VPC as the Pulumi-launched workers from previous sessions.
+Workers live in private subnets with no public IPs, so SSH access goes
+through the master as a ProxyJump host. The cluster is brought up
+without `systemd` enabled on the AMIs (these test AMIs ship with a
+sysvinit / no-init setup), which means the standard `systemctl enable
+k3s-agent` path doesn't work — see "Worker k3s install" below.
+
+**Why not use `pulumi up`?** Time + cost. The full Pulumi stack plans
+~97 resources and includes EC2 instance types that Pulumi won't
+provision on the test account. Doing this by hand keeps the test
+surface small (3 EC2s + the existing DynamoDB tables / S3 bucket) and
+matches the topology the `playbook-ml-test.yml` expects (1 master + 2
+workers).
+
+**Pre-flight (read-only):**
+```bash
+export AWS_PROFILE=poridhi-aws
+export AWS_DEFAULT_REGION=ap-southeast-1
+
+# Cluster health (re-use last session's 3× t3.small)
+aws ec2 describe-instances --filters \
+  'Name=instance-state.name,Values=running' \
+  'Name=tag:Cluster,Values=production-k3s' \
+  --query 'Reservations[].Instances[].{Id:InstanceId,Name:Tags[?Key==`Name`]|[0].Value,PrivateIp:PrivateIpAddress}'
+
+# S3 + DynamoDB state (gated behind credentials)
+aws s3 ls | grep k3s-models
+aws dynamodb list-tables | grep k3s-
+
+# SSM master IP (scoped, exact name)
+aws ssm get-parameter --name /k3s/production-k3s/master-ip
+```
+
+If the master/workers were terminated, re-create with the same
+`t3.small` / `Name=k3s-worker-{1,2}` / `Permanent=true` tags using
+`aws ec2 run-instances`, assign a new keypair, install k3s server, fetch
+the join token via `/var/lib/rancher/k3s/server/node-token`, install k3s
+agent with `--node-label k3s-worker=$NAME`. Save the join token to
+Secrets Manager as `k3s-production-k3s-join-token` (this is what
+`k3s-worker-bootstrap` expects).
+
+**Master install:**
+```bash
+# On master
+curl -sfL https://get.k3s.io | \
+  INSTALL_K3S_EXEC="server \
+    --disable=traefik \
+    --disable=servicelb \
+    --tls-san=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)" \
+  sh -
+# Kubeconfig lives at /etc/rancher/k3s/k3s.yaml (0600 root:root)
+# Make it readable to ubuntu for ansible/kubectl non-sudo use:
+sudo cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/k3s.yaml
+sudo chown ubuntu:ubuntu /home/ubuntu/k3s.yaml
+sudo chmod 600 /home/ubuntu/k3s.yaml
+```
+
+**Worker install (no systemd → use `nohup`):**
+```bash
+# On worker (after copying the join token from master)
+nohup k3s agent \
+  --server https://<MASTER_IP>:6443 \
+  --token-file /tmp/k3s-server-token \
+  --node-label "k3s-worker=$NAME" \
+  >/var/log/k3s-agent.log 2>&1 &
+# `--node-label` applies k3s-worker=<name> at registration time so the
+# CronJob's nodeAffinity selector matches without any post-boot kubectl
+# label / SSM send-command.
+```
+
+**Egress unblock (VPC Gateway Endpoints):**
+The previous session stalled at the AWS API calls because the worker
+subnet has no NAT. Cheapest fix: attach DynamoDB + S3 Gateway endpoints
+to the cluster's route table (both free, no NAT-GW required). CloudWatch
+`put-metric-data` isn't used by the deployed pipeline (the IAM
+`k3s-worker` role doesn't have `cloudwatch:PutMetricData`), so no CW
+endpoint is needed.
+```bash
+VPC_ID=$(aws ec2 describe-vpcs \
+  --filters 'Name=tag:Name,Values=*k3s*' 'Name=isDefault,Values=false' \
+  --query 'Vpcs[0].VpcId' --output text)
+RT_ID=$(aws ec2 describe-route-tables \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'RouteTables[?Associations[0].Main==`true`].RouteTableId | [0]' \
+  --output text)
+
+aws ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
+  --service-name com.amazonaws.ap-southeast-1.s3 \
+  --route-table-ids "$RT_ID" --vpc-endpoint-type Gateway
+
+aws ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
+  --service-name com.amazonaws.ap-southeast-1.dynamodb \
+  --route-table-ids "$RT_ID" --vpc-endpoint-type Gateway
+```
+
+**Pause image pre-import:**
+Workers in private subnets with no NAT have no internet, so `k3s
+agent` fails to pull `rancher/mirrored-pause:3.6`. Workaround: export
+the pause image from the master (which has internet via `docker.io`
+mirror caching) and import it on each worker.
+```bash
+# On master
+docker save rancher/mirrored-pause:3.6 > /tmp/pause.tar
+scp /tmp/pause.tar ubuntu@<worker-via-master-jump>:/tmp/pause.tar
+
+# On worker
+sudo k3s ctr images import /tmp/pause.tar
+```
+
+**Image distribution (workers have no `docker` binary):**
+The `distribute-image.yml` role runs `docker load -i` on each worker,
+but the workers only ship with `k3s` (which wraps `ctr`). Install a
+5-line `/usr/local/bin/docker` wrapper that translates `docker load -i
+FILE` → `k3s ctr images import FILE`. Idempotent — re-running
+`distribute-image.yml` overwrites the wrapper.
+
+**Ansible inventory wiring:**
+`infrastructure/ansible/inventory/test-hosts.ini` is set up so workers
+are reached via the master using `ProxyCommand` (workers have no public
+IPs). See `infrastructure/ansible/inventory/test-hosts.ini` for the
+exact configuration.
+
 ### End-to-End ML Pipeline Validation Against Real AWS (this session)
 
 Resolved the worker → AWS egress blocker from the previous session by
