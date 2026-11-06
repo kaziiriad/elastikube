@@ -6,15 +6,24 @@ This module provides:
 - Uses DynamoDB conditional writes for atomic operations
 """
 
+import logging
 import time
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import boto3
 from botocore.exceptions import ClientError
 
 from utils.config import get_config
+
+logger = logging.getLogger(__name__)
+
+# A scaling_in_progress flag older than this is treated as abandoned.
+# Must exceed the longest Lambda timeout that sets the flag (300s in
+# infrastructure/pulumi/__main__.py), so a live holder is never preempted.
+LOCK_STALE_SECONDS = 360
 
 
 @dataclass
@@ -60,7 +69,10 @@ class ClusterState:
 
         try:
             last_time = datetime.fromisoformat(self.last_scale_time)
-            elapsed = (datetime.utcnow() - last_time).total_seconds()
+            # Scale Lambdas write tz-aware UTC; treat naive values as UTC.
+            if last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
             return elapsed < cooldown_seconds
         except (ValueError, TypeError):
             return False
@@ -83,12 +95,19 @@ class DistributedLock:
         self._config = get_config()
         self._table_name = self._config.state_table_name
         self._cluster_id = self._config.cluster_name
+        self._owner = f"decision-{uuid.uuid4()}"
 
     def acquire(self, timeout_seconds: int = 60) -> bool:
         """Acquire the distributed lock.
 
-        Uses conditional write to atomically set scaling_in_progress=true
-        only if it's currently false.
+        Atomically sets scaling_in_progress=true (plus owner and timestamp)
+        when the flag is free, or when the current holder is presumed dead:
+        its scaling_in_progress_since is older than LOCK_STALE_SECONDS, or it
+        has no timestamp at all (legacy writes that never recorded one).
+
+        The flag is shared with the scale-up Lambda, which writes the same
+        scaling_in_progress_since attribute, so a crashed scale-up is also
+        recovered here.
 
         Args:
             timeout_seconds: Maximum time to wait for lock (default: 60s)
@@ -99,15 +118,31 @@ class DistributedLock:
         start_time = time.time()
 
         while time.time() - start_time < timeout_seconds:
+            now = datetime.now(timezone.utc)
+            stale_cutoff = now - timedelta(seconds=LOCK_STALE_SECONDS)
             try:
                 self._client.update_item(
                     TableName=self._table_name,
                     Key={"cluster_id": {"S": self._cluster_id}},
-                    UpdateExpression="SET scaling_in_progress = :true",
-                    ConditionExpression="scaling_in_progress = :false OR attribute_not_exists(scaling_in_progress)",
+                    UpdateExpression=(
+                        "SET scaling_in_progress = :true, "
+                        "scaling_in_progress_since = :now, "
+                        "lock_owner = :owner"
+                    ),
+                    # ISO-8601 UTC strings with the same offset sort
+                    # chronologically, so a string compare is safe here.
+                    ConditionExpression=(
+                        "attribute_not_exists(scaling_in_progress) "
+                        "OR scaling_in_progress = :false "
+                        "OR attribute_not_exists(scaling_in_progress_since) "
+                        "OR scaling_in_progress_since < :stale_cutoff"
+                    ),
                     ExpressionAttributeValues={
                         ":true": {"S": "true"},
                         ":false": {"S": "false"},
+                        ":now": {"S": now.isoformat()},
+                        ":owner": {"S": self._owner},
+                        ":stale_cutoff": {"S": stale_cutoff.isoformat()},
                     },
                 )
                 return True
@@ -122,17 +157,32 @@ class DistributedLock:
         return False  # Timeout
 
     def release(self) -> None:
-        """Release the distributed lock."""
+        """Release the distributed lock if this instance still owns it.
+
+        If the lock was taken over (we were judged stale), leave it alone so
+        we don't release someone else's lock.
+        """
         try:
             self._client.update_item(
                 TableName=self._table_name,
                 Key={"cluster_id": {"S": self._cluster_id}},
-                UpdateExpression="SET scaling_in_progress = :false",
+                UpdateExpression=(
+                    "SET scaling_in_progress = :false "
+                    "REMOVE scaling_in_progress_since, lock_owner"
+                ),
+                ConditionExpression="lock_owner = :owner",
                 ExpressionAttributeValues={
                     ":false": {"S": "false"},
+                    ":owner": {"S": self._owner},
                 },
             )
         except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                logger.warning(
+                    "Lock no longer owned by %s (taken over as stale); not releasing",
+                    self._owner,
+                )
+                return
             raise RuntimeError(f"Failed to release lock: {e}") from e
 
     def __enter__(self):
