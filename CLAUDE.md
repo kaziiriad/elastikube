@@ -954,3 +954,88 @@ explicitly accepted the partial upload as progress.
 - `/home/ubuntu/k3s.yaml` on master — copy of k3s kubeconfig with
   ubuntu ownership so `kubernetes.core.k8s` and `kubectl
   --kubeconfig=` work without `sudo`.
+
+### Bash-Script Bug Fixes (this session)
+
+Fixed three coupled bugs in the model-selection / validation / upload
+chain that were silently uploading the `_metrics.json` stub (81-269 B)
+to `s3://k3s-models/models/cpu_prophet_model.json` instead of the real
+~896 KB Prophet model, and producing NaN validation metrics every run.
+
+**`infrastructure/ansible/roles/ml-training-cronjob/templates/ml-training-script.sh.j2`:**
+
+1. **Line 38 — model-file selection** — `ls -t models/cpu_prophet_model_*.json | head -1`
+   is non-deterministic when the model + its sibling `_metrics.json`
+   are written in the same second (same mtime, ambiguous ordering).
+   Replaced with `... | grep -v _metrics.json | head -1` so the model
+   artifact is always selected.
+
+2. **Line 58 — metrics-path computation** — `${MODEL_FILE}_metrics.json`
+   on `MODEL_FILE=cpu_prophet_model_<ts>.json` produced
+   `cpu_prophet_model_<ts>.json_metrics.json` (double extension),
+   missing the file `validate_model.py` actually writes. Replaced with
+   `${MODEL_FILE%.json}_metrics.json` so the result is
+   `cpu_prophet_model_<ts>_metrics.json` (matches what
+   `validate_model.py` writes).
+
+**`ml_training/scripts/validate_model.py`:**
+
+3. **`backtest()` prediction frame** — `model.predict(test[["ds"]].copy())`
+   raised `Regressor 'pending_pods' missing from dataframe` because
+   the trained model has `pending_pods` and `worker_count` as extra
+   regressors but the prediction frame only had `ds`. Replaced with
+   `future = test[["ds", *model.extra_regressors.keys()]].copy()` —
+   auto-discovers regressors from the fitted model; falls back to
+   the conventional names if `extra_regressors` is missing.
+
+4. **`main()` history loader** — `history = history[["ds", "y"]].dropna()`
+   dropped the regressor columns that `backtest()` needs once it
+   starts asking for them. Now preserves `pending_pods` and
+   `worker_count` columns if present in the source CSV.
+
+5. **`main()` tz-strip** — `pd.read_csv(..., parse_dates=["timestamp"])`
+   produces tz-aware `ds` from `extract_data.py`'s ISO-format column,
+   which makes Prophet's `make_future_dataframe` reject the column.
+   Added `if history["ds"].dt.tz is not None: history["ds"] = history["ds"].dt.tz_localize(None)`.
+
+### End-to-End Validation Against LocalStack Pro (this session)
+
+AWS `poridhi-aws` account is empty + `ombg-poridhi` IAM user is
+missing `s3:*`, `dynamodb:*`, and `iam:*` create permissions, so
+neither a fresh 1+2 k3s cluster nor a real DynamoDB seed was possible.
+Validated the bash + Python fixes end-to-end against LocalStack Pro
+(`localstack-aws` container, `:4566`, edition `pro`, version `2026.8.1`).
+
+**Bootstrap:**
+```sh
+./scripts/bootstrap-localstack.sh   # S3 buckets + 4 DDB tables + 5 AWS-mgd-policy ARNs
+python3 scripts/seed_ml_tables.py --days 7 --region ap-southeast-1
+# -> 5040 metrics samples + 219 scaling-history rows (Decimal, second precision)
+```
+
+**Pipeline (run inside `k3s-ml-training:latest`, mounted /app/scripts + /app/utils
+to preserve the image's `/app/.venv`):**
+- `extract_data.py` → 5033 metric rows (5040 sampled - some tz-deduped)
+- `train_model.py` → fits Prophet with `pending_pods`+`worker_count` regressors,
+  saves `cpu_prophet_model_20260905_174359.json` (896,109 B) +
+  `..._metrics.json` stub (124 B)
+- `validate_model.py` against the real model JSON now succeeds —
+  MAE **7.24**, RMSE **10.06**, MAPE **16.55%**, **7200 samples**
+- boto3 upload lands the real model JSON in `s3://k3s-models/models/`:
+  ```
+  cpu_prophet_model_20260905_174359.json   896,109 B   (versioned)
+  cpu_prophet_model.json                   896,109 B   (latest pointer, first bytes = {"growth": "linear", ..., "__prophet_version": "1.4.0"})
+  cpu_prophet_model_20260905_174359_metrics.json   109 B   (real {mae,rmse,mape,samples})
+  ```
+
+`predictive.py:load_model_from_s3("cpu_prophet_model.json")` round-trip
++ `get_cpu_prediction(regressor_values={...})` against LocalStack is
+unchanged from earlier sessions — already validated.
+
+### Outstanding (deferred)
+- Real-AWS `poridhi-aws` validation deferred — `ombg-poridhi` IAM user
+  is missing `s3:CreateBucket`, `dynamodb:CreateTable`, and an EC2
+  RunInstances policy. Permissions need to be granted by an account
+  admin before a 1+2 k3s cluster can be re-provisioned to re-test the
+  bash script on real AWS. The LocalStack validation covers the same
+  code paths with full coverage of the boto3/dynamodb/s3 APIs.

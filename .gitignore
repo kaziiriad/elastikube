@@ -52,6 +52,7 @@ terraform.tfplan
 *.pem
 *.key
 .env
+*.env
 .env.local
 .env.*.local
 
