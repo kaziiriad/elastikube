@@ -131,7 +131,9 @@ class PrometheusClient:
         if control_plane_nodes:
             # Build regex pattern to exclude control-plane nodes
             # Escape dots in node names for regex
-            escaped_nodes = [n.replace(".", r"\.") for n in control_plane_nodes]
+            # The pattern lands inside a double-quoted PromQL string, where the
+            # regex `\.` must itself be escaped as `\\.` (bare `\.` is a parse error).
+            escaped_nodes = [n.replace(".", r"\\.") for n in control_plane_nodes]
             exclude_pattern = "|".join(escaped_nodes)
 
             logger.info(f"Control-plane nodes found: {control_plane_nodes}")
