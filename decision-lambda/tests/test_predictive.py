@@ -4,11 +4,12 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
-import numpy as np
-import pandas as pd
 import pytest
 
+# Prophet (and numpy/pandas) aren't Lambda deps; skip when absent.
 prophet = pytest.importorskip("prophet")
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 from prophet.serialize import model_to_json  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
