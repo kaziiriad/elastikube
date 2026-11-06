@@ -1,0 +1,9 @@
+---
+# Just the deploy step (master).
+- name: Deploy ML training CronJob to k3s cluster
+  hosts: master
+  gather_facts: false
+  tasks:
+    - include_role:
+        name: ml-training-cronjob
+        tasks_from: deploy-cronjob.yml

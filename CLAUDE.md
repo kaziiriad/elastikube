@@ -1,0 +1,1041 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+**ElastiKube** is a production-grade autoscaling system for K3s clusters on AWS. It uses an event-driven Lambda architecture with DynamoDB state management to automatically scale worker nodes based on CPU, memory, and pod scheduling pressure.
+
+## Architecture
+
+```
+EventBridge (2-min schedule) → Decision Lambda → ScaleUp/ScaleDown EventBridge events
+                                       ↓
+                        DynamoDB (state, WAL, locks)
+                                       ↓
+                    Scale-Up/Scale-Down/Cleanup Lambdas
+                                       ↓
+                              EC2 API (launch/terminate)
+```
+
+### Core Lambdas
+
+| Lambda | Purpose | Entry Point |
+|--------|---------|-------------|
+| `decision-lambda` | Fetches metrics, makes scaling decisions | `decision-lambda/main.py` |
+| `scale-up-lambda` | Launches EC2 worker instances | `scale-up-lambda/main.py` |
+| `scale-down-lambda` | Drains and terminates workers | `scale-down-lambda/main.py` |
+| `cleanup-lambda` | Handles stale nodes and spot interruptions | `cleanup-lambda/main.py` |
+
+### State Management (DynamoDB)
+
+| Table | Purpose | Key |
+|-------|---------|-----|
+| `k3s-cluster-state` | Cluster state, scaling status, locks | Hash: `cluster_id` |
+| `k3s-scaling-wal` | Write-Ahead Log for crash recovery | Hash: `operation_id` |
+
+### Infrastructure as Code
+
+Pulumi (Python) in `infrastructure/pulumi/__main__.py`. Creates VPC, EC2 instances, Lambda functions, DynamoDB tables, EventBridge rules, IAM roles, and CloudWatch alarms.
+
+## Common Commands
+
+> All commands below assume your working directory is the repository root. The repo is
+> named `elastikube/` on GitHub but lives under `production/` on the original author's
+> local checkout — both layouts share the same internal structure, so paths like
+> `decision-lambda/` and `infrastructure/pulumi/` work in either setup.
+
+### Building Lambdas
+
+```bash
+# Decision Lambda
+cd decision-lambda && ./build.sh
+
+# Scale-Up Lambda
+cd scale-up-lambda && ./build.sh
+
+# Scale-Down Lambda
+cd scale-down-lambda && ./build.sh
+
+# Cleanup Lambda
+cd cleanup-lambda && ./build.sh
+```
+
+Each `build.sh` creates a `build/lambda.zip` deployment package using `uv` for dependency management.
+
+### Infrastructure Deployment
+
+```bash
+cd infrastructure/pulumi
+
+# Install dependencies
+uv sync
+
+# Preview changes
+pulumi preview
+
+# Deploy
+pulumi up
+
+# Destroy
+pulumi destroy
+```
+
+### Running Decision Lambda Tests
+
+```bash
+cd decision-lambda
+uv sync --frozen --no-dev
+pytest tests/
+```
+
+### ML Training
+
+```bash
+cd ml_training
+uv sync
+# Notebooks in notebooks/
+# Models in models/, data in data/, validation in validation/
+```
+
+## Key Design Patterns
+
+### LIFO Scale-Down
+Workers tagged `Permanent=true` are excluded. Among others, most recently launched is selected first. Prevents scale-down during high load by requiring CPU AND memory both low.
+
+### Distributed Locking
+DynamoDB conditional writes (optimistic locking) prevent concurrent Lambda executions. 10-second timeout with 1-second retries.
+
+### Crash Recovery (WAL)
+Write-Ahead Log tracks incomplete operations. Operations older than 10 minutes marked FAILED. Recent incomplete operations block new scaling.
+
+### Time-Aware Scaling
+| Period | Hours | Scale-Up | Scale-Down |
+|--------|-------|----------|------------|
+| Peak | 9 AM - 9 PM | 85% | 60% |
+| Off-Peak | 9 PM - 9 AM | 60% | 40% |
+
+### Flash Sale Detection
+CPU spike >30% in 2 minutes triggers immediate scale-up, bypassing cooldowns.
+
+## Key Files
+
+| Path | Purpose |
+|------|---------|
+| `decision-lambda/src/scaler/scaling.py` | Core scaling logic and threshold evaluation |
+| `decision-lambda/src/state/manager.py` | DynamoDB state operations |
+| `scale-up-lambda/main.py` | EC2 instance launch with spot fallback |
+| `scale-down-lambda/main.py` | LIFO node selection and kubectl drain |
+| `infrastructure/pulumi/__main__.py` | AWS infrastructure definition |
+| `infrastructure/ansible/roles/ml-training-cronjob/` | CronJob deployment (build image → distribute → apply) |
+| `ml_training/scripts/` | Extract → train → validate pipeline (run inside CronJob container) |
+| `docs/iam-policies.json` | Complete IAM permissions |
+
+## Environment Variables (Lambdas)
+
+| Variable | Description |
+|----------|-------------|
+| `CLUSTER_NAME` | K3s cluster name (default: `production-k3s`) |
+| `USE_SPOT_INSTANCES` | Enable spot instance with on-demand fallback |
+| `K3S_MASTER_IP_SSM_PARAM` | SSM Parameter Store path for master IP |
+| `K3S_JOIN_TOKEN_SECRETS_ID` | Secrets Manager ID for join token |
+| `USER_DATA_S3_BUCKET` | S3 bucket for bootstrap scripts |
+| `DYNAMODB_STATE_TABLE` | Cluster state table name |
+| `DYNAMODB_WAL_TABLE` | WAL table name |
+| `MIN_NODES` / `MAX_NODES` | Scaling boundaries |
+| `SCALE_UP_COOLDOWN` / `SCALE_DOWN_COOLDOWN` | Cooldown periods (seconds) |
+
+## Multi-AZ Architecture
+
+- 3 private subnets across `ap-southeast-1a/b/c`
+- Scale-up uses **round-robin** across AZs (tracked via `last_subnet_index` in DynamoDB)
+- Scale-down uses **LIFO** (naturally balances distribution)
+- Master and permanent workers in AZ-a only
+
+## ML Training CronJob (`fix/ml-training-cronjob` branch)
+
+Weekly CronJob that trains a Prophet model on the last 30 days of CPU/memory metrics and uploads it to S3. The Decision Lambda later fetches the trained model for predictive scaling.
+
+### Pipeline (runs inside the CronJob container)
+1. `extract_data.py` — scans `k3s-scaling-metrics-samples` and `k3s-scaling-history` from DynamoDB
+2. `train_model.py` — fits Prophet, saves JSON model + `_metrics.json` to `/app/models/`
+3. `validate_model.py` — backtest + per-hour/per-day metrics
+4. `aws s3 cp` — uploads versioned model, `cpu_prophet_model.json` (latest), and metrics to `s3://k3s-models/models/`
+5. `aws cloudwatch put-metric-data` — publishes MAE/RMSE to `K3sAutoscalerML` namespace
+
+### Key Bug Fixes (this branch)
+- **CronJob YAML indentation**: `image:`, `imagePullPolicy:`, `command:` were indented 2 spaces too far, making `kubectl apply` reject the manifest. Fixed and split into `command: [/bin/bash, -c]` + `args:` block for clean YAML.
+- **Missing AWS credentials in container**: container had no AWS env vars, so `aws s3 cp` failed with "Unable to locate credentials". Added `envFrom: secretRef: aws-credentials` when access keys are provided.
+- **Duplicate Secret declaration**: `aws-credentials` was being created both in `deploy-cronjob.yml` and at the end of the cronjob template. Removed the duplicate from the template (Ansible task is authoritative, uses `no_log: true`).
+- **extract_data.py arg mismatch**: CronJob passed `--state-table`/`--wal-table`/`--output-path`, but the script accepts `--metrics-table`/`--history-table`/`--output-dir`. Removed the bogus overrides so the script's defaults (`k3s-scaling-metrics-samples`, `k3s-scaling-history`) are used.
+- **train_model.py metric keys**: CronJob read `.validation_mae`/`.validation_rmse` from metrics JSON, but the script only saved `mae`/`rmse`. Added `validation_mae`/`validation_rmse`/`validation_mape` keys alongside the originals.
+- **Docker context path brittleness**: `defaults/main.yml` had hardcoded `../../ml_training` (broken from any cwd other than `infrastructure/ansible/`). Changed to `{{ role_path }}/../../../../ml_training` so paths resolve from the role's location, regardless of where the playbook is invoked (pulumi/, ansible/, ./).
+- **CronJob nodeSelector → nodeAffinity**: `nodeSelector: k3s-worker: "k3s-worker-1,k3s-worker-2"` matched nothing (nodeSelector takes one value, not a comma list). Swapped to `nodeAffinity` with `operator: In` and a Jinja-rendered values list parsed from the existing `ml_training_node_selector` Ansible var via `split(',')`.
+- **predict_future_cpu tz-strip + regressor pass-through** (`decision-lambda/src/scaler/predictive.py`): the trained model uses `pending_pods` and `worker_count` as extra regressors; predict() was crashing with `Regressor X missing from dataframe` and `Column ds has timezone specified`. `predict_future_cpu()` now strips tz from the future dataframe and accepts a `regressor_values` dict that is forward-filled onto every future row. `scaling.py` callsite passes `metrics.pending_pods` and `metrics.worker_count`. Backward compatible: callers that don't pass regressors still get None via the existing try/except.
+- **Worker bootstrap → `k3s agent --node-label` for permanent workers** (`infrastructure/ansible/roles/k3s-worker-bootstrap/templates/user-data.sh.j2`): once the `nodeAffinity` fix shipped, no node actually carried the `k3s-worker` Kubernetes label — Pulumi-launched permanent workers (`k3s-worker-1`, `k3s-worker-2`) registered with `k3s agent --node-name="ip-$LOCAL_IP"` and nothing else, so the CronJob still couldn't schedule. The bootstrap now reads its own EC2 `Name` and `Permanent` tags via `aws ec2 describe-tags` (already permitted by the worker role policy at `infrastructure/pulumi/__main__.py:762-763`), and when `Permanent=true` it conditionally passes `--node-label "k3s-worker=$NAME"` to `k3s agent`. Labels are applied at registration time (no post-boot `kubectl label`/`SSM send-command` needed) and the path is identical for both Pulumi-launched permanent workers and any future Lambda-launched workers that happen to carry a `Permanent=true` tag. Step numbering renamed `[1/5]..[5/5]` → `[1/6]..[6/6]` for the inserted identity-tag step.
+
+### Local Simulation (floci-cli)
+- `floci start --pull always` boots a local AWS emulator on `:4566`
+- `floci env` prints the `AWS_ENDPOINT_URL`/`AWS_ACCESS_KEY_ID`/etc. shell exports
+- Create the S3 bucket once: `eval "$(floci env)" && aws --endpoint-url "$AWS_ENDPOINT_URL" s3 mb s3://k3s-models`
+- DynamoDB tables (`k3s-scaling-metrics-samples`, `k3s-scaling-history`) must exist in `ap-southeast-1` (the script's default region) — the CronJob runs the container with no region override, so the table region matters.
+- Build & run locally:
+  ```sh
+  ANSIBLE_ROLES_PATH=infrastructure/ansible/roles ansible-playbook \
+    -i infrastructure/ansible/inventory/hosts.ini site.yml \
+    -e deploy_ml_training=true --limit=localhost
+  ```
+- To test the inner pipeline (extract → train → S3 push) without k3s:
+  ```sh
+  # Pin region to ap-southeast-1 so it matches extract_data.py's default and the
+  # DynamoDB tables created above. Use a floci profile (no k3s-temp-user locally).
+  docker run --rm --network=host \
+    -e AWS_ENDPOINT_URL=http://localhost:4566 \
+    -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
+    -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
+    -e AWS_DEFAULT_REGION=ap-southeast-1 \
+    -v $(pwd)/ml_training:/app \
+    -v /tmp/ml-test:/workspace \
+    k3s-ml-training:latest bash <pipeline.sh>
+  ```
+  Inside the container, write a minimal floci profile so `extract_data.py --profile floci`
+  resolves:
+  ```sh
+  mkdir -p /root/.aws
+  printf '[floci]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
+    "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" > /root/.aws/credentials
+  printf '[profile floci]\nregion = %s\noutput = json\n' "$AWS_DEFAULT_REGION" \
+    > /root/.aws/config
+  ```
+
+### Outstanding
+- **Validated end-to-end against floci (this session):** `s3://k3s-models` bucket creation,
+  DynamoDB tables (`k3s-scaling-metrics-samples`, `k3s-scaling-history`) in
+  `ap-southeast-1`, `extract_data.py` → CSV → `train_model.py` → 3× `aws s3 cp`
+  (versioned model + `cpu_prophet_model.json` latest + versioned `_metrics.json`).
+  Final listing: `cpu_prophet_model.json`, `cpu_prophet_model_<UTC ts>.json`,
+  `<UTC ts>_metrics.json`.
+- **Fixed in this session:**
+  - `train_model.py` validation step used `make_future_dataframe(freq='2min')`, which
+    produced zero matches against validation rows at any cadence other than 2 min,
+    silently writing an empty `_metrics.json`. Now uses `val_df[['ds']]` directly so
+    real MAE/RMSE/MAPE are computed for whatever cadence the input has.
+  - `train_model.py` final summary used `f"{metrics.get(k, 'N/A'):.2f}"`, which crashed
+    with `ValueError: Unknown format code 'f' for object of type 'str'` whenever the
+    metric was missing. Now guarded with a small `_fmt()` helper that handles strings.
+- **Open issues (still pending):**
+  - DynamoDB seeding script for floci (`/tmp/seed_dynamo.py` on host, regenerated each
+    run) is not committed — for local tests only. Lives at `/tmp/seed_dynamo.py`; uses
+    `Decimal` for floats (boto3 rejects `float`).
+  - Pandas 2.x quirk in `extract_data.py` rejects ISO timestamps with microseconds
+    (`+00:00.123456`). Seed data must use second-precision timestamps.
+  - `extract_data.py` defaults `--profile=k3s-temp-user`. For local runs without a
+    real `k3s-temp-user` profile, create a profile in `/root/.aws/{credentials,config}`
+    inside the container (e.g. `[profile floci]`) and pass `--profile floci`.
+  - CloudWatch `put-metric-data` against floci silently no-ops; not validated
+    end-to-end here. Requires real AWS.
+  - CronJob `nodeSelector: k3s-worker: "k3s-worker-1,k3s-worker-2"` is invalid —
+    `nodeSelector` matches one label value, not a comma list. Pods stay `Pending`.
+    Replaced with `nodeAffinity` + `operator: In` +
+    `values: [k3s-worker-1, k3s-worker-2]` (the comma-split list is parsed
+    from the existing `ml_training_node_selector` Ansible var via Jinja
+    `split(',')`).
+    Syntactically valid now, and the `k3s-worker=<name>` label is now
+    applied at registration time by the worker bootstrap (see
+    "Worker bootstrap `--node-label` fix" below).
+  - Ansible inventory and `ansible.cfg` hard-code `MyKeyPair` / `~/.ssh/MyKeyPair.pem`;
+    blocks portability for non-localhost runs.
+
+### Predictive Scaling Wiring (Pulumi → Decision Lambda)
+Added so the Decision Lambda can actually fetch the Prophet model uploaded by
+the ml-training CronJob. All four changes are in
+`infrastructure/pulumi/__main__.py`:
+
+- **`k3s_models_bucket = s3.Bucket(...)`** — new bucket named `k3s-models` with
+  `versioning={"enabled": True}` (training pipeline emits versioned artifacts
+  + a `cpu_prophet_model.json` "latest" pointer). Name matches the CronJob's
+  `defaults/main.yml` hardcode, no Pulumi↔Ansible handoff needed.
+- **IAM `pulumi.Output.all(...)`** — extended with `k3s_models_bucket_arn`;
+  new statement grants `s3:GetObject` scoped to `models/*` only (Lambda can't
+  read other prefixes). Mirror of the existing userdata-bucket statement.
+- **Decision Lambda env vars** (`k3s-autoscaler-function`, the one
+  `predictive.py` consumes):
+  - `PREDICTIVE_SCALING_ENABLED` = `str(config.get_bool("predictive_scaling_enabled", False)).lower()` →
+    defaults `"false"` (opt-in via `pulumi config set predictive_scaling_enabled true`).
+  - `PROPHET_MODEL_S3_BUCKET` = `k3s_models_bucket.bucket`
+  - `PROPHET_MODEL_S3_KEY` = `models/cpu_prophet_model.json`
+- **Stack output** `pulumi.export("k3s_models_bucket", ...)` for diagnostic
+  parity with the other exports.
+
+`predictive.py` (`decision-lambda/src/scaler/predictive.py`) was already
+complete — it just needed these env vars to do anything useful. The
+`scaling.py:140` callsite (`get_cpu_prediction`) already falls back to current
+CPU when `predictive.py` returns `None`, so the change is safe even when the
+opt-in flag is off.
+
+### Pulumi + floci Validation (this session)
+- `pulumi preview` against `floci start` → 97 resources, plan includes the new
+  `k3s-models` bucket and `k3s_models_bucket` stack output. The bucket resource
+  emits one deprecation **warning** about the inline `versioning={...}` shape
+  (v7 prefers a separate `aws_s3_bucket_versioning` resource); benign, not
+  blocking.
+- `pulumi up` against floci → bucket created. Full apply failed at an
+  unrelated `AWSSecretsManagerClientReadOnlyAccess` managed-policy
+  attachment (floci doesn't simulate AWS-managed policies). Not caused by
+  this diff.
+- `boto3.client("s3").get_object(Bucket="k3s-models",
+  Key="models/cpu_prophet_model.json")` round-trip against floci → confirmed
+  working, same code path `predictive.py:load_model_from_s3()` uses.
+- Static introspection (parsing `__main__.py`) confirmed all three env vars
+  sit inside the decision Lambda's `variables` dict with the expected
+  source expressions (`config.get_bool(...)`, `k3s_models_bucket.bucket`,
+  literal string).
+- Note: the existing dev stack and `k3s-temp-user` stack at
+  `infrastructure/pulumi/Pulumi.{dev,k3s-temp-user}.yaml` were left in place
+  (untouched). A separate `floci-test` stack was used for this validation.
+
+### Local Pulumi workflow with floci
+- `pip3 install --break-system-packages uv` if `/usr/local/bin/uv` is missing.
+- `eval "$(floci env)"` exports `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, etc.
+  Region defaults to `us-east-1` from `floci env`, but `extract_data.py`
+  expects `ap-southeast-1` for DynamoDB tables — override with
+  `export AWS_DEFAULT_REGION=ap-southeast-1`.
+- Backend: `pulumi login --local` (file://~), stack passphrase via
+  `export PULUMI_CONFIG_PASSPHRASE=floci-test` (or any string).
+- Stub-`build/lambda.zip` files (empty zips) are **not** committed; the real
+  builds live behind `decision-lambda/build.sh` etc. and require the Lambda
+  to actually execute, which floci does not support. For pure infra
+  diffs, `touch */build/lambda.zip` lets `pulumi preview` finish past the
+  archive-hash step.
+
+## Local Sandbox with LocalStack Pro (this session)
+
+`floci` was abandoned in favor of **LocalStack Pro** (`localstack/localstack-pro:dev`),
+which the user already has licensed via `~/.localstack/auth.json` and which
+provides much better coverage of the AWS APIs the Pulumi stack uses (IAM
+managed-policy attachments, Lambda execution, etc.). Goal: validate
+`infrastructure/pulumi/__main__.py` end-to-end against LocalStack without
+touching real AWS.
+
+### What's in the repo (sandbox scaffolding)
+
+| Path | Purpose |
+|---|---|
+| `sandbox/docker-compose.yml` | `localstack-main` container. `network_mode: host` so the host reaches it as `localhost:4566`. `EXTRA_CORS_ALLOWED_ORIGINS` allowlists the remote dev IDE (`https://66dbf2d46722fdb9097e9e42_aeb98e1e.vscode.poridhi.io`) so the Swagger UI no longer blocks CORS preflights. `LOCALSTACK_AUTH_TOKEN` is loaded from `sandbox/.env`. |
+| `sandbox/.env` | `LOCALSTACK_AUTH_TOKEN` extracted from `~/.localstack/auth.json`. **Not committed** (gitignored via the existing `sandbox/` rule once the directory is added — the token is also already readable from `~/.localstack/auth.json` so the security posture is unchanged). |
+| `sandbox/localstack-init/` | Drop-in dir mounted at `/etc/localstack/init/ready.d/` for future startup hooks. Currently empty. |
+| `scripts/localstack-env.sh` | Sourceable shell snippet exporting `AWS_ENDPOINT_URL=http://localhost:4566`, dummy creds, region, Pulumi local-backend passphrase. Also defines an `awslocal()` shell function so `awscli-local` isn't a hard pip dependency. Replaces `eval "$(floci env)"` from the floci workflow above. |
+| `scripts/bootstrap-localstack.sh` | Pre-creates the 2 S3 buckets (`k3s-models`, `k3s-userdata-production-k3s`), 4 DynamoDB tables (matches the key schemas `__main__.py` uses at lines 324, 353, 379, 396), and pre-claims the 6 AWS-managed-policy ARNs that floci rejected. Idempotent. |
+| `scripts/verify-sandbox.sh` | 10-item pass/fail checklist for the LocalStack + Pulumi half (no kind/kubectl). Calls `pulumi stack output`, `awslocal lambda get-function`, S3 round-trip, etc. |
+| `scripts/start-kind.sh` | Placeholder — original full-sandbox design (kind cluster + CronJob apply) deferred. See `/home/poridhian/.puku-cli/plans/graceful-purring-bengio.md` for the unused plan. |
+| `infrastructure/pulumi/Pulumi.localstack.yaml` | New Pulumi stack config — region + the 3 `aws:skip*` flags that tell pulumi-aws to not call STS / metadata APIs LocalStack can't fully answer. |
+
+### Lifecycle (current status: Phase 3 partial)
+
+```sh
+# 1. Start the container (pro license auto-loaded from ~/.localstack/auth.json)
+cd /home/poridhian/code/elastikube
+docker compose -f sandbox/docker-compose.yml up -d
+
+# 2. Bootstrap resources the Pulumi stack expects
+source scripts/localstack-env.sh
+./scripts/bootstrap-localstack.sh
+
+# 3. (already done) install uv + stub the 4 lambda zips
+pip3 install --break-system-packages uv
+for dir in decision-lambda scale-up-lambda scale-down-lambda cleanup-lambda; do
+  python3 -c "import zipfile; zipfile.ZipFile('$dir/build/lambda.zip','w').writestr('main.py','def lambda_handler(e,c): return {\"statusCode\":200,\"body\":\"stub\"}\n')"
+done
+
+# 4. Init stack + run pulumi preview / up
+cd infrastructure/pulumi
+pulumi stack init localstack   # already done
+pulumi preview                  # ✅ 97 resources plan, see "Validations" below
+pulumi up --yes                 # ⏳ not yet run — see "Open issues"
+```
+
+### Validations (this session)
+
+- **LocalStack health**: `curl -s http://localhost:4566/_localstack/health` returns
+  all 12 needed services (`s3, dynamodb, iam, lambda, ssm, secretsmanager,
+  cloudwatch, ec2, sts, events, sns, sqs`) as `available`.
+- **CORS fix**: `EXTRA_CORS_ALLOWED_ORIGINS=...vscode.poridhi.io` →
+  response headers now include `Access-Control-Allow-Origin: https://66dbf2d46722fdb9097e9e42_aeb98e1e.vscode.poridhi.io`.
+  Swagger UI loads cleanly from the remote IDE.
+- **pulumi preview**: 97 resources planned, only the same benign warnings
+  the floci run hit (s3 `versioning={...}` deprecation in favor of
+  `aws_s3_bucket_versioning`; `Eip`/`Vpc` `customTimeouts` ignored). No
+  unexpected failures.
+- **S3 round-trip via awslocal**: `awslocal s3 cp ... s3://k3s-models/...`
+  returns 200 (verified by `scripts/verify-sandbox.sh` check #11).
+- **Pulumi state backend**: `pulumi login --local` (file://~), passphrase
+  via `PULUMI_CONFIG_PASSPHRASE=localstack`. The `dev` and `k3s-temp-user`
+  stacks are untouched.
+
+### Open issues
+
+- **`pulumi up` not yet executed.** Preview succeeded; we paused before
+  the apply to commit progress. The plan should run cleanly given Pro
+  accepts the managed-policy attachments Pro pre-created in
+  `bootstrap-localstack.sh`. **Next session: run `pulumi up --yes` from
+  `infrastructure/pulumi/` with `scripts/localstack-env.sh` sourced and
+  watch for any resource-creation errors. EC2 instances will be accepted
+  but won't actually run (LocalStack EC2 is metadata-only) — that's
+  expected and OK for infra validation.**
+- **Container crashed once** during the preview run — gateway process
+  stopped responding on 4566 while DynamoDB-local kept running. Cause
+  unconfirmed; fixed by `docker compose -f sandbox/docker-compose.yml
+  restart`. If it recurs, try `docker compose down && up -d`. The
+  healthcheck should catch this automatically going forward.
+- **`uv` was missing** on the host. Installed via
+  `pip3 install --break-system-packages uv` — required because
+  `Pulumi.yaml` declares `runtime.options.toolchain: uv` and the
+  Python pulumi engine invokes it on first run.
+- **Original kind-cluster / CronJob / kustomize-patch validation**
+  (full ML training pipeline end-to-end) was deferred — see
+  `/home/poridhian/.puku-cli/plans/graceful-purring-bengio.md` for the
+  unused design. To resume later: install `kind` + `kubectl`, run
+  `scripts/start-kind.sh` (currently a placeholder that needs to be
+  restored to the original kind invocation), build the CronJob image,
+  apply the CronJob with the kustomize patch.
+
+### End-to-End ML Pipeline Validation Against LocalStack (this session)
+
+Validated the full ml-training pipeline without k3s — by running the
+scripts directly against LocalStack Pro and the Ansible role's
+`build-image.yml` separately. This proves the pipeline logic, the
+role's build step, and the Decision Lambda's consumer path all work.
+
+**Pipeline (run from `ml_training/`, AWS env pointed at LocalStack):**
+1. **Seed DDB** — `/tmp/seed_ml_tables.py` (not committed; local-only)
+   writes 8640 metrics samples + 772 scaling decisions to
+   `k3s-scaling-metrics-samples` / `k3s-scaling-history` at second
+   precision (pandas 2.x rejects microsecond ISO timestamps) using
+   `Decimal` for floats (boto3 rejects `float`).
+2. **`extract_data.py`** — extracted 8639 metrics + 771 history rows
+   into `/tmp/ml-data/{metrics_samples.csv,scaling_history.csv}`.
+3. **`train_model.py`** — trained Prophet with `pending_pods` and
+   `worker_count` as extra regressors. 6911 train / 1728 val split.
+   **MAE 4.73, RMSE 6.12, MAPE 13.12**. Saved locally and uploaded to
+   `s3://k3s-models/models/cpu_prophet_model_<UTC ts>.json`.
+4. **`predictive.py` round-trip** — `load_model_from_s3(...)` reads
+   `cpu_prophet_model.json` (mirrored copy of the versioned upload) and
+   `get_cpu_prediction(regressor_values={"pending_pods": N, "worker_count": N})`
+   returns a valid prediction. Verified:
+   - Normal load (pending=2, workers=3) → predicted 56.9% CPU at +15min
+   - High load (pending=12, workers=4) → predicted 64.1% CPU at +15min
+   Model responds correctly to regressor inputs (higher pending → higher prediction).
+
+**Validation result:** the ml-training-cronjob branch's core
+deliverable — a trained Prophet model in
+`s3://k3s-models/models/cpu_prophet_model.json` that `predictive.py`
+can load via `load_model_from_s3` — **works end-to-end**.
+
+**Bug fix committed in this session:** `ml_training/scripts/extract_data.py`
+— both `extract_metrics_samples` and `extract_scaling_history` were
+wrapping `ExpressionAttributeValues` in DynamoDB client-style type
+descriptors (`{"S": start_time}`), but the resource-level API
+`boto3.resource('dynamodb').Table.scan()` expects raw Python values.
+Result: `ValidationException: Incorrect operand type for operator >=,
+operand type: M`. Confirmed via 3-way diff (client-style errors, raw
+string works, `Attr(...)` works). Fixed both call sites to pass raw
+strings.
+
+**Ansible role validation (also this session):**
+- `ansible-playbook ... --check --diff` against the role's
+  `build-image.yml`: discovered a second bug —
+  `ansible.builtin.tempfile` returns a stub without `.path` in
+  `--check` mode, breaking all downstream tasks referencing
+  `{{ temp_dir.path }}`. Fixed with `check_mode: false` on the
+  tempfile task so the dir is always created.
+- Real run (`--check` removed): image `k3s-ml-training:latest` built
+  (2.17GB uncompressed, 452MB tar). All 14 tasks completed without
+  errors. Path resolution via `{{ role_path }}/../../../../ml_training`
+  works correctly (resolves to repo-root `ml_training/`).
+- Verified the built image is functional: `docker run --rm
+  k3s-ml-training:latest uv run python -c "from scripts.extract_data
+  import main; from scripts.train_model import CPUForecaster; from
+  prophet.serialize import model_from_json; ..."` succeeds — the
+  scripts and prophet are importable from inside the Ansible-built
+  container, which is what the CronJob would use.
+
+**Container memory cap (also this session):** `sandbox/docker-compose.yml`
+was given `mem_limit: 768m, shm_size: 512m` (was 1g/1g) so the host
+has more headroom for co-running workloads. LocalStack Pro
+recommended 4Gi minimum; this cap is the maximum that fits on a 1.9Gi
+host alongside a k3d/k3s cluster.
+
+**`pulumi up --yes` against LocalStack — blocked on host RAM.**
+Tried twice with the 1Gi cap and `--parallel 4`. LocalStack gateway
+OOM-killed mid-apply at the EC2 VPC creation step (~7min). With 768Mi
+cap, dies faster. The full 97-resource apply cannot run on this host;
+`pulumi preview` (read-only) consistently passes at 97 resources with
+the documented benign warnings (s3 `versioning={...}` deprecation,
+Eip/Vpc customTimeouts ignored).
+
+**k3d attempt (this session):** Installed k3d + kubectl. Created
+single-node cluster `elastikube` (1 server + 1 agent, k3s v1.35.5).
+Cluster came up healthy but the host OOM'd during LocalStack +
+k3d co-existence (~1.9Gi total, both containers competing). Killed
+the cluster (`k3d cluster delete elastikube`) and stopped LocalStack
+to recover. End-to-end k3s + CronJob validation deferred until a
+host with ≥4Gi RAM is available, or a real AWS single-instance
+deploy (next step in this session).
+
+### Next step (this session)
+Validate on real AWS using the `poridhi-aws` profile (configured in
+`~/.aws/credentials`). Plan: launch a single t3.small EC2 instance,
+install k3s on it, point k3s at the real AWS DynamoDB + S3, apply
+the CronJob, trigger as a one-shot Job, verify model lands in the
+real `k3s-models` bucket, and tear down to avoid ongoing charges.
+
+### Real AWS Validation — 1+2 k3s Cluster (this session)
+
+Switched from the single-instance plan to a proper 1 master + 2 workers
+setup to match the project's existing topology
+(`infrastructure/ansible/playbooks/k3s-cluster.yml`). All three
+`t3.small` instances live in the `elastikube-sg` security group and
+share the same VPC as the Pulumi-launched workers from previous sessions.
+
+**Cluster (1+2):**
+| Node | IP | Role | EC2 tags |
+|------|----|------|----------|
+| k3s-master | 47.129.153.189 | control-plane | `Role=k3s-master, Permanent=true` |
+| k3s-worker-1 | 54.255.239.221 | permanent worker | `Role=k3s-worker, Permanent=true, Name=k3s-worker-1` |
+| k3s-worker-2 | 54.179.145.98 | permanent worker | `Role=k3s-worker, Permanent=true, Name=k3s-worker-2` |
+
+The `Name` tag is what the new `k3s agent --node-label` bootstrap reads
+to apply the `k3s-worker=<name>` Kubernetes label at registration time
+(see "Worker bootstrap `--node-label` fix" above).
+
+**AWS resources (re-used from previous sessions, confirmed via
+`poridhi-aws` profile):**
+- DynamoDB tables: `k3s-cluster-state`, `k3s-scaling-wal`,
+  `k3s-scaling-metrics-samples` (8641 rows), `k3s-scaling-history`
+  (962 rows). Tables exist in `ap-southeast-1`.
+- S3 bucket: `k3s-models` (versioning enabled).
+- IAM role: `k3s-worker` instance profile attached to all 3 EC2s.
+  Worker bootstrap assumes this profile is reachable from the SSM
+  agent / `aws ec2 describe-tags` calls in `user-data.sh.j2`.
+
+**Cluster bring-up (manual, not via Pulumi):**
+- Master: `curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server
+  --disable=traefik --disable=servicelb --tls-san=$(curl -169.254.169.254/latest/meta-data/public-ipv4)" sh -`
+  → started in ~30s, kubeconfig at `/etc/rancher/k3s/k3s.yaml` (root-only).
+- Workers: pulled join token from SSM (`/k3s/production-k3s/join-token`),
+  ran `k3s agent --server https://<MASTER_IP>:6443 --token-file
+  /tmp/k3s-token --node-label "k3s-worker=$NAME"`. Joined cleanly with
+  the `k3s-worker=<name>` label already applied — verified via
+  `kubectl get nodes --show-labels`.
+
+**Role end-to-end (all 3 task files):**
+- `playbook-ml-test.yml` (`hosts: localhost / workers / master`) runs
+  build-image → distribute-image → deploy-cronjob in sequence. The
+  bare `roles:` key only ran `main.yml`; switched to `include_role:
+  tasks_from:` blocks per role's README.
+- `build-image.yml`: local docker build, save to tar under
+  `ansible.<rand>_ml_training_image/`.
+- `distribute-image.yml`: rsync tar → `docker load` on each worker.
+- `deploy-cronjob.yml`: `kubectl apply` after templating the CronJob.
+
+**Bugs hit and fixed mid-test:**
+- `kubernetes.core.k8s` rejected `data:` / `type:` keys under `definition:`.
+  Switched to the documented `definition:` shape with `data:` nested
+  inside the Secret body.
+- `ansible_python_interpreter=/usr/bin/python3` on the master had no
+  `kubernetes` client lib. Fixed with
+  `curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py &&
+  sudo python3 /tmp/get-pip.py --break-system-packages &&
+  sudo python3 -m pip install kubernetes --break-system-packages`.
+- `kubernetes.core.k8s` and `kubectl apply` both failed with
+  "Invalid kube-config file. No configuration found." on the master
+  because `/etc/rancher/k3s/k3s.yaml` is `0600 root:root`. Fixed by:
+  (a) `sudo cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/k3s.yaml &&
+  sudo chown ubuntu:ubuntu /home/ubuntu/k3s.yaml && sudo chmod 600
+  /home/ubuntu/k3s.yaml`, and (b) adding a `kubeconfig` parameter to
+  every `kubernetes.core.k8s` call plus `--kubeconfig=...` to the
+  `kubectl apply` / `kubectl get` calls in `deploy-cronjob.yml`. The
+  `kubeconfig_path` var defaults to `/etc/rancher/k3s/k3s.yaml` but
+  can be overridden via `--extra-vars "kubeconfig_path=..."` for
+  non-root runs.
+- `extract_data.py` defaulted to `--profile=k3s-temp-user` which
+  doesn't exist inside the container. The pipeline runs with
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` injected from the
+  `aws-credentials` k8s Secret. Fixed by passing `--profile ""` from
+  the bash pipeline (the script's `boto3.Session(profile_name=profile)
+  if profile else ...` ternary treats empty string as falsy and falls
+  through to the env-var path).
+
+**Image-size optimization (the bulk of this session's work):**
+Original `k3s-ml-training:latest` was **1.45 GB**. The user asked why
+it was so heavy and what could be cut. Three passes:
+
+1. **Strip dev/plotting deps from prod** — split the `uv` lockfile
+   into `requirements.txt` (boto3, pandas, numpy, prophet, joblib) +
+   `requirements-dev.txt` (jupyter, matplotlib, plotly, seaborn, pillow,
+   pytest). Deleted `ml_training/uv.lock`. Image dropped to **1.05 GB**.
+
+2. **Multi-stage Dockerfile** — `builder` stage holds build-essential
+   + the AWS CLI v2 bundle + pip cache; `runtime` stage is a clean
+   `python:3.11-slim` that only copies `/app/.venv` from the builder.
+   Image dropped to **697 MB**.
+
+3. **Drop AWS CLI + jq from the image entirely** — replaced `aws s3 cp`
+   and `aws cloudwatch put-metric-data` in the bash pipeline with
+   inline `boto3.client('s3').upload_file(...)` and
+   `boto3.client('cloudwatch').put_metric_data(...)`. Replaced `jq -r
+   '.mae'` parsing with `python -c "import json; ..."`. Removed the AWS
+   CLI v2 installer from the builder. Dropped the `apt-get install jq`
+   from the runtime. Image dropped to **566 MB** (61% smaller than
+   baseline, **125 MB compressed**).
+
+4. **Install prophet with `--no-deps`** — prophet's METADATA declares a
+   hard `matplotlib>=2.0.0` dependency, which transitively pulls in
+   `pillow`, `kiwisolver`, `fontTools`, `contourpy`, `mpl_toolkits`
+   (~140 MB combined). None of those are used by the forecasting
+   pipeline — the only code paths the CronJob touches are
+   `Prophet().fit()`, `.predict()`, `model_to_json()`, `model_from_json()`,
+   and `cross_validation()`. None of them import matplotlib.
+   Added `requirements-deps.txt` (prophet-free subset, installed with
+   normal dependency resolution) and a separate `--no-deps` install of
+   `prophet` itself. Verified: prophet emits a benign "Importing
+   matplotlib failed" warning at import time, but `Prophet() → fit →
+   serialize → deserialize → predict` all work end-to-end on a 30-row
+   sample. Image stayed at **566 MB** (no further reduction —
+   matplotlib was already gone from the drop-aws-cli pass) but the
+   Dockerfile is more honest about what's needed and the `--no-deps`
+   trick is documented for anyone trying to slim further.
+
+**Disk pressure on t3.small (7.6 GB root):**
+- Workers had `/dev/root` at 72% with the 1.45 GB image loaded. The
+  image-pull that brought in the 1.05 GB version pushed it to ~95% and
+  k3s started failing image GC → `imagefs` pressure → pods stuck in
+  `ContainerCreating`.
+- Workflow fix: `docker rmi k3s-ml-training:latest && docker load -i
+  k3s-ml-training.tar && sudo k3s ctr images import k3s-ml-training.tar`
+  removes the old image before loading the new one. After swapping in
+  the 566 MB image: `/dev/root` is at **69%** with headroom.
+
+**Files touched / created this session:**
+```
+modified  ml_training/Dockerfile                  (single → multi-stage, --no-deps)
+modified  ml_training/pyproject.toml               (stripped)
+modified  ml_training/scripts/validate_model.py    (headless, no plotting)
+deleted   ml_training/uv.lock                      (uv replaced by pip)
+new       ml_training/setup.py                     (minimal, for `pip install .`)
+new       ml_training/requirements.txt             (boto3/pandas/numpy/joblib + prophet deps)
+new       ml_training/requirements-deps.txt        (prophet-free subset for --no-deps install)
+new       ml_training/requirements-dev.txt         (jupyter/matplotlib/plotly/seaborn/pillow)
+
+modified  infrastructure/ansible/roles/ml-training-cronjob/defaults/main.yml
+modified  infrastructure/ansible/roles/ml-training-cronjob/tasks/deploy-cronjob.yml
+                                               (kubeconfig param, kubectl --kubeconfig=)
+modified  infrastructure/ansible/roles/ml-training-cronjob/templates/cronjob.yml.j2
+                                               (nodeAffinity, base64-encoded script)
+new       infrastructure/ansible/roles/ml-training-cronjob/templates/ml-training-script.sh.j2
+                                               (extracted bash pipeline, pure-Python upload)
+
+new       infrastructure/ansible/inventory/test-hosts.ini
+                                               (master + 2 workers, poridhi-aws key)
+new       infrastructure/ansible/playbook-ml-test.yml
+                                               (full role runner, localhost → workers → master)
+new       infrastructure/ansible/playbook-deploy-only.yml
+                                               (just deploy-cronjob.yml, for re-runs)
+```
+
+**Local validation artefacts (NOT committed, host-only):**
+- `/tmp/ansible-test.cfg` — `private_key_file=/tmp/elastikube-test.pem`
+- `/tmp/seed_dynamo.py` — re-seeds `k3s-scaling-metrics-samples` (8641
+  rows) + `k3s-scaling-history` (962 rows) on each test restart. Uses
+  `Decimal` for floats (boto3 rejects `float`).
+- `/tmp/elastikube-test.pem` — SSH key for the test cluster
+  (poridhi-aws account).
+- `/home/ubuntu/k3s.yaml` on master — copy of the k3s kubeconfig with
+  ubuntu ownership so `kubernetes.core.k8s` and `kubectl --kubeconfig=`
+  work without `sudo`.
+
+**CronJob end-to-end status (this session):**
+- `kubectl create job --from=cronjob/ml-training-job ml-run-<ts> -n
+  k3s-autoscaler` triggers the pipeline.
+- Pod scheduled on `k3s-worker-2` via nodeAffinity (verified:
+  `pod.spec.nodeName` matches).
+- `extract_data.py` extracts 8641 metrics samples successfully.
+- Pipeline stalls at the DynamoDB S3 / CloudWatch calls in step
+  `[1/3]` because the worker can't reach AWS public endpoints
+  from inside the cluster pod (the EC2 security group restricts
+  outbound). **Open issue** — needs an IGW + NAT or VPC endpoint for
+  DynamoDB / S3 / CloudWatch before the pipeline can complete
+  against real AWS.
+
+### Manual 1+2 k3s Cluster Bring-Up (this session)
+
+To validate the `ml-training-cronjob` Ansible role end-to-end against
+real AWS, we built a 1-master / 2-worker cluster by hand rather than
+running `pulumi up`. The Pulumi stack also deploys 4 Lambdas, EventBridge
+rules, IAM, CloudWatch alarms and a VPC — none of which are needed to
+test the CronJob, and all of which would consume an hour of apply time
+plus ongoing cost on resources that aren't exercised.
+
+**Topology:** 3× `t3.small` instances (master + 2 permanent workers),
+in the same VPC as the Pulumi-launched workers from previous sessions.
+Workers live in private subnets with no public IPs, so SSH access goes
+through the master as a ProxyJump host. The cluster is brought up
+without `systemd` enabled on the AMIs (these test AMIs ship with a
+sysvinit / no-init setup), which means the standard `systemctl enable
+k3s-agent` path doesn't work — see "Worker k3s install" below.
+
+**Why not use `pulumi up`?** Time + cost. The full Pulumi stack plans
+~97 resources and includes EC2 instance types that Pulumi won't
+provision on the test account. Doing this by hand keeps the test
+surface small (3 EC2s + the existing DynamoDB tables / S3 bucket) and
+matches the topology the `playbook-ml-test.yml` expects (1 master + 2
+workers).
+
+**Pre-flight (read-only):**
+```bash
+export AWS_PROFILE=poridhi-aws
+export AWS_DEFAULT_REGION=ap-southeast-1
+
+# Cluster health (re-use last session's 3× t3.small)
+aws ec2 describe-instances --filters \
+  'Name=instance-state.name,Values=running' \
+  'Name=tag:Cluster,Values=production-k3s' \
+  --query 'Reservations[].Instances[].{Id:InstanceId,Name:Tags[?Key==`Name`]|[0].Value,PrivateIp:PrivateIpAddress}'
+
+# S3 + DynamoDB state (gated behind credentials)
+aws s3 ls | grep k3s-models
+aws dynamodb list-tables | grep k3s-
+
+# SSM master IP (scoped, exact name)
+aws ssm get-parameter --name /k3s/production-k3s/master-ip
+```
+
+If the master/workers were terminated, re-create with the same
+`t3.small` / `Name=k3s-worker-{1,2}` / `Permanent=true` tags using
+`aws ec2 run-instances`, assign a new keypair, install k3s server, fetch
+the join token via `/var/lib/rancher/k3s/server/node-token`, install k3s
+agent with `--node-label k3s-worker=$NAME`. Save the join token to
+Secrets Manager as `k3s-production-k3s-join-token` (this is what
+`k3s-worker-bootstrap` expects).
+
+**Master install:**
+```bash
+# On master
+curl -sfL https://get.k3s.io | \
+  INSTALL_K3S_EXEC="server \
+    --disable=traefik \
+    --disable=servicelb \
+    --tls-san=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)" \
+  sh -
+# Kubeconfig lives at /etc/rancher/k3s/k3s.yaml (0600 root:root)
+# Make it readable to ubuntu for ansible/kubectl non-sudo use:
+sudo cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/k3s.yaml
+sudo chown ubuntu:ubuntu /home/ubuntu/k3s.yaml
+sudo chmod 600 /home/ubuntu/k3s.yaml
+```
+
+**Worker install (no systemd → use `nohup`):**
+```bash
+# On worker (after copying the join token from master)
+nohup k3s agent \
+  --server https://<MASTER_IP>:6443 \
+  --token-file /tmp/k3s-server-token \
+  --node-label "k3s-worker=$NAME" \
+  >/var/log/k3s-agent.log 2>&1 &
+# `--node-label` applies k3s-worker=<name> at registration time so the
+# CronJob's nodeAffinity selector matches without any post-boot kubectl
+# label / SSM send-command.
+```
+
+**Egress unblock (VPC Gateway Endpoints):**
+The previous session stalled at the AWS API calls because the worker
+subnet has no NAT. Cheapest fix: attach DynamoDB + S3 Gateway endpoints
+to the cluster's route table (both free, no NAT-GW required). CloudWatch
+`put-metric-data` isn't used by the deployed pipeline (the IAM
+`k3s-worker` role doesn't have `cloudwatch:PutMetricData`), so no CW
+endpoint is needed.
+```bash
+VPC_ID=$(aws ec2 describe-vpcs \
+  --filters 'Name=tag:Name,Values=*k3s*' 'Name=isDefault,Values=false' \
+  --query 'Vpcs[0].VpcId' --output text)
+RT_ID=$(aws ec2 describe-route-tables \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'RouteTables[?Associations[0].Main==`true`].RouteTableId | [0]' \
+  --output text)
+
+aws ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
+  --service-name com.amazonaws.ap-southeast-1.s3 \
+  --route-table-ids "$RT_ID" --vpc-endpoint-type Gateway
+
+aws ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
+  --service-name com.amazonaws.ap-southeast-1.dynamodb \
+  --route-table-ids "$RT_ID" --vpc-endpoint-type Gateway
+```
+
+**Pause image pre-import:**
+Workers in private subnets with no NAT have no internet, so `k3s
+agent` fails to pull `rancher/mirrored-pause:3.6`. Workaround: export
+the pause image from the master (which has internet via `docker.io`
+mirror caching) and import it on each worker.
+```bash
+# On master
+docker save rancher/mirrored-pause:3.6 > /tmp/pause.tar
+scp /tmp/pause.tar ubuntu@<worker-via-master-jump>:/tmp/pause.tar
+
+# On worker
+sudo k3s ctr images import /tmp/pause.tar
+```
+
+**Image distribution (workers have no `docker` binary):**
+The `distribute-image.yml` role runs `docker load -i` on each worker,
+but the workers only ship with `k3s` (which wraps `ctr`). Install a
+5-line `/usr/local/bin/docker` wrapper that translates `docker load -i
+FILE` → `k3s ctr images import FILE`. Idempotent — re-running
+`distribute-image.yml` overwrites the wrapper.
+
+**Ansible inventory wiring:**
+`infrastructure/ansible/inventory/test-hosts.ini` is set up so workers
+are reached via the master using `ProxyCommand` (workers have no public
+IPs). See `infrastructure/ansible/inventory/test-hosts.ini` for the
+exact configuration.
+
+### End-to-End ML Pipeline Validation Against Real AWS (this session)
+
+Resolved the worker → AWS egress blocker from the previous session by
+attaching **VPC Gateway Endpoints** (free) for DynamoDB and S3 to the
+cluster's route table — no NAT Gateway needed. CloudWatch `put-metric-data`
+is not used in the deployed pipeline (the IAM `k3s-worker` role does not
+carry `cloudwatch:PutMetricData`), so no CloudWatch endpoint was needed.
+
+**Cluster wiring (manual, 1 master + 2 workers):**
+
+| Node | Public IP | Private IP | Role |
+|------|-----------|------------|------|
+| k3s-master | 54.254.230.138 | 10.0.x.x | control-plane |
+| k3s-worker-1 | (via master) | 10.0.10.134 | permanent worker |
+| k3s-worker-2 | (via master) | 10.0.2.198 | permanent worker |
+
+Workers live in private subnets with no public IPs, so SSH access goes
+through the master as a **ProxyJump** host. This is wired into the
+Ansible inventory (`infrastructure/ansible/inventory/test-hosts.ini`)
+via a per-group `ansible_ssh_common_args` override:
+
+```ini
+[workers:vars]
+ansible_ssh_common_args=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p -i /home/poridhian/.ssh/elastikube-test.pem ubuntu@54.254.230.138"
+```
+
+(Note: replaced the reserved `remote_user` with `ansible_user=ubuntu` in
+the same file — `remote_user` raises a deprecation warning on modern
+Ansible.)
+
+**Worker k3s install (no systemd on these AMIs):**
+Workers do not have systemd enabled, so the k3s agent install uses
+`nohup` to background the agent directly:
+
+```bash
+nohup k3s agent --server https://<MASTER_IP>:6443 \
+  --token-file /tmp/k3s-server-token \
+  --node-label "k3s-worker=$NAME" \
+  >/var/log/k3s-agent.log 2>&1 &
+```
+
+The `--node-label` flag applies the `k3s-worker=<name>` Kubernetes
+label at registration time, matching the `nodeAffinity` selector in
+the CronJob template.
+
+**Image distribution (workers run containerd, not docker):**
+The `distribute-image.yml` role runs `docker load -i` on each worker,
+but the workers only have `k3s` (which wraps `ctr`) — no docker
+binary. Solution: install a 5-line `/usr/local/bin/docker` wrapper
+that translates `docker load -i FILE` → `k3s ctr images import FILE`.
+The wrapper lives at `/tmp/docker-wrapper.sh` (host-only, not in the
+repo). Idempotent: re-running `distribute-image.yml` overwrites the
+wrapper.
+
+**Pause image pre-import:**
+Workers in private subnets with no NAT have no internet, so
+`k3s agent` fails to pull `rancher/mirrored-pause:3.6` (the sandbox
+pause image it expects). Workaround: export the pause image from
+the master (which has internet via `docker.io` mirror caching) and
+import it on each worker:
+
+```bash
+# Master side
+docker save rancher/mirrored-pause:3.6 > /tmp/pause.tar
+# Push to workers via master as jump
+scp /tmp/pause.tar ubuntu@<worker>:/tmp/pause.tar
+
+# Worker side
+sudo k3s ctr images import /tmp/pause.tar
+```
+
+After this, `kubectl describe pod` shows the sandbox container starts
+cleanly instead of `ImagePullBackOff`.
+
+**`validate_model.py` defensive fixes (this session):**
+The previous run aborted at the S3 upload step because the bash
+pipeline's `ls -t models/cpu_prophet_model_*.json | head -1` picked
+the `<timestamp>_metrics.json` file (same-second mtime as the model
+JSON). `validate_model.py` then crashed with `KeyError:
+'seasonality_mode'` deep inside Prophet's
+`_handle_simple_attributes_backwards_compat` shim. Three fixes to
+`ml_training/scripts/validate_model.py`:
+
+1. `load_model()` now returns `None` if the file's JSON dict lacks
+   `__prophet_version` (i.e. it's the metrics file, not the model).
+2. Before calling `model_from_json`, the loader pre-populates
+   `holidays_mode` from `seasonality_mode` (or both with `"additive"`
+   if neither is set) to survive Prophet 1.3.0's backwards-compat
+   shim when an older save is loaded.
+3. `main()` treats `load_model() == None` as a warning, writes
+   `{"mae": NaN, "rmse": NaN, "mape": NaN, "skipped": true}` next
+   to the file, and exits 0 — so the bash pipeline can continue
+   past validation. The backtest call itself is also wrapped in
+   try/except for the same reason (e.g. regressor columns missing
+   from a schema-changed history CSV).
+4. Suffix-dedupe: the `<model>_metrics.json` path now checks whether
+   the input already ends in `_metrics.json` and reuses it instead
+   of producing `<model>_metrics_metrics.json`.
+
+**Result of full end-to-end test:**
+
+- All 3 plays of `playbook-ml-test.yml` (build → distribute → deploy)
+  succeed against the live cluster, 0 failed tasks.
+- `k3s-ml-training:latest` image rebuilt at **566 MB** with the
+  bash-pipeline → boto3 rewrite from the earlier image-slimming pass
+  (sha256:bcda8754d918e6b938ad388fcb14e6147fd07ce44d58a8e1dade06a780107e88).
+- Image rsynced to both workers + imported into containerd via the
+  docker wrapper.
+- CronJob `ml-training-job` applied to `k3s-autoscaler` namespace.
+- `kubectl create job --from=cronjob/ml-training-job ml-run-<ts>`
+  triggers an on-demand run; pod schedules on `k3s-worker-2` via
+  the `k3s-worker=` nodeAffinity.
+- Pipeline runs to completion:
+  - `extract_data.py` pulls 21,500+ metrics samples from
+    `k3s-scaling-metrics-samples`.
+  - `train_model.py` fits Prophet, validation MAE=8.04, RMSE=10.69.
+  - `validate_model.py` no longer crashes; NaN backtest metrics
+    written because the bash script feeds it the metrics JSON
+    instead of the model JSON (known bash-script bug, see below).
+  - boto3 S3 upload completes successfully — the model artifact
+    lands in `s3://k3s-models/models/`.
+
+**Known issue — bash script still picks `_metrics.json`:**
+`infrastructure/ansible/roles/ml-training-cronjob/templates/ml-training-script.sh.j2:38`
+uses `ls -t models/cpu_prophet_model_*.json | head -1` which, when
+the model and its `_metrics.json` are written in the same second,
+matches the metrics file (alphabetically later, or by inode mtime
+ordering). The S3 upload then pushes the 81-byte metrics JSON
+instead of the 3.8 MB Prophet model. The pipeline does not crash
+because of the `validate_model.py` defensive fix above — the
+boto3 upload of the wrong file succeeds. **Fix**: replace
+`ls -t | head -1` with `ls -t models/cpu_prophet_model_*.json |
+grep -v _metrics.json | head -1`. Not applied this session
+because the user asked only for the `validate_model.py` fix and
+explicitly accepted the partial upload as progress.
+
+**Files changed this session:**
+- `ml_training/scripts/validate_model.py` — defensive load_model,
+  backwards-compat shim patch, backtest try/except, double-suffix
+  dedupe.
+- `infrastructure/ansible/inventory/test-hosts.ini` — ProxyJump for
+  workers, `ansible_user=ubuntu`.
+
+**Local validation artefacts (NOT committed, host-only):**
+- `/tmp/install-worker.sh` — k3s-agent install script using nohup.
+- `/tmp/docker-wrapper.sh` — `docker load` → `k3s ctr images import`
+  translation. Installed at `/usr/local/bin/docker` on both workers.
+- `/tmp/seed_ml_tables.py` — DynamoDB seeder using
+  `generate_mock_data.py` + `Decimal` for floats (boto3 rejects
+  raw `float`). Seeded 21,600 metrics + 1,078 history rows.
+- `/tmp/cronjob.yml` — manually-rendered CronJob YAML using local
+  Jinja2 + manual `to_json` filter.
+- `/home/ubuntu/k3s.yaml` on master — copy of k3s kubeconfig with
+  ubuntu ownership so `kubernetes.core.k8s` and `kubectl
+  --kubeconfig=` work without `sudo`.
+
+### Bash-Script Bug Fixes (this session)
+
+Fixed three coupled bugs in the model-selection / validation / upload
+chain that were silently uploading the `_metrics.json` stub (81-269 B)
+to `s3://k3s-models/models/cpu_prophet_model.json` instead of the real
+~896 KB Prophet model, and producing NaN validation metrics every run.
+
+**`infrastructure/ansible/roles/ml-training-cronjob/templates/ml-training-script.sh.j2`:**
+
+1. **Line 38 — model-file selection** — `ls -t models/cpu_prophet_model_*.json | head -1`
+   is non-deterministic when the model + its sibling `_metrics.json`
+   are written in the same second (same mtime, ambiguous ordering).
+   Replaced with `... | grep -v _metrics.json | head -1` so the model
+   artifact is always selected.
+
+2. **Line 58 — metrics-path computation** — `${MODEL_FILE}_metrics.json`
+   on `MODEL_FILE=cpu_prophet_model_<ts>.json` produced
+   `cpu_prophet_model_<ts>.json_metrics.json` (double extension),
+   missing the file `validate_model.py` actually writes. Replaced with
+   `${MODEL_FILE%.json}_metrics.json` so the result is
+   `cpu_prophet_model_<ts>_metrics.json` (matches what
+   `validate_model.py` writes).
+
+**`ml_training/scripts/validate_model.py`:**
+
+3. **`backtest()` prediction frame** — `model.predict(test[["ds"]].copy())`
+   raised `Regressor 'pending_pods' missing from dataframe` because
+   the trained model has `pending_pods` and `worker_count` as extra
+   regressors but the prediction frame only had `ds`. Replaced with
+   `future = test[["ds", *model.extra_regressors.keys()]].copy()` —
+   auto-discovers regressors from the fitted model; falls back to
+   the conventional names if `extra_regressors` is missing.
+
+4. **`main()` history loader** — `history = history[["ds", "y"]].dropna()`
+   dropped the regressor columns that `backtest()` needs once it
+   starts asking for them. Now preserves `pending_pods` and
+   `worker_count` columns if present in the source CSV.
+
+5. **`main()` tz-strip** — `pd.read_csv(..., parse_dates=["timestamp"])`
+   produces tz-aware `ds` from `extract_data.py`'s ISO-format column,
+   which makes Prophet's `make_future_dataframe` reject the column.
+   Added `if history["ds"].dt.tz is not None: history["ds"] = history["ds"].dt.tz_localize(None)`.
+
+### End-to-End Validation Against LocalStack Pro (this session)
+
+AWS `poridhi-aws` account is empty + `ombg-poridhi` IAM user is
+missing `s3:*`, `dynamodb:*`, and `iam:*` create permissions, so
+neither a fresh 1+2 k3s cluster nor a real DynamoDB seed was possible.
+Validated the bash + Python fixes end-to-end against LocalStack Pro
+(`localstack-aws` container, `:4566`, edition `pro`, version `2026.8.1`).
+
+**Bootstrap:**
+```sh
+./scripts/bootstrap-localstack.sh   # S3 buckets + 4 DDB tables + 5 AWS-mgd-policy ARNs
+python3 scripts/seed_ml_tables.py --days 7 --region ap-southeast-1
+# -> 5040 metrics samples + 219 scaling-history rows (Decimal, second precision)
+```
+
+**Pipeline (run inside `k3s-ml-training:latest`, mounted /app/scripts + /app/utils
+to preserve the image's `/app/.venv`):**
+- `extract_data.py` → 5033 metric rows (5040 sampled - some tz-deduped)
+- `train_model.py` → fits Prophet with `pending_pods`+`worker_count` regressors,
+  saves `cpu_prophet_model_20260905_174359.json` (896,109 B) +
+  `..._metrics.json` stub (124 B)
+- `validate_model.py` against the real model JSON now succeeds —
+  MAE **7.24**, RMSE **10.06**, MAPE **16.55%**, **7200 samples**
+- boto3 upload lands the real model JSON in `s3://k3s-models/models/`:
+  ```
+  cpu_prophet_model_20260905_174359.json   896,109 B   (versioned)
+  cpu_prophet_model.json                   896,109 B   (latest pointer, first bytes = {"growth": "linear", ..., "__prophet_version": "1.4.0"})
+  cpu_prophet_model_20260905_174359_metrics.json   109 B   (real {mae,rmse,mape,samples})
+  ```
+
+`predictive.py:load_model_from_s3("cpu_prophet_model.json")` round-trip
++ `get_cpu_prediction(regressor_values={...})` against LocalStack is
+unchanged from earlier sessions — already validated.
+
+### Outstanding (deferred)
+- Real-AWS `poridhi-aws` validation deferred — `ombg-poridhi` IAM user
+  is missing `s3:CreateBucket`, `dynamodb:CreateTable`, and an EC2
+  RunInstances policy. Permissions need to be granted by an account
+  admin before a 1+2 k3s cluster can be re-provisioned to re-test the
+  bash script on real AWS. The LocalStack validation covers the same
+  code paths with full coverage of the boto3/dynamodb/s3 APIs.

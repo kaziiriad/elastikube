@@ -15,7 +15,7 @@ echo "Cluster: $CLUSTER_NAME"
 echo "Region: $AWS_REGION"
 
 # Get instance metadata from IMDSv2
-echo "[1/5] Getting instance metadata..."
+echo "[1/6] Getting instance metadata..."
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds:21600" -s)
 INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id -s)
 LOCAL_IP=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 -s)
@@ -24,8 +24,44 @@ echo "  Instance: $INSTANCE_ID"
 echo "  IP: $LOCAL_IP"
 echo "  AZ: $AZ"
 
+# Read EC2 tags to determine if this worker is permanent (k3s-worker-1/2)
+# and to capture its `Name` value, which we'll apply as a Kubernetes node
+# label via `k3s agent --node-label`. This is what makes workloads pinned
+# via `nodeAffinity: { k3s-worker In [k3s-worker-1, k3s-worker-2] }` (e.g.
+# the ml-training CronJob) actually schedule on permanent workers.
+echo "[2/6] Reading worker identity tags from EC2..."
+WORKER_NAME=""
+WORKER_PERMANENT="false"
+TAGS_JSON=$(aws ec2 describe-tags \
+    --region "$AWS_REGION" \
+    --filters "Name=resource-id,Values=$INSTANCE_ID" \
+    --output json 2>/dev/null || echo '{"Tags":[]}')
+
+# Extract Name and Permanent from the tag set. Use python3 because the
+# workers' pre-baked AMI ships it (k3s-worker-bake.yml) and avoids a
+# fragile jq dependency in this single call site.
+eval "$(echo "$TAGS_JSON" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+out = {"WORKER_NAME": "", "WORKER_PERMANENT": "false"}
+for tag in data.get("Tags", []):
+    key, val = tag.get("Key", ""), tag.get("Value", "")
+    if key == "Name":
+        out["WORKER_NAME"] = val
+    elif key == "Permanent" and val.lower() == "true":
+        out["WORKER_PERMANENT"] = "true"
+for k, v in out.items():
+    print(f"{k}=\"{v}\"")
+')"
+
+if [ "$WORKER_PERMANENT" = "true" ] && [ -n "$WORKER_NAME" ]; then
+    echo "  Permanent worker detected: name=$WORKER_NAME (will set k8s label)"
+else
+    echo "  Ephemeral worker (no Permanent=true tag or no Name)"
+fi
+
 # Get master IP from SSM Parameter Store
-echo "[2/5] Fetching master IP from SSM Parameter..."
+echo "[3/6] Fetching master IP from SSM Parameter..."
 MAX_RETRIES=5
 RETRY_COUNT=0
 
@@ -54,7 +90,7 @@ if [ -z "$MASTER_IP" ]; then
 fi
 
 # Get K3s join token from Secrets Manager
-echo "[3/5] Fetching K3s join token from Secrets Manager..."
+echo "[4/6] Fetching K3s join token from Secrets Manager..."
 RETRY_COUNT=0
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
@@ -89,7 +125,7 @@ fi
 echo "  Primary interface: $PRIMARY_IFACE"
 
 # Start k3s agent (binary pre-installed in AMI - skip download)
-echo "[4/5] Starting k3s agent (pre-installed binary)..."
+echo "[5/6] Starting k3s agent (pre-installed binary)..."
 
 # Safety: stop any k3s server/agent that auto-started from AMI
 echo "  Stopping any auto-started k3s services..."
@@ -120,12 +156,23 @@ fi
 
 # Start k3s agent directly (bypass systemd for faster bootstrap)
 echo "Starting k3s-agent..."
+
+# Permanent workers carry an extra `--node-label` so the matching
+# Kubernetes label is set at registration time (no post-boot kubectl
+# step needed). Ephemeral workers get no extra label.
+NODE_LABEL_ARGS=()
+if [ "$WORKER_PERMANENT" = "true" ] && [ -n "$WORKER_NAME" ]; then
+    NODE_LABEL_ARGS=(--node-label "k3s-worker=$WORKER_NAME")
+    echo "  Applying k3s-worker=$WORKER_NAME label at registration"
+fi
+
 nohup /usr/local/bin/k3s agent \
     --token="$JOIN_TOKEN" \
     --server="https://$MASTER_IP:6443" \
     --node-ip="$LOCAL_IP" \
     --node-name="ip-$LOCAL_IP" \
     --flannel-iface="$PRIMARY_IFACE" \
+    "${NODE_LABEL_ARGS[@]}" \
     >> /var/log/k3s-agent.log 2>&1 &
 
 K3S_PID=$!
@@ -152,7 +199,7 @@ sleep 5
 
 # Check if k3s-agent process is still running
 if pgrep -f "k3s agent" > /dev/null 2>&1; then
-    echo "[5/5] Tagging instance..."
+    echo "[6/6] Tagging instance..."
 
     # Tag the instance with cluster metadata
     aws ec2 create-tags \

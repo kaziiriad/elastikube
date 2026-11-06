@@ -1,2 +1,3 @@
 config:
   k3s-autoscaler:use_spot_instances: "true"
+  ec2:keyPairName: MyKeyPair

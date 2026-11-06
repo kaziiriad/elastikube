@@ -2,6 +2,8 @@
 
 Production-grade autoscaling system for K3s clusters on AWS using event-driven Lambda architecture, DynamoDB state management, and EC2.
 
+![Thumbnail](./thumbnail.png)
+
 ## Project Overview
 
 This autoscaler monitors K3s cluster metrics via Prometheus and automatically scales worker nodes based on CPU, memory, and pod scheduling pressure. It uses an event-driven architecture with Lambda functions orchestrated through EventBridge for fault tolerance and retry capabilities.
@@ -1053,7 +1055,6 @@ cd monitoring/scripts
 ## Directory Structure
 
 ```
-production/
 ├── .github/workflows.disabled/  # Disabled GitHub Actions workflows
 ├── infrastructure/
 │   ├── pulumi/                 # Pulumi IaC for AWS resources
@@ -1666,6 +1667,22 @@ Tested with 30 days of synthetic metrics data generated to simulate realistic cl
 
 ## Recent Enhancements
 
+
+**v1.4 - ML Image Slimming + Real-AWS Validation (Latest)**
+
+| Feature | Description |
+|---------|-------------|
+| **Multi-stage Dockerfile** | `builder` stage holds build-essential + the AWS CLI v2 bundle + pip cache; `runtime` stage is a clean `python:3.11-slim` that only copies `/app/.venv`. No build toolchain ships in the runtime image. |
+| **Drop AWS CLI + jq from the image** | Pipeline was rewritten to use `boto3.client('s3').upload_file(...)` and `boto3.client('cloudwatch').put_metric_data(...)` instead of `aws s3 cp` / `aws cloudwatch put-metric-data`. JSON parsing moved from `jq` to the stdlib `json` module. |
+| **`prophet` installed with `--no-deps`** | Bypasses the matplotlib hard dependency in prophet's METADATA so PIL / pillow.libs / kiwisolver / fontTools / contourpy / mpl_toolkits are not pulled in. Prophet's forecasting pipeline (`fit`, `predict`, `cross_validation`, `model_to_json`/`model_from_json`) doesn't need matplotlib. |
+| **Image size 1.45 GB → 566 MB** | ~61% reduction. Compressed tar drops from 235 MB → 125 MB. Same forecasting output, headless container. |
+| **3-way Ansible role runtime fix** | `kubernetes.core.k8s` and `kubectl apply` now respect a `kubeconfig_path` var (default `/etc/rancher/k3s/k3s.yaml`); needed because k3s installs the kubeconfig as `0600 root:root` and the Ansible user can't read it. |
+| **Pipeline runs on real AWS** | Manual 1+2 cluster (master + 2 permanent workers, `t3.small`) in `poridhi-aws` account. CronJob `ml-training-job` schedules weekly retraining; `kubectl create job --from=cronjob/ml-training-job` triggers an on-demand run. Pod scheduled via `nodeAffinity` against the `k3s-worker=<name>` label applied by the worker bootstrap `--node-label` fix. |
+| **`extract_data.py` profile fix** | Default `--profile=k3s-temp-user` doesn't exist inside the container; pipeline now passes `--profile ""` so boto3 falls back to the `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars injected from the `aws-credentials` k8s Secret. |
+| **Defensive `validate_model.py`** | `load_model()` returns `None` if the input isn't a serialized Prophet model (no `__prophet_version` key), pre-populates `holidays_mode`/`seasonality_mode` for Prophet 1.3.0's backwards-compat shim, and `main()` writes NaN metrics + exits 0 on any failure — so the bash pipeline can continue past validation instead of aborting before the S3 upload. |
+| **Worker egress unblocked via VPC Gateway Endpoints** | DynamoDB + S3 Gateway endpoints attached to the cluster VPC route table (free, no NAT Gateway needed) so worker pods can reach the tables and the `k3s-models` bucket. |
+
+**Key fixes (this session):** `kubernetes.core.k8s` rejected `data:`/`type:` keys → use `definition:` · `kubectl apply` `0600` kubeconfig → copy to `~/.ssh` with `chmod 600` and pass `--kubeconfig=` · `extract_data.py` flaky profile resolution → `--profile ""` works against the container's env vars · `nodeSelector` comma list → `nodeAffinity` with `operator: In` plus a Jinja `split(',')` list · worker bootstrap now reads its own `Name` tag and conditionally passes `--node-label "k3s-worker=$NAME"` to `k3s agent` · `validate_model.py` swallows the wrong-file input (the bash script's `ls -t | head -1` sometimes picks the `_metrics.json` instead of the model JSON) and survives Prophet 1.3.0's backwards-compat shim that crashes on missing `holidays_mode`. Pipeline completes end-to-end on real AWS.
 
 **v1.3 - Fast Worker Bootstrap with Pre-Baked AMI**
 

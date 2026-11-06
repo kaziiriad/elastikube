@@ -47,8 +47,6 @@
       -f {{ ml_training_dockerfile_path }}
       -t {{ ml_training_image }}
       {{ ml_training_context_path }}
-  args:
-    chdir: "{{ playbook_dir }}/../.."
   register: docker_build
   # TODO(human): Add changed_when logic to detect if image was actually rebuilt
   # You can parse the docker build output to check if "Successfully built" appears
@@ -66,6 +64,10 @@
     state: directory
     suffix: _ml_training_image
   register: temp_dir
+  # Always create the dir even in --check mode so downstream tasks that
+  # reference temp_dir.path can resolve the variable. Otherwise `ansible.builtin.command`
+  # finalizer fails with "object of type 'dict' has no attribute 'path'".
+  check_mode: false
 
 - name: Save Docker image to tar file
   ansible.builtin.command:

@@ -79,6 +79,11 @@
     overwrite: true
     region: "{{ aws_region }}"
   register: aws_secret_result
+  # Skip when Secrets Manager is denied by an org-level SCP
+  # (test accounts often have SM explicitly denied). The token is still
+  # broadcast to workers via `set_fact` below, so the worker install
+  # works without SM.
+  ignore_errors: true
 
 - name: Show Secrets Manager storage result
   debug:

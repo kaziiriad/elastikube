@@ -1,0 +1,134 @@
+---
+# k3s-worker-static: install k3s agent on workers WITHOUT apt.
+#
+# Used for test clusters where workers live in private subnets without NAT
+# (so apt update / get.k3s.io can't reach package mirrors). The role:
+#   1. Slurps the k3s join token from the k3s-master node
+#   2. Pulls the k3s static binary from the k3s-master node (which has internet)
+#   3. SCPs it to this worker
+#   4. Writes /etc/rancher/k3s/k3s-{url,token}.env
+#   5. Starts the agent via nohup + disown with --node-label k3s-worker=$NAME
+#
+# Labels applied at registration time so the ml-training-cronjob's
+# nodeAffinity selector matches without any post-boot kubectl label.
+
+- name: Set k3s install version
+  set_fact:
+    k3s_install_version: "{{ k3s_install_version | default('v1.36.4+k3s1') }}"
+
+- name: Slurp k3s join token from master
+  slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  register: k3s_token_b64
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+  run_once: true
+
+- name: Decode k3s join token
+  set_fact:
+    k3s_cluster_token: "{{ k3s_token_b64.content | b64decode | trim }}"
+
+- name: Ensure /etc/rancher/k3s dir exists
+  file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Write K3S_URL env file
+  copy:
+    dest: /etc/rancher/k3s/k3s-url.env
+    content: "K3S_URL=https://{{ hostvars[groups['master'][0]]['ansible_host'] }}:6443\n"
+    mode: '0600'
+  become: true
+
+- name: Write K3S_TOKEN env file
+  copy:
+    dest: /etc/rancher/k3s/k3s-token.env
+    content: "K3S_TOKEN={{ k3s_cluster_token }}\n"
+    mode: '0600'
+  no_log: true
+  become: true
+
+- name: Check if k3s binary already present at /usr/local/bin/k3s
+  stat:
+    path: /usr/local/bin/k3s
+  register: k3s_bin
+
+- name: Download k3s binary on master
+  become: true
+  delegate_to: "{{ groups['master'][0] }}"
+  shell: |
+    curl -sfL https://github.com/k3s-io/k3s/releases/download/{{ k3s_install_version }}/k3s \
+      -o /tmp/k3s-{{ inventory_hostname }} && chmod 0644 /tmp/k3s-{{ inventory_hostname }}
+  when: not k3s_bin.stat.exists
+
+- name: SCP k3s binary from master to this worker
+  become: true
+  delegate_to: "{{ groups['master'][0] }}"
+  fetch:
+    src: "/tmp/k3s-{{ inventory_hostname }}"
+    dest: "/tmp/k3s-{{ inventory_hostname }}"
+    flat: yes
+  when: not k3s_bin.stat.exists
+
+- name: Move k3s binary to /usr/local/bin/k3s
+  copy:
+    src: "/tmp/k3s-{{ inventory_hostname }}"
+    dest: /usr/local/bin/k3s
+    mode: '0755'
+    owner: root
+    group: root
+  become: true
+  when: not k3s_bin.stat.exists
+
+- name: Read EC2 Name tag for the k3s-worker label
+  shell: "curl -s http://169.254.169.254/latest/meta-data/tags/instance/Name 2>/dev/null || true"
+  register: ec2_name_tag
+  changed_when: false
+
+- name: Set node_name fact
+  set_fact:
+    node_name: "{{ ec2_name_tag.stdout | default(inventory_hostname, true) }}"
+
+- name: Kill any existing k3s agent processes (idempotent - re-runs after stale installs)
+  shell: |
+    # Only kill processes whose executable is k3s - avoids killing ssh
+    # sessions whose command lines happen to contain "k3s agent" (e.g.
+    # an Ansible task that runs pgrep/pkill on k3s strings).
+    for pid in $(pgrep -x k3s 2>/dev/null) $(pgrep -f '^/usr/local/bin/k3s agent' 2>/dev/null); do
+      kill -9 "$pid" 2>/dev/null || true
+    done
+    true
+  become: true
+  changed_when: false
+
+- name: Check if k3s agent is already running
+  shell: pgrep -f '/usr/local/bin/k3s agent' || true
+  register: k3s_running
+  changed_when: false
+
+- name: Start k3s agent in background
+  shell: |
+    nohup /usr/local/bin/k3s agent \
+      --server https://{{ hostvars[groups['master'][0]]['ansible_host'] }}:6443 \
+      --token-file /etc/rancher/k3s/k3s-token.env \
+      --node-label "k3s-worker={{ node_name }}" \
+      >/var/log/k3s-agent.log 2>&1 < /dev/null &
+    disown
+    sleep 5
+    pgrep -f 'k3s agent' && echo OK || echo NOT_RUNNING
+  args:
+    executable: /bin/bash
+  become: true
+  when: k3s_running.stdout == ""
+  changed_when: false
+
+- name: Display agent log tail
+  shell: tail -10 /var/log/k3s-agent.log 2>&1 || true
+  register: agent_log
+  changed_when: false
+
+- name: Show agent log
+  debug:
+    msg: "{{ agent_log.stdout_lines }}"

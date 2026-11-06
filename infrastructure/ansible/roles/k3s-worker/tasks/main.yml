@@ -21,9 +21,22 @@
   debug:
     msg: "Joining cluster: {{ k3s_url }} with token {{ k3s_token[:20] }}..."
 
+- name: Read EC2 Name tag for k3s-worker label
+  shell: "curl -s http://169.254.169.254/latest/meta-data/tags/instance/Name 2>/dev/null || true"
+  register: ec2_name_tag
+  changed_when: false
+
+- name: Set NODE_NAME fact
+  set_fact:
+    node_name: "{{ ec2_name_tag.stdout | default(ansible_hostname, true) }}"
+
 - name: Download and install k3s agent
-  shell: |
-    curl -sfL https://get.k3s.io | K3S_URL={{ k3s_url }} K3S_TOKEN={{ k3s_token }} INSTALL_K3S_EXEC="agent --node-ip={{ ansible_default_ipv4.address }}" sh -
+  shell: >
+    curl -sfL https://get.k3s.io |
+    K3S_URL={{ k3s_url }}
+    K3S_TOKEN={{ k3s_token }}
+    INSTALL_K3S_EXEC="agent --node-ip={{ ansible_default_ipv4.address }} --node-label k3s-worker={{ node_name }}"
+    sh -
   args:
     creates: /usr/local/bin/k3s
 

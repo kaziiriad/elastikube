@@ -25,7 +25,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -58,19 +58,35 @@ def get_clients():
     return dynamodb_client, ec2_client
 
 
-def _publish_cloudwatch_metrics(metrics: ClusterMetrics, node_count: int, prometheus_healthy: bool = True) -> None:
+def _publish_cloudwatch_metrics(metrics: Optional[ClusterMetrics], node_count: int, prometheus_healthy: bool = True) -> None:
     """Publish cluster metrics to CloudWatch using PutMetricData API.
 
     This sends metrics directly to CloudWatch without embedding in logs.
 
     Args:
-        metrics: Cluster metrics from Prometheus
+        metrics: Cluster metrics from Prometheus, or None when unavailable
+            (only the PrometheusHealth metric is published then)
         node_count: Current node count
         prometheus_healthy: Whether Prometheus fetch succeeded (for health alarm)
     """
     import boto3
 
     cloudwatch = boto3.client("cloudwatch")
+
+    if metrics is None:
+        try:
+            cloudwatch.put_metric_data(
+                Namespace="K3sAutoscaler",
+                MetricData=[{
+                    "MetricName": "PrometheusHealth",
+                    "Value": 1 if prometheus_healthy else 0,
+                    "Unit": "None",
+                    "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+                }],
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish CloudWatch metrics: {e}")
+        return
 
     # Build metric data list
     metric_data = [
@@ -325,25 +341,20 @@ def lambda_handler(event: dict, context: Any) -> dict:
                 # Step 4.5: Record periodic metrics sample for ML training
                 recorder.record_metrics_sample(metrics)
             except RuntimeError as e:
-                # Prometheus fetch failed - use degraded metrics
+                # Prometheus fetch failed. Without metrics there is no basis
+                # for any scaling action: fabricating 100% CPU here blocked
+                # scale-down but also triggered a scale-up every cycle until
+                # MAX_NODES. Report unhealthy and hold.
                 logger.error(f"Failed to fetch Prometheus metrics: {e}")
-                logger.warning("Using degraded metrics - scaling decisions may be suboptimal")
-                prometheus_healthy = False
-                # Create default metrics with conservative values (assume high CPU to prevent scale-down)
-                from datetime import datetime, timezone
-                metrics = ClusterMetrics(
-                    cpu_percent=100.0,  # Assume high CPU (conservative)
-                    memory_percent=100.0,  # Assume high memory (conservative)
-                    pending_pods=0,  # Unknown, use 0
-                    ready_nodes=state.node_count,  # Use state table value
-                    total_nodes=state.node_count,  # Use state table value
-                    worker_count=state.node_count,  # Use state table value
-                    worker_cpu_percent_avg=100.0,  # Assume high CPU
-                    worker_memory_percent_avg=100.0,  # Assume high memory
-                    master_cpu_percent=0.0,  # Not used in scaling
-                    master_memory_percent=0.0,  # Not used in scaling
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                )
+                logger.warning("Prometheus unavailable - skipping scaling evaluation (NO_OP)")
+                _publish_cloudwatch_metrics(None, state.node_count, prometheus_healthy=False)
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({
+                        "action": "NO_OP",
+                        "reason": "Prometheus unavailable - no metrics to evaluate",
+                    }),
+                }
 
             # Log to console
             logger.info(f"Worker Metrics: CPU={metrics.worker_cpu_percent_avg:.1f}%, "
@@ -450,6 +461,8 @@ def _publish_scale_up_event(decision: ScalingDecision) -> dict:
                         "cpu_percent": decision.cpu_percent,
                         "memory_percent": decision.memory_percent,
                         "pending_pods": decision.pending_pods,
+                        # Lets scale-up skip its time-based cooldown for a flash sale.
+                        "flash_sale": decision.flash_sale,
                     }),
                     "EventBusName": event_bus_name,
                 }

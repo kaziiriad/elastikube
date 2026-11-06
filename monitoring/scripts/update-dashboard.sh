@@ -29,9 +29,9 @@ log "Starting dashboard update for region: $REGION"
 
 # Step 1: Query Lambda functions (for log queries only)
 log "Querying Lambda functions..."
-DECISION_LAMBDA=$(aws lambda list-functions --region "$REGION" --query "Functions[?contains(FunctionName, 'k3s-autoscaler-function')].FunctionName" --output text 2>/dev/null | head -1)
-SCALE_UP_LAMBDA=$(aws lambda list-functions --region "$REGION" --query "Functions[?contains(FunctionName, 'scale-up-lambda')].FunctionName" --output text 2>/dev/null | head -1)
-SCALE_DOWN_LAMBDA=$(aws lambda list-functions --region "$REGION" --query "Functions[?contains(FunctionName, 'scale-down-lambda')].FunctionName" --output text 2>/dev/null | head -1)
+DECISION_LAMBDA=$(aws lambda list-functions --region "$REGION" --query "Functions[?contains(FunctionName, 'k3s-autoscaler') && !contains(FunctionName, '-scale') && !contains(FunctionName, '-cleanup')].FunctionName" --output text 2>/dev/null | head -1)
+SCALE_UP_LAMBDA=$(aws lambda list-functions --region "$REGION" --query "Functions[?contains(FunctionName, 'k3s-autoscaler-scale-up')].FunctionName" --output text 2>/dev/null | head -1)
+SCALE_DOWN_LAMBDA=$(aws lambda list-functions --region "$REGION" --query "Functions[?contains(FunctionName, 'k3s-autoscaler-scale-down')].FunctionName" --output text 2>/dev/null | head -1)
 
 [[ -z "$DECISION_LAMBDA" ]] && error "Decision Lambda not found"
 [[ -z "$SCALE_UP_LAMBDA" ]] && error "Scale-Up Lambda not found"

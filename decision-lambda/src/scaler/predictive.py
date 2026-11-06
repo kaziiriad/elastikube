@@ -12,7 +12,7 @@ Environment variables:
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import boto3
@@ -56,11 +56,19 @@ class CPUPredictor:
             "prediction_horizon_minutes": prediction_horizon_minutes,
         }
 
-    def predict_future_cpu(self, current_timestamp: Optional[datetime] = None) -> dict:
+    def predict_future_cpu(
+        self,
+        current_timestamp: Optional[datetime] = None,
+        regressor_values: Optional[dict] = None,
+    ) -> dict:
         """Predict CPU usage at prediction horizon.
 
         Args:
             current_timestamp: Current timestamp (default: now)
+            regressor_values: Optional dict mapping regressor name to its current
+                value. Forwarded into the future dataframe so model.predict()
+                has the regressor columns it was trained with. Missing keys
+                fall back to 0 (Prophet default).
 
         Returns:
             Dictionary with prediction results:
@@ -77,11 +85,27 @@ class CPUPredictor:
         # Prophet requires 'ds' column with datetime
         import pandas as pd
 
-        future = self.model.make_future_dataframe(
-            periods=self.prediction_horizon_minutes,
-            freq='min',  # 1-minute intervals
-            include_history=False,
-        )
+        # Anchor the horizon on current_timestamp, not on the end of the
+        # training data (which is what make_future_dataframe does). Training
+        # data is naive UTC, so convert to UTC and drop tz — Prophet rejects
+        # tz-aware ds. Naive inputs are assumed to already be UTC.
+        if current_timestamp.tzinfo is not None:
+            current_utc = current_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        else:
+            current_utc = current_timestamp
+        future = pd.DataFrame({
+            "ds": pd.date_range(
+                start=current_utc + timedelta(minutes=1),
+                periods=self.prediction_horizon_minutes,
+                freq="min",  # 1-minute intervals
+            )
+        })
+
+        # Forward-fill current regressor values into the future dataframe.
+        # Without these, model.predict() raises "Regressor X missing from dataframe".
+        if regressor_values:
+            for name in self.model.extra_regressors:
+                future[name] = regressor_values.get(name, 0)
 
         # Make prediction
         forecast = self.model.predict(future)
@@ -202,6 +226,7 @@ def get_predictor() -> Optional[CPUPredictor]:
 
 def get_cpu_prediction(
     current_timestamp: Optional[datetime] = None,
+    regressor_values: Optional[dict] = None,
 ) -> Optional[dict]:
     """Get CPU prediction with error handling.
 
@@ -210,6 +235,9 @@ def get_cpu_prediction(
 
     Args:
         current_timestamp: Current timestamp for prediction
+        regressor_values: Optional dict of current regressor values
+            (e.g. {"pending_pods": 0, "worker_count": 3}). Required if the
+            trained model has extra regressors.
 
     Returns:
         Prediction dict or None (see CPUPredictor.predict_future_cpu())
@@ -219,7 +247,7 @@ def get_cpu_prediction(
         if predictor is None:
             return None
 
-        prediction = predictor.predict_future_cpu(current_timestamp)
+        prediction = predictor.predict_future_cpu(current_timestamp, regressor_values)
 
         logger.info(
             f"CPU Prediction: {prediction['predicted_cpu']:.1f}% "

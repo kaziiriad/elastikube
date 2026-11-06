@@ -434,6 +434,32 @@ master_ip_parameter = ssm.Parameter(
     tags={**common_tags, "Name": "k3s-master-ip-parameter"},
 )
 
+# SSM Parameter for Worker Security Group ID
+worker_sg_parameter = ssm.Parameter(
+    "k3s-worker-security-group-id",
+    name=f"/k3s/{cluster_name}/security-group-id",
+    type="String",
+    value=bastion_security_group.id,
+    overwrite=True,
+    description="Security group ID for worker nodes",
+    tags={**common_tags, "Name": "k3s-worker-security-group-id"},
+)
+
+# SSM Parameter for Worker Subnet IDs (JSON array for multi-AZ)
+worker_subnet_ids_parameter = ssm.Parameter(
+    "k3s-worker-subnet-ids",
+    name=f"/k3s/{cluster_name}/worker-subnet-ids",
+    type="String",
+    value=pulumi.Output.all(
+        subnet_a_id=private_subnet_a.id,
+        subnet_b_id=private_subnet_b.id,
+        subnet_c_id=private_subnet_c.id,
+    ).apply(lambda vs: json.dumps([vs["subnet_a_id"], vs["subnet_b_id"], vs["subnet_c_id"]])),
+    overwrite=True,
+    description="JSON array of subnet IDs for worker nodes (multi-AZ)",
+    tags={**common_tags, "Name": "k3s-worker-subnet-ids"},
+)
+
 # Secrets Manager Secret for K3s Join Token (sensitive data)
 # Note: recovery_window_in_days=0 for immediate cleanup during pulumi destroy
 k3s_join_token_secret = secretsmanager.Secret(
@@ -466,6 +492,18 @@ worker_userdata_bucket = s3.Bucket(
     bucket=f"k3s-userdata-{cluster_name}",
     force_destroy=True,  # Delete all objects before destroying bucket
     tags={**common_tags, "Name": "k3s-worker-userdata", "Purpose": "worker-bootstrap-scripts"}
+)
+
+# S3 Bucket for Prophet ML model artifacts
+# Uploaded by ml-training CronJob (infrastructure/ansible/roles/ml-training-cronjob/).
+# Read by Decision Lambda for predictive scaling (Layer 4 in decision-lambda/src/scaler/scaling.py).
+# Hardcoded name to match the CronJob's defaults/main.yml (s3_bucket_name: k3s-models).
+k3s_models_bucket = s3.Bucket(
+    "k3s-models",
+    bucket="k3s-models",
+    versioning={"enabled": True},  # Training pipeline emits versioned artifacts + a "latest" pointer
+    force_destroy=True,  # Mirror worker_userdata_bucket; needed for `pulumi destroy`
+    tags={**common_tags, "Name": "k3s-models", "Purpose": "prophet-model-store"}
 )
 
 # =============================================================================
@@ -515,6 +553,7 @@ autoscaler_policy = iam.RolePolicy(
         scaling_history_table_arn=scaling_history_table.arn,
         metrics_samples_table_arn=metrics_samples_table.arn,
         userdata_bucket_arn=worker_userdata_bucket.arn,
+        k3s_models_bucket_arn=k3s_models_bucket.arn,
     ).apply(lambda args: iam.get_policy_document(
         statements=[
             # EC2 Permissions
@@ -663,6 +702,14 @@ autoscaler_policy = iam.RolePolicy(
             {
                 "actions": ["s3:GetObject"],
                 "resources": [f"{args['userdata_bucket_arn']}/*"],
+                "effect": "Allow",
+            },
+            # S3 Permissions - Read Prophet model artifacts from k3s-models
+            # Scoped to models/* prefix only — CronJob uploads here, nothing else.
+            # Used by Decision Lambda (Layer 4 predictive scaling, decision-lambda/src/scaler/predictive.py).
+            {
+                "actions": ["s3:GetObject"],
+                "resources": [f"{args['k3s_models_bucket_arn']}/models/*"],
                 "effect": "Allow",
             },
         ],
@@ -823,6 +870,7 @@ master_cloudwatch_policy = iam.RolePolicy(
 # Note: Key pair must already exist in AWS for this region
 existing_key_name = config.get("ec2:keyPairName", "MyKeyPair")
 
+
 # Static IP assignments for consistent infrastructure across deployments
 # These IPs are reserved within the subnet CIDR blocks:
 # - Public subnet: 10.0.1.0/24
@@ -841,7 +889,7 @@ bastion_instance = ec2.Instance(
     vpc_security_group_ids=[bastion_security_group.id],
     associate_public_ip_address=True,
     private_ip=bastion_static_ip,  # Static private IP for consistency
-    key_name=existing_key_name,
+    key_name="MyKeyPair",
     tags={**common_tags, 'Name': 'k3s-bastion', 'NodeRole': 'bastion'}
 )
 
@@ -855,7 +903,7 @@ master_instance = ec2.Instance(
     associate_public_ip_address=False,  # No public IP
     private_ip=master_static_ip,  # Static private IP for SSH config consistency
     iam_instance_profile=master_instance_profile.name,  # SSM access for kubectl drain
-    key_name=existing_key_name,
+    key_name="MyKeyPair",
     tags={**common_tags, 'Name': 'k3s-master', 'NodeRole': 'master'}
 )
 
@@ -868,7 +916,7 @@ worker_instance_1 = ec2.Instance('worker-instance-1',
     associate_public_ip_address=False,  # No public IP
     private_ip=worker_1_static_ip,  # Static private IP
     iam_instance_profile=worker_instance_profile.name,
-    key_name=existing_key_name,
+    key_name="MyKeyPair",
     tags={**common_tags, 'Name': 'k3s-worker-1', 'NodeRole': 'worker', 'Permanent': 'true'}
 )
 
@@ -881,7 +929,7 @@ worker_instance_2 = ec2.Instance('worker-instance-2',
     associate_public_ip_address=False,  # No public IP
     private_ip=worker_2_static_ip,  # Static private IP
     iam_instance_profile=worker_instance_profile.name,
-    key_name=existing_key_name,
+    key_name='MyKeyPair',
     tags={**common_tags, 'Name': 'k3s-worker-2', 'NodeRole': 'worker', 'Permanent': 'true'}
 )
 
@@ -989,6 +1037,16 @@ lambda_function = lambda_.Function(
             # S3 Configuration for worker bootstrap script
             "USER_DATA_S3_BUCKET": worker_userdata_bucket.bucket,
             "USER_DATA_S3_KEY": "user-data/worker-bootstrap.sh",
+            # Predictive Scaling (Layer 4) - Prophet model fetch
+            # Opt-in: `pulumi config set predictive_scaling_enabled true` to enable.
+            # Bucket populated by ml-training CronJob
+            # (infrastructure/ansible/roles/ml-training-cronjob/).
+            "PREDICTIVE_SCALING_ENABLED": str(config.get_bool("predictive_scaling_enabled", False)).lower(),
+            "PROPHET_MODEL_S3_BUCKET": k3s_models_bucket.bucket,
+            "PROPHET_MODEL_S3_KEY": "models/cpu_prophet_model.json",
+            # Layer 3 flash-sale detection. Opt-in via
+            # `pulumi config set flash_sale_detection_enabled true`.
+            "FLASH_SALE_DETECTION_ENABLED": str(config.get_bool("flash_sale_detection_enabled", False)).lower(),
         }
     ),
     code=lambda_archive,
@@ -1066,7 +1124,7 @@ scale_up_lambda = lambda_.Function(
             "IAM_INSTANCE_PROFILE": worker_instance_profile.name,
             "AMI_ID": ami_id,
             "INSTANCE_TYPE": worker_instance_type,
-            "KEY_NAME": existing_key_name,  # SSH key pair for debugging
+            "KEY_NAME": "MyKeyPair",  # SSH key pair for debugging
             # Spot Instance Configuration
             "USE_SPOT_INSTANCES": config.get_bool("use_spot_instances", False),
             # Bootstrap Verification Configuration
@@ -1737,12 +1795,15 @@ pulumi.export("worker_2_private_ip", worker_instance_2.private_ip)
 pulumi.export("config_min_nodes", min_nodes)
 pulumi.export("config_max_nodes", max_nodes)
 pulumi.export("config_scale_up_threshold", scale_up_threshold)
+pulumi.export("k3s_models_bucket", k3s_models_bucket.bucket)
 pulumi.export("config_scale_down_threshold", scale_down_threshold)
 pulumi.export("config_scale_up_cooldown", scale_up_cooldown)
 pulumi.export("config_scale_down_cooldown", scale_down_cooldown)
 
 # SSM and Secrets Manager exports
 pulumi.export("ssm_master_ip_parameter_name", master_ip_parameter.name)
+pulumi.export("ssm_worker_security_group_id", worker_sg_parameter.name)
+pulumi.export("ssm_worker_subnet_ids", worker_subnet_ids_parameter.name)
 pulumi.export("secrets_manager_join_token_arn", k3s_join_token_secret.arn)
 
 # S3 bucket for worker bootstrap scripts

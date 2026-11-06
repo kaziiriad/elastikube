@@ -50,6 +50,7 @@ class ScalingDecision:
     cpu_percent: float
     memory_percent: float
     pending_pods: int
+    flash_sale: bool = False  # Layer 3 emergency scale-up (bypasses cooldowns)
 
     def should_scale(self) -> bool:
         """Returns True if scaling action is needed."""
@@ -65,6 +66,7 @@ class ScalingDecision:
             "cpu_percent": self.cpu_percent,
             "memory_percent": self.memory_percent,
             "pending_pods": self.pending_pods,
+            "flash_sale": self.flash_sale,
         }
 
 
@@ -102,7 +104,9 @@ class ScalingEngine:
 
         # Layer 3: Flash Sale Detection (emergency response, overrides cooldown)
         # Check BEFORE cooldown to allow immediate scaling during spikes
-        if self._flash_sale_detector.detect(metrics.worker_cpu_percent_avg):
+        if self._flash_sale_detector.detect(
+            metrics.worker_cpu_percent_avg, metrics.worker_cpu_window_min
+        ):
             if current_nodes < self._config.max_nodes:
                 logger.warning("FLASH SALE: Triggering immediate scale-up")
                 return ScalingDecision(
@@ -113,6 +117,7 @@ class ScalingEngine:
                     cpu_percent=metrics.worker_cpu_percent_avg,
                     memory_percent=metrics.worker_memory_percent_avg,
                     pending_pods=metrics.pending_pods,
+                    flash_sale=True,
                 )
             else:
                 logger.warning("FLASH SALE: At max nodes, cannot scale further")
@@ -137,7 +142,16 @@ class ScalingEngine:
         cpu_for_scale_up = metrics.worker_cpu_percent_avg  # Default to current
 
         if PREDICTIVE_AVAILABLE:
-            prediction = get_cpu_prediction(current_timestamp=now)
+            # Pass current regressor values so predict_future_cpu can populate
+            # them in the future dataframe (model was trained with these as
+            # extra regressors; predict() rejects missing columns).
+            prediction = get_cpu_prediction(
+                current_timestamp=now,
+                regressor_values={
+                    "pending_pods": metrics.pending_pods,
+                    "worker_count": metrics.worker_count,
+                },
+            )
             if prediction:
                 predicted_cpu = prediction["predicted_cpu"]
                 cpu_for_scale_up = predicted_cpu

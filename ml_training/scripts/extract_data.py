@@ -57,11 +57,14 @@ class DynamoDBExtractor:
         print(f"Time range: {start_time} to now")
 
         # Scan with filter (note: ScanFilter is deprecated, use FilterExpression)
+        # The Table resource API takes raw Python values, not DynamoDB type
+        # descriptors ({"S": "..."}). Wrapping in {S: ...} makes boto3 send
+        # operand type M to DynamoDB and the filter rejects it.
         records = []
         scan_kwargs = {
             "FilterExpression": "#ts >= :start_time",
             "ExpressionAttributeNames": {"#ts": "timestamp"},
-            "ExpressionAttributeValues": {":start_time": {"S": start_time}},
+            "ExpressionAttributeValues": {":start_time": start_time},
         }
 
         try:
@@ -129,7 +132,7 @@ class DynamoDBExtractor:
         scan_kwargs = {
             "FilterExpression": "#ts >= :start_time",
             "ExpressionAttributeNames": {"#ts": "timestamp"},
-            "ExpressionAttributeValues": {":start_time": {"S": start_time}},
+            "ExpressionAttributeValues": {":start_time": start_time},
         }
 
         try:

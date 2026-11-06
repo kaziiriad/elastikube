@@ -1,0 +1,33 @@
+---
+# Site playbook for the elastikube test cluster.
+# Uses the static-binary worker role (k3s-worker-static) so workers
+# don't need apt / NAT. The k3s-master role is the existing one (already
+# patched to tolerate the Secrets Manager SCP deny).
+#
+# Run with:
+#   ANSIBLE_CONFIG=scripts/elastikube-test-ansible.cfg \
+#     ansible-playbook scripts/elastikube-test-cluster.yml \
+#       -e AWS_PROFILE=poridhi-aws \
+#       -e aws_region=ap-southeast-1 \
+#       -e cluster_name=production-k3s
+
+- hosts: k3s_cluster
+  gather_facts: false
+  tasks:
+    - name: Ping (verify SSH connectivity)
+      ping:
+
+- hosts: master
+  become: true
+  gather_facts: true
+  vars:
+    cluster_name: production-k3s
+    aws_region: ap-southeast-1
+  roles:
+    - k3s-master
+
+- hosts: workers
+  become: true
+  gather_facts: true
+  roles:
+    - k3s-worker-static

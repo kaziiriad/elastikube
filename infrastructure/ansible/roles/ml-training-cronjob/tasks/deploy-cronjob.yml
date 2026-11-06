@@ -39,19 +39,25 @@
 
 - name: Create namespace for ML training
   kubernetes.core.k8s:
-    name: "{{ ml_training_namespace }}"
-    api_version: v1
-    kind: Namespace
     state: present
+    kubeconfig: "{{ kubeconfig_path | default('/etc/rancher/k3s/k3s.yaml') }}"
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ ml_training_namespace }}"
   register: namespace_result
 
 - name: Create ServiceAccount for ML training
   kubernetes.core.k8s:
-    name: ml-training-sa
-    namespace: "{{ ml_training_namespace }}"
-    api_version: v1
-    kind: ServiceAccount
     state: present
+    kubeconfig: "{{ kubeconfig_path | default('/etc/rancher/k3s/k3s.yaml') }}"
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: ml-training-sa
+        namespace: "{{ ml_training_namespace }}"
 
 # Note: For IRSA (IAM Roles for Service Accounts), the annotation would be added
 # when the cluster is set up with the IAM role. This ServiceAccount will work
@@ -59,15 +65,18 @@
 
 - name: Create Secret for AWS credentials (if using access keys)
   kubernetes.core.k8s:
-    name: aws-credentials
-    namespace: "{{ ml_training_namespace }}"
-    api_version: v1
-    kind: Secret
     state: present
-    type: Opaque
-    data:
-      AWS_ACCESS_KEY_ID: "{{ aws_access_key_id | default('') | b64encode }}"
-      AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key | default('') | b64encode }}"
+    kubeconfig: "{{ kubeconfig_path | default('/etc/rancher/k3s/k3s.yaml') }}"
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: aws-credentials
+        namespace: "{{ ml_training_namespace }}"
+      type: Opaque
+      data:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key_id | default('') | b64encode }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key | default('') | b64encode }}"
   when:
     - aws_access_key_id is defined
     - aws_access_key_id | length > 0
@@ -82,13 +91,13 @@
 
 - name: Apply CronJob to cluster
   ansible.builtin.command:
-    cmd: kubectl apply -f /tmp/ml-training-cronjob.yml
+    cmd: kubectl --kubeconfig={{ kubeconfig_path | default('/etc/rancher/k3s/k3s.yaml') }} apply -f /tmp/ml-training-cronjob.yml
   register: apply_result
   changed_when: "'created' in apply_result.stdout or 'configured' in apply_result.stdout"
 
 - name: Verify CronJob deployment
   ansible.builtin.command:
-    cmd: kubectl get cronjob -n "{{ ml_training_namespace }}" ml-training-job
+    cmd: kubectl --kubeconfig={{ kubeconfig_path | default('/etc/rancher/k3s/k3s.yaml') }} get cronjob -n "{{ ml_training_namespace }}" ml-training-job
   register: verify_result
   changed_when: false
 
