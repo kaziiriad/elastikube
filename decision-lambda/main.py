@@ -461,6 +461,8 @@ def _publish_scale_up_event(decision: ScalingDecision) -> dict:
                         "cpu_percent": decision.cpu_percent,
                         "memory_percent": decision.memory_percent,
                         "pending_pods": decision.pending_pods,
+                        # Lets scale-up skip its time-based cooldown for a flash sale.
+                        "flash_sale": decision.flash_sale,
                     }),
                     "EventBusName": event_bus_name,
                 }

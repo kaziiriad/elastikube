@@ -36,6 +36,9 @@ class ClusterMetrics:
     master_cpu_percent: float  # Master node CPU usage
     master_memory_percent: float  # Master node memory usage
     timestamp: str  # ISO timestamp of metrics collection
+    # Lowest worker CPU within the flash-sale detection window (Layer 3).
+    # None when detection is disabled or the window query failed.
+    worker_cpu_window_min: Optional[float] = None
 
     def to_dict(self) -> dict:
         """Convert to dict for CloudWatch metrics."""
@@ -135,15 +138,8 @@ class PrometheusClient:
             logger.info(f"Using exclude pattern: {exclude_pattern}")
 
             # Query WORKER CPU (exclude control-plane nodes, only K3s nodes)
-            worker_cpu_result = self.query(f"""
-                avg(
-                    100 - (
-                        avg by(instance) (
-                            irate(node_cpu_seconds_total{{job="node-exporter-k3s-nodes",mode="idle",instance!~".*({exclude_pattern}).*"}}[5m])
-                        ) * 100
-                    )
-                )
-            """)
+            worker_cpu_expr = self._worker_cpu_promql(exclude_pattern)
+            worker_cpu_result = self.query(worker_cpu_expr)
             worker_cpu_percent = self._extract_average_value(worker_cpu_result)
 
             # Query WORKER Memory
@@ -182,15 +178,16 @@ class PrometheusClient:
         else:
             # No control-plane nodes found, use all K3s nodes as workers
             logger.warning("No control-plane nodes found via kube_node_role, using all K3s nodes as workers")
-            worker_cpu_result = self.query("""
-                avg(100 - (avg by(instance) (irate(node_cpu_seconds_total{job="node-exporter-k3s-nodes",mode="idle"}[5m])) * 100))
-            """)
+            worker_cpu_expr = self._worker_cpu_promql(None)
+            worker_cpu_result = self.query(worker_cpu_expr)
             worker_cpu_percent = self._extract_average_value(worker_cpu_result)
 
             worker_memory_result = self.query("""
                 avg((1 - (node_memory_MemAvailable_bytes{job="node-exporter-k3s-nodes"} / node_memory_MemTotal_bytes{job="node-exporter-k3s-nodes"})) * 100)
             """)
             worker_memory_percent = self._extract_average_value(worker_memory_result)
+
+        worker_cpu_window_min = self._get_worker_cpu_window_min(worker_cpu_expr)
 
         # ==========================================
         # CLUSTER-WIDE METRICS
@@ -228,8 +225,39 @@ class PrometheusClient:
             master_cpu_percent=master_cpu_percent,
             master_memory_percent=master_memory_percent,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            worker_cpu_window_min=worker_cpu_window_min,
         )
-    
+
+    @staticmethod
+    def _worker_cpu_promql(exclude_pattern: Optional[str]) -> str:
+        """Build the worker CPU % PromQL, excluding control-plane nodes if given."""
+        instance_filter = (
+            f',instance!~".*({exclude_pattern}).*"' if exclude_pattern else ""
+        )
+        return (
+            "avg(100 - (avg by(instance) (irate(node_cpu_seconds_total"
+            f'{{job="node-exporter-k3s-nodes",mode="idle"{instance_filter}}}[5m])) * 100))'
+        )
+
+    def _get_worker_cpu_window_min(self, worker_cpu_expr: str) -> Optional[float]:
+        """Lowest worker CPU within the flash-sale detection window.
+
+        Uses a Prometheus subquery so detection sees the scrape-resolution
+        history between decision runs. Returns None when flash-sale detection
+        is disabled or the query fails (detection is best-effort and must not
+        break the main metrics fetch).
+        """
+        if not self._config.flash_sale_detection_enabled:
+            return None
+
+        window = self._config.flash_sale_detection_window_seconds
+        try:
+            result = self.query(f"min_over_time(({worker_cpu_expr})[{window}s:15s])")
+        except RuntimeError as e:
+            logger.warning(f"Flash-sale window query failed, skipping detection: {e}")
+            return None
+        return self._extract_value(result)
+
     @staticmethod
     def _extract_value(query_result: dict) -> Optional[float]:
         """Extract scalar value from Prometheus query result.

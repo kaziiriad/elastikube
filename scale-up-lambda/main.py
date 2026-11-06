@@ -705,17 +705,22 @@ def _handle_scale_up(detail: dict) -> dict:
     cluster_name = config.get("cluster_name", "production-k3s")
 
     if table_name:
-        # Check 2a: Cooldown - prevent rapid successive scale-ups
-        should_skip, skip_reason = _check_recent_scale_up(table_name, cluster_name, cooldown_seconds=180)
-        if should_skip:
-            logger.info(f"Scale-up skipped: {skip_reason}")
-            return {
-                "statusCode": 200,
-                "body": json.dumps({
-                    "status": "skipped",
-                    "reason": skip_reason,
-                }),
-            }
+        # Check 2a: Cooldown - prevent rapid successive scale-ups.
+        # A flash sale (Layer 3) skips only this time-based cooldown; the
+        # in-progress, pending-instance and lock checks below still apply.
+        if detail.get("flash_sale"):
+            logger.warning("Flash sale scale-up: bypassing 180s scale-up cooldown")
+        else:
+            should_skip, skip_reason = _check_recent_scale_up(table_name, cluster_name, cooldown_seconds=180)
+            if should_skip:
+                logger.info(f"Scale-up skipped: {skip_reason}")
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({
+                        "status": "skipped",
+                        "reason": skip_reason,
+                    }),
+                }
 
         # Check 2b: Scaling in progress - persistent flag
         in_progress, progress_reason = _check_scaling_in_progress(table_name, cluster_name)

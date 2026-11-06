@@ -1044,6 +1044,9 @@ lambda_function = lambda_.Function(
             "PREDICTIVE_SCALING_ENABLED": str(config.get_bool("predictive_scaling_enabled", False)).lower(),
             "PROPHET_MODEL_S3_BUCKET": k3s_models_bucket.bucket,
             "PROPHET_MODEL_S3_KEY": "models/cpu_prophet_model.json",
+            # Layer 3 flash-sale detection. Opt-in via
+            # `pulumi config set flash_sale_detection_enabled true`.
+            "FLASH_SALE_DETECTION_ENABLED": str(config.get_bool("flash_sale_detection_enabled", False)).lower(),
         }
     ),
     code=lambda_archive,
