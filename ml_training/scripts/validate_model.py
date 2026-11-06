@@ -131,8 +131,16 @@ def backtest(
             continue
 
         # Reuse the pre-trained model rather than refitting from scratch —
-        # cheaper and good enough for a validation signal.
-        future = test[["ds"]].copy()
+        # cheaper and good enough for a validation signal. Include any
+        # extra regressors the model was fit on (e.g. pending_pods /
+        # worker_count) — Prophet needs them in the prediction frame.
+        regressor_cols = [c for c in model.extra_regressors.keys()] if hasattr(model, "extra_regressors") else []
+        # `extra_regressors` is a dict on fitted Prophet models; if for
+        # any reason it's missing fall back to the conventional names.
+        if not regressor_cols:
+            regressor_cols = [c for c in ("pending_pods", "worker_count") if c in test.columns]
+        future_cols = ["ds", *regressor_cols]
+        future = test[future_cols].copy()
         forecast = model.predict(future)
         merged = test.merge(forecast[["ds", "yhat"]], on="ds", how="inner")
 
@@ -231,7 +239,15 @@ def main() -> None:
               f"against {args.history_path}...")
         history = pd.read_csv(args.history_path, parse_dates=["timestamp"])
         history = history.rename(columns={"timestamp": "ds", "cpu_percent": "y"})
-        history = history[["ds", "y"]].dropna()
+        # Keep ds + y + any extra regressors the trained model expects
+        # (e.g. pending_pods, worker_count). Without the regressors
+        # `backtest()` fails with "Regressor X missing from dataframe".
+        regressor_cols = [c for c in ("pending_pods", "worker_count") if c in history.columns]
+        history = history[["ds", "y", *regressor_cols]].dropna()
+        # Prophet rejects tz-aware datetime columns — strip timezone so the
+        # backtest's `make_future_dataframe` + fit() pipeline works.
+        if history["ds"].dt.tz is not None:
+            history["ds"] = history["ds"].dt.tz_localize(None)
         try:
             metrics = backtest(
                 model,

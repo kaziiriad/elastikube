@@ -34,8 +34,11 @@ python /app/scripts/train_model.py \
   --data-path data/metrics_samples.csv \
   --output-dir models
 
-# Find generated model
-MODEL_FILE=$(ls -t models/cpu_prophet_model_*.json 2>/dev/null | head -1)
+# Find generated model. Filter out the sibling <timestamp>_metrics.json
+# file so we always pick the actual Prophet model artifact — when both
+# are written in the same second, `ls -t` is not deterministic about
+# which one comes first.
+MODEL_FILE=$(ls -t models/cpu_prophet_model_*.json 2>/dev/null | grep -v _metrics.json | head -1)
 MODEL_VERSION=$(basename "$MODEL_FILE" .json)
 echo ""
 echo "[3/3] Model trained: $MODEL_VERSION"
@@ -52,7 +55,7 @@ python /app/scripts/validate_model.py \
 TRAINED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 S3_BUCKET={{ s3_bucket_name }}
 
-METRICS_FILE="${MODEL_FILE}_metrics.json"
+METRICS_FILE="${MODEL_FILE%.json}_metrics.json"
 echo ""
 echo "Uploading model + metrics to s3://${S3_BUCKET}/..."
 python - "$MODEL_FILE" "$MODEL_VERSION" "$METRICS_FILE" "$TRAINED_AT" "$S3_BUCKET" <<'PYEOF'
