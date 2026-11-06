@@ -12,7 +12,7 @@ Environment variables:
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import boto3
@@ -85,15 +85,21 @@ class CPUPredictor:
         # Prophet requires 'ds' column with datetime
         import pandas as pd
 
-        future = self.model.make_future_dataframe(
-            periods=self.prediction_horizon_minutes,
-            freq='min',  # 1-minute intervals
-            include_history=False,
-        )
-
-        # Prophet's setup_dataframe rejects tz-aware datetimes, but
-        # make_future_dataframe inherits tz from the training data. Strip it.
-        future["ds"] = future["ds"].dt.tz_localize(None)
+        # Anchor the horizon on current_timestamp, not on the end of the
+        # training data (which is what make_future_dataframe does). Training
+        # data is naive UTC, so convert to UTC and drop tz — Prophet rejects
+        # tz-aware ds. Naive inputs are assumed to already be UTC.
+        if current_timestamp.tzinfo is not None:
+            current_utc = current_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        else:
+            current_utc = current_timestamp
+        future = pd.DataFrame({
+            "ds": pd.date_range(
+                start=current_utc + timedelta(minutes=1),
+                periods=self.prediction_horizon_minutes,
+                freq="min",  # 1-minute intervals
+            )
+        })
 
         # Forward-fill current regressor values into the future dataframe.
         # Without these, model.predict() raises "Regressor X missing from dataframe".
