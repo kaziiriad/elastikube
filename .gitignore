@@ -88,3 +88,5 @@ ml_training/validation/
 ml_training/data/
 ml_training/models/
 !ml_training/docs/
+# Personal notes
+docs/interview_qna.md
