@@ -12,6 +12,7 @@ This Pulumi program provisions AWS resources for the K3s autoscaler:
 """
 
 from datetime import datetime, timezone
+import base64
 import json
 import os
 import pathlib
@@ -21,7 +22,7 @@ from pulumi_command import local
 import pulumi_aws as aws
 import pulumi_random
 
-import master_bootstrap
+import bootstrap
 from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3, sns, cloudwatch
 
 # If CustomTimeouts is provider-specific (e.g., AWS, Kubernetes):
@@ -51,7 +52,7 @@ region = aws_config.get("region", "ap-southeast-1")
 cluster_name = k3s_config.get("clusterName", "production-k3s")
 min_nodes = k3s_config.get_int("minNodes", 2)
 max_nodes = k3s_config.get_int("maxNodes", 10)
-k3s_version = k3s_config.get("version", master_bootstrap.DEFAULT_K3S_VERSION)
+k3s_version = k3s_config.get("version", bootstrap.DEFAULT_K3S_VERSION)
 
 # EC2 Configuration
 master_instance_type = ec2_config.get("masterInstanceType", "t3.small")  # Free Tier eligible
@@ -505,8 +506,9 @@ k3s_join_token_version = secretsmanager.SecretVersion(
 # =============================================================================
 # S3 Bucket for Worker Bootstrap Scripts
 # =============================================================================
-# Stores user-data scripts that new worker instances fetch during launch
-# The actual bootstrap script is deployed via Ansible (worker-bootstrap.yml)
+# Holds the master's bootstrap assets (master/: monitoring manifests and
+# check-node-by-ip.sh). Worker bootstrap user-data lives in the worker Launch
+# Template, not here.
 #
 # Note: Bucket creation requires S3 permissions. If IAM user lacks permissions,
 # the bucket can be created manually or via Ansible before running Pulumi.
@@ -577,7 +579,6 @@ autoscaler_policy = iam.RolePolicy(
         wal_table_arn=wal_table.arn,
         scaling_history_table_arn=scaling_history_table.arn,
         metrics_samples_table_arn=metrics_samples_table.arn,
-        userdata_bucket_arn=worker_userdata_bucket.arn,
         k3s_models_bucket_arn=k3s_models_bucket.arn,
     ).apply(lambda args: iam.get_policy_document(
         statements=[
@@ -590,6 +591,7 @@ autoscaler_policy = iam.RolePolicy(
                     "ec2:DescribeInstanceStatus",
                     "ec2:CreateTags",
                     "ec2:DescribeTags",
+                    "ec2:DescribeLaunchTemplates",
                     # Spot Instance Permissions
                     "ec2:DescribeSpotInstanceRequests",
                     "ec2:DescribeSpotPriceHistory",
@@ -721,12 +723,6 @@ autoscaler_policy = iam.RolePolicy(
                     "cloudwatch:ListMetrics",
                 ],
                 "resources": ["*"],
-                "effect": "Allow",
-            },
-            # S3 Permissions - Read user-data scripts for worker bootstrap
-            {
-                "actions": ["s3:GetObject"],
-                "resources": [f"{args['userdata_bucket_arn']}/*"],
                 "effect": "Allow",
             },
             # S3 Permissions - Read Prophet model artifacts from k3s-models
@@ -963,7 +959,7 @@ bastion_instance = ec2.Instance(
 )
 
 master_user_data = pulumi.Output.all(worker_userdata_bucket.bucket, k3s_join_token_secret.name).apply(
-    lambda args: master_bootstrap.render_master_user_data(
+    lambda args: bootstrap.render_master_user_data(
         region=region,
         secret_id=args[1],
         bucket=args[0],
@@ -995,34 +991,49 @@ master_instance = ec2.Instance(
     ),
 )
 
-# Worker Instance 1 (permanent, in private subnet)
-worker_instance_1 = ec2.Instance('worker-instance-1',
+# =============================================================================
+# Worker Launch Template (Phase 1: one bootstrap path for every worker)
+# =============================================================================
+# Permanent workers and Lambda-launched workers both boot from this template:
+# same AMI, instance type, security group, instance profile and bootstrap
+# user-data (templates/worker-user-data.sh). The scale-up Lambda adds only a
+# subnet, tags and, when a baked AMI is registered in SSM, an AMI override.
+worker_launch_template = ec2.LaunchTemplate(
+    "k3s-worker-template",
+    name_prefix=f"k3s-worker-{cluster_name}-",
+    image_id=ami_id,
     instance_type=worker_instance_type,
-    ami=ami_id,
-    subnet_id=private_subnet.id,  # Private subnet for security
-    vpc_security_group_ids=[bastion_security_group.id],
-    # No public IP: the private subnet sets map_public_ip_on_launch=False.
-    # Not set here explicitly: LocalStack echoes back an empty Association, which
-    # the provider reads as True and treats as a change forcing replacement.
-    private_ip=worker_1_static_ip,  # Static private IP
-    iam_instance_profile=worker_instance_profile.name,
     key_name="MyKeyPair",
-    tags={**common_tags, 'Name': 'k3s-worker-1', 'NodeRole': 'worker', 'Permanent': 'true'}
+    iam_instance_profile={"name": worker_instance_profile.name},
+    vpc_security_group_ids=[bastion_security_group.id],
+    user_data=base64.b64encode(
+        bootstrap.render_worker_user_data(
+            cluster_name=cluster_name, region=region, k3s_version=k3s_version,
+        ).encode("utf-8")
+    ).decode("ascii"),
+    update_default_version=True,
+    tags={**common_tags, "Name": "k3s-worker-template"},
 )
 
-# Worker Instance 2 (permanent, in private subnet)
-worker_instance_2 = ec2.Instance('worker-instance-2',
-    instance_type=worker_instance_type,
-    ami=ami_id,
+# Permanent workers (in private subnet). "$Latest" keeps a template change from
+# replacing them; like the master, they run their user-data only on first boot.
+# No public IP: the private subnet sets map_public_ip_on_launch=False. Not set
+# here explicitly: LocalStack echoes back an empty Association, which the
+# provider reads as True and treats as a change forcing replacement.
+worker_instance_1 = ec2.Instance('worker-instance-1',
+    launch_template={"id": worker_launch_template.id, "version": "$Latest"},
     subnet_id=private_subnet.id,  # Private subnet for security
-    vpc_security_group_ids=[bastion_security_group.id],
-    # No public IP: the private subnet sets map_public_ip_on_launch=False.
-    # Not set here explicitly: LocalStack echoes back an empty Association, which
-    # the provider reads as True and treats as a change forcing replacement.
+    private_ip=worker_1_static_ip,  # Static private IP
+    tags={**common_tags, 'Name': 'k3s-worker-1', 'NodeRole': 'worker', 'Permanent': 'true'},
+    opts=pulumi.ResourceOptions(depends_on=[k3s_join_token_version, master_ip_parameter]),
+)
+
+worker_instance_2 = ec2.Instance('worker-instance-2',
+    launch_template={"id": worker_launch_template.id, "version": "$Latest"},
+    subnet_id=private_subnet.id,  # Private subnet for security
     private_ip=worker_2_static_ip,  # Static private IP
-    iam_instance_profile=worker_instance_profile.name,
-    key_name='MyKeyPair',
-    tags={**common_tags, 'Name': 'k3s-worker-2', 'NodeRole': 'worker', 'Permanent': 'true'}
+    tags={**common_tags, 'Name': 'k3s-worker-2', 'NodeRole': 'worker', 'Permanent': 'true'},
+    opts=pulumi.ResourceOptions(depends_on=[k3s_join_token_version, master_ip_parameter]),
 )
 
 # =============================================================================
@@ -1215,19 +1226,13 @@ scale_up_lambda = lambda_.Function(
             ).apply(lambda ids: json.dumps([ids["subnet_a_id"], ids["subnet_b_id"], ids["subnet_c_id"]])),
             # Primary subnet for backward compatibility (master + permanent workers)
             "SUBNET_ID": private_subnet_a.id,
-            # Security Configuration
-            "SECURITY_GROUP_ID": bastion_security_group.id,
-            "IAM_INSTANCE_PROFILE": worker_instance_profile.name,
-            "AMI_ID": ami_id,
-            "INSTANCE_TYPE": worker_instance_type,
-            "KEY_NAME": "MyKeyPair",  # SSH key pair for debugging
+            # AMI, instance type, security group, profile, key and bootstrap
+            # user-data all come from the worker Launch Template
+            "LAUNCH_TEMPLATE_ID": worker_launch_template.id,
             # Spot Instance Configuration
             "USE_SPOT_INSTANCES": config.get_bool("use_spot_instances", False),
             # Bootstrap Verification Configuration
             "BOOTSTRAP_TIMEOUT_SECONDS": str(config.get_int("bootstrap_timeout", 180)),
-            # S3 Configuration for bootstrap script
-            "USER_DATA_S3_BUCKET": worker_userdata_bucket.bucket,
-            "USER_DATA_S3_KEY": "user-data/worker-bootstrap.sh",
         }
     ),
     code=scale_up_archive,

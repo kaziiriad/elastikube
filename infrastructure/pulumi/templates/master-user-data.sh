@@ -1,5 +1,5 @@
 #!/bin/bash
-# K3s master bootstrap. Rendered by Pulumi (master_bootstrap.py) and run once
+# K3s master bootstrap. Rendered by Pulumi (bootstrap.py) and run once
 # by cloud-init on the master's first boot. Replaces the k3s-master Ansible role
 # in the bring-up path.
 #
@@ -59,7 +59,7 @@ unset TOKEN
 # The scale-down and cleanup Lambdas run kubectl on the master through SSM.
 echo "[5/5] Ensuring SSM Agent..."
 if ! snap list amazon-ssm-agent >/dev/null 2>&1 && ! dpkg -s amazon-ssm-agent >/dev/null 2>&1; then
-  curl -sfL --retry 5 -o /tmp/amazon-ssm-agent.deb \
+  curl -sfL --retry 5 --max-time 600 -o /tmp/amazon-ssm-agent.deb \
     https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/debian_amd64/amazon-ssm-agent.deb
   dpkg -i /tmp/amazon-ssm-agent.deb
 fi

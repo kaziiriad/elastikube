@@ -2,22 +2,19 @@
 
 This Lambda handles scale-up operations:
 1. Fetch EC2 configuration from environment
-2. Fetch bootstrap script from S3
-3. Launch a new EC2 instance with the bootstrap script
-4. Update DynamoDB state with scale operation info
+2. Launch new EC2 instances from the worker Launch Template
+3. Update DynamoDB state with scale operation info
 
 Triggered by EventBridge when main autoscaler decides to scale up.
 Also supports direct invocation for testing.
 
+The Launch Template (managed by Pulumi) carries the AMI, instance type,
+security group, instance profile, key pair and bootstrap user-data.
+
 Environment variables required:
     SUBNET_IDS: JSON array of subnet IDs for multi-AZ round-robin distribution
     SUBNET_ID: (Optional) Primary subnet ID for backward compatibility
-    SECURITY_GROUP_ID: Security group ID
-    IAM_INSTANCE_PROFILE: IAM instance profile name
-    AMI_ID: AMI ID for the instance
-    INSTANCE_TYPE: EC2 instance type
-    USER_DATA_S3_BUCKET: S3 bucket containing bootstrap script
-    USER_DATA_S3_KEY: S3 key for bootstrap script
+    LAUNCH_TEMPLATE_ID: Worker Launch Template ID
     STATE_TABLE_NAME: DynamoDB table for cluster state
     CLUSTER_NAME: Name of the K3s cluster (default: production-k3s)
 """
@@ -54,7 +51,6 @@ def _handle_health_check() -> dict:
 
     try:
         ec2_client = boto3.client("ec2")
-        s3_client = boto3.client("s3")
         dynamodb_client = boto3.client("dynamodb")
 
         # Check EC2 connectivity
@@ -65,22 +61,22 @@ def _handle_health_check() -> dict:
             health_status["components"]["ec2"] = {"status": "unhealthy", "error": str(e)}
             health_status["status"] = "degraded"
 
-        # Check S3 connectivity (bootstrap script)
+        # Check the worker Launch Template exists
         try:
-            bucket = os.environ.get("USER_DATA_S3_BUCKET")
-            key = os.environ.get("USER_DATA_S3_KEY", "user-data/worker-bootstrap.sh")
-            if bucket:
-                s3_client.head_object(Bucket=bucket, Key=key)
-                health_status["components"]["s3"] = {
+            template_id = os.environ.get("LAUNCH_TEMPLATE_ID")
+            if template_id:
+                ec2_client.describe_launch_templates(LaunchTemplateIds=[template_id])
+                health_status["components"]["launch_template"] = {
                     "status": "healthy",
-                    "bucket": bucket,
-                    "key": key,
+                    "id": template_id,
                 }
             else:
-                health_status["components"]["s3"] = {"status": "unhealthy", "error": "Bucket not configured"}
+                health_status["components"]["launch_template"] = {
+                    "status": "unhealthy", "error": "Launch template not configured",
+                }
                 health_status["status"] = "degraded"
         except Exception as e:
-            health_status["components"]["s3"] = {"status": "unhealthy", "error": str(e)}
+            health_status["components"]["launch_template"] = {"status": "unhealthy", "error": str(e)}
             health_status["status"] = "degraded"
 
         # Check DynamoDB connectivity
@@ -102,13 +98,10 @@ def _handle_health_check() -> dict:
         # Check configuration
         health_status["components"]["config"] = {
             "status": "healthy" if all(
-                os.environ.get(k)
-                for k in ["SUBNET_ID", "SECURITY_GROUP_ID", "AMI_ID", "INSTANCE_TYPE"]
+                os.environ.get(k) for k in ["SUBNET_ID", "LAUNCH_TEMPLATE_ID"]
             ) else "degraded",
             "subnet_id": os.environ.get("SUBNET_ID"),
-            "security_group": os.environ.get("SECURITY_GROUP_ID"),
-            "ami_id": os.environ.get("AMI_ID"),
-            "instance_type": os.environ.get("INSTANCE_TYPE"),
+            "launch_template_id": os.environ.get("LAUNCH_TEMPLATE_ID"),
         }
 
     except Exception as e:
@@ -234,35 +227,26 @@ def _get_config() -> dict:
     cluster_name = os.environ.get("CLUSTER_NAME", "production-k3s")
     region = os.environ.get("AWS_REGION", "ap-southeast-1")
 
-    # Try to get AMI from SSM Parameter (baked AMI approach)
+    # A baked AMI registered in SSM overrides the Launch Template's AMI.
     ami_id = None
     try:
         ami_id = _get_worker_ami_id(cluster_name, region)
     except Exception as e:
-        logger.warning(f"Could not fetch AMI from SSM, using env var: {e}")
-
-    # Fallback to env var if SSM fetch fails
-    if not ami_id:
-        ami_id = os.environ.get("AMI_ID")
+        logger.info(f"No baked AMI in SSM, using the Launch Template's AMI: {e}")
 
     config = {
         "subnet_ids": subnet_ids,  # Multi-AZ subnets for round-robin
         "subnet_id": os.environ.get("SUBNET_ID"),  # Primary subnet (backward compat)
-        "security_group_id": os.environ.get("SECURITY_GROUP_ID"),
-        "iam_instance_profile": os.environ.get("IAM_INSTANCE_PROFILE"),
+        "launch_template_id": os.environ.get("LAUNCH_TEMPLATE_ID"),
         "ami_id": ami_id,
-        "instance_type": os.environ.get("INSTANCE_TYPE", "t3.small"),
-        "key_name": os.environ.get("KEY_NAME"),  # SSH key pair for debugging
-        "s3_bucket": os.environ.get("USER_DATA_S3_BUCKET"),
-        "s3_key": os.environ.get("USER_DATA_S3_KEY"),
         "state_table_name": os.environ.get("STATE_TABLE_NAME"),
         "cluster_name": cluster_name,
         "use_spot_instances": os.environ.get("USE_SPOT_INSTANCES", "false").lower() == "true",
         "bootstrap_timeout": int(os.environ.get("BOOTSTRAP_TIMEOUT_SECONDS", "180")),
     }
 
-    # Validate required config (key_name and state_table_name are optional)
-    optional_keys = ("state_table_name", "key_name")
+    # Validate required config (ami_id and state_table_name are optional)
+    optional_keys = ("state_table_name", "ami_id")
     # Check for None (not set) specifically, not falsy values (False is valid for use_spot_instances)
     missing = [k for k, v in config.items() if v is None and k not in optional_keys]
     if missing:
@@ -1014,60 +998,32 @@ def _verify_nodes_joined(instance_ids: list[str], timeout_seconds: int = 180) ->
 
 
 
-def _fetch_bootstrap_script(s3_client, bucket: str, key: str) -> str:
-    """Fetch bootstrap script from S3 and log its content."""
-    logger.info(f"Fetching bootstrap script from s3://{bucket}/{key}")
-    response = s3_client.get_object(Bucket=bucket, Key=key)
-    script = response["Body"].read().decode("utf-8")
-    logger.info(f"Fetched bootstrap script ({len(script)} bytes)")
-
-    # Log the bootstrap script content for verification
-    # logger.info("=" * 60)
-    # logger.info("BOOTSTRAP SCRIPT CONTENT:")
-    # logger.info(script)
-    # logger.info("=" * 60)
-
-    return script
-
-
 def _launch_test_instance() -> dict:
-    """Launch a worker EC2 instance with bootstrap script.
+    """Launch a worker EC2 instance from the worker Launch Template.
 
-    Process:
-    1. Fetch bootstrap script from S3
-    2. Log bootstrap script content for verification
-    3. Launch EC2 instance with bootstrap script as user-data
+    The template carries the AMI, instance type, security group, instance
+    profile, key pair and bootstrap user-data; this call adds only the subnet,
+    tags, spot options and (when a baked AMI is registered) an AMI override.
     """
 
     logger.info("=" * 60)
     logger.info("STEP 1: Initializing worker instance launch")
     logger.info("=" * 60)
 
-    # Initialize AWS clients
     ec2_client = boto3.client("ec2")
-    s3_client = boto3.client("s3")
 
     # Get configuration
     config = _get_config()
 
     # Select subnet using round-robin for multi-AZ distribution
     subnet_id, availability_zone = _get_next_subnet_id(config)
-    logger.info(f"Config: subnet={subnet_id}, az={availability_zone}, ami={config['ami_id']}")
+    logger.info(f"Config: subnet={subnet_id}, az={availability_zone}, "
+                f"template={config['launch_template_id']}, ami_override={config['ami_id']}")
     logger.info(f"Multi-AZ: {'enabled' if len(config.get('subnet_ids', [])) > 1 else 'disabled (single subnet)'}")
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("STEP 2: Fetching bootstrap script from S3")
-    logger.info("=" * 60)
-
-    # Fetch bootstrap script from S3 (logs content in the function)
-    bootstrap_script = _fetch_bootstrap_script(
-        s3_client, config["s3_bucket"], config["s3_key"]
-    )
-
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("STEP 3: Launching EC2 instance with bootstrap script")
+    logger.info("STEP 2: Launching EC2 instance from the Launch Template")
     logger.info("=" * 60)
 
     # Prepare tags - include Cluster and NodeRole for scale-down Lambda discovery
@@ -1085,18 +1041,15 @@ def _launch_test_instance() -> dict:
         {"Key": "AvailabilityZone", "Value": availability_zone},  # Track AZ for observability
     ]
 
-    # Prepare instance launch parameters.
-    # UserData is passed as the plain script: boto3 base64-encodes RunInstances
-    # UserData itself, so encoding it here delivered base64 text to the instance.
+    # Prepare instance launch parameters
     run_params = {
-        "ImageId": config["ami_id"],
-        "InstanceType": config["instance_type"],
+        "LaunchTemplate": {
+            "LaunchTemplateId": config["launch_template_id"],
+            "Version": "$Latest",
+        },
         "MinCount": 1,
         "MaxCount": 1,
         "SubnetId": subnet_id,  # Use round-robin selected subnet
-        "SecurityGroupIds": [config["security_group_id"]],
-        "IamInstanceProfile": {"Name": config["iam_instance_profile"]},
-        "UserData": bootstrap_script,
         "TagSpecifications": [
             {
                 "ResourceType": "instance",
@@ -1105,11 +1058,8 @@ def _launch_test_instance() -> dict:
         ],
         "ClientToken": str(uuid.uuid4()),  # Idempotency
     }
-
-    # Add SSH key pair if configured (for debugging)
-    if config.get("key_name"):
-        run_params["KeyName"] = config["key_name"]
-        logger.info(f"Using SSH key pair: {config['key_name']}")
+    if config.get("ami_id"):
+        run_params["ImageId"] = config["ami_id"]
 
     # Add Spot instance configuration if enabled
     if config.get("use_spot_instances"):
@@ -1128,13 +1078,11 @@ def _launch_test_instance() -> dict:
         tags.append({"Key": "InstanceLifecycle", "Value": "on-demand"})
         logger.info("Using ON-DEMAND instances")
 
-    logger.info(f"Launching instance with: ami={run_params['ImageId']}, "
-                f"type={run_params['InstanceType']}, subnet={run_params['SubnetId']}")
-    logger.info(f"User-data size: {len(bootstrap_script.encode('utf-8'))} bytes")
+    logger.info(f"Launching instance from template {config['launch_template_id']} "
+                f"in subnet {run_params['SubnetId']}")
 
     # Launch instance with spot fallback mechanism
     response = None
-    instance_type = run_params["InstanceType"]
     using_spot = config.get("use_spot_instances")
 
     try:
@@ -1196,22 +1144,17 @@ def _launch_test_instance() -> dict:
     logger.info(f"Launched worker instance: {instance_id}")
     logger.info("=" * 60)
 
-    # Return response with bootstrap script preview
     return {
         "statusCode": 200,
         "body": json.dumps({
             "message": "Worker instance launched successfully",
             "instance_id": instance_id,
             "instance_uuid": instance_uuid,
-            "bootstrap_script_preview": bootstrap_script[:500] + "..." if len(bootstrap_script) > 500 else bootstrap_script,
-            "bootstrap_script_size_bytes": len(bootstrap_script),
             "config": {
-                "ami": config["ami_id"],
-                "instance_type": config["instance_type"],
+                "launch_template_id": config["launch_template_id"],
+                "ami_override": config["ami_id"],
                 "subnet": subnet_id,
                 "availability_zone": availability_zone,
-                "s3_bucket": config["s3_bucket"],
-                "s3_key": config["s3_key"],
             },
             "tags": {tag["Key"]: tag["Value"] for tag in tags},
             "next_actions": {
