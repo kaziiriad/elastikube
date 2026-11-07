@@ -922,7 +922,9 @@ master_instance = ec2.Instance(
     ami=ami_id,
     subnet_id=private_subnet.id,  # Private subnet for security
     vpc_security_group_ids=[bastion_security_group.id],
-    associate_public_ip_address=False,  # No public IP
+    # No public IP: the private subnet sets map_public_ip_on_launch=False.
+    # Not set here explicitly: LocalStack echoes back an empty Association, which
+    # the provider reads as True and treats as a change forcing replacement.
     private_ip=master_static_ip,  # Static private IP for SSH config consistency
     iam_instance_profile=master_instance_profile.name,  # SSM access for kubectl drain
     key_name="MyKeyPair",
@@ -935,7 +937,9 @@ worker_instance_1 = ec2.Instance('worker-instance-1',
     ami=ami_id,
     subnet_id=private_subnet.id,  # Private subnet for security
     vpc_security_group_ids=[bastion_security_group.id],
-    associate_public_ip_address=False,  # No public IP
+    # No public IP: the private subnet sets map_public_ip_on_launch=False.
+    # Not set here explicitly: LocalStack echoes back an empty Association, which
+    # the provider reads as True and treats as a change forcing replacement.
     private_ip=worker_1_static_ip,  # Static private IP
     iam_instance_profile=worker_instance_profile.name,
     key_name="MyKeyPair",
@@ -948,7 +952,9 @@ worker_instance_2 = ec2.Instance('worker-instance-2',
     ami=ami_id,
     subnet_id=private_subnet.id,  # Private subnet for security
     vpc_security_group_ids=[bastion_security_group.id],
-    associate_public_ip_address=False,  # No public IP
+    # No public IP: the private subnet sets map_public_ip_on_launch=False.
+    # Not set here explicitly: LocalStack echoes back an empty Association, which
+    # the provider reads as True and treats as a change forcing replacement.
     private_ip=worker_2_static_ip,  # Static private IP
     iam_instance_profile=worker_instance_profile.name,
     key_name='MyKeyPair',
