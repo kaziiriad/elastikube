@@ -1,7 +1,7 @@
 ---
 # K3s Autoscaler Production - Cluster Deployment Playbook
 # This playbook sets up:
-# - K3s master with Prometheus (NodePort 30900 for Lambda access)
+# - Common host setup (the master itself is installed by cloud-init from Pulumi)
 # - K3s worker nodes
 # - S3 integration for autoscaler Lambda (bootstrap script deployment)
 # - ML Training CronJob (optional, when deploy_ml_training flag is set)
@@ -12,14 +12,8 @@
   roles:
     - common
 
-- hosts: master
-  become: true
-  gather_facts: true
-  roles:
-    - k3s-master
-  vars:
-    cluster_name: production-k3s
-    aws_region: ap-southeast-1
+# The master is configured by cloud-init (user-data rendered by Pulumi:
+# infrastructure/pulumi/templates/master-user-data.sh), not by Ansible.
 
 - hosts: workers
   become: true

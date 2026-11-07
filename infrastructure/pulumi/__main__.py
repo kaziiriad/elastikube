@@ -20,6 +20,8 @@ import pulumi_command as command
 from pulumi_command import local
 import pulumi_aws as aws
 import pulumi_random
+
+import master_bootstrap
 from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3, sns, cloudwatch
 
 # If CustomTimeouts is provider-specific (e.g., AWS, Kubernetes):
@@ -49,6 +51,7 @@ region = aws_config.get("region", "ap-southeast-1")
 cluster_name = k3s_config.get("clusterName", "production-k3s")
 min_nodes = k3s_config.get_int("minNodes", 2)
 max_nodes = k3s_config.get_int("maxNodes", 10)
+k3s_version = k3s_config.get("version", master_bootstrap.DEFAULT_K3S_VERSION)
 
 # EC2 Configuration
 master_instance_type = ec2_config.get("masterInstanceType", "t3.small")  # Free Tier eligible
@@ -883,6 +886,50 @@ master_cloudwatch_policy = iam.RolePolicy(
     ).json
 )
 # =============================================================================
+# Master bootstrap assets (Phase 1: master configured by cloud-init)
+# =============================================================================
+# The monitoring manifests (22 KB) exceed the 16 KB user-data limit, so the
+# master downloads them at boot. They are read from the k3s-master role, which
+# scripts/elastikube-test-cluster.yml still uses.
+master_files_dir = pathlib.Path(__file__).resolve().parent.parent / "ansible" / "roles" / "k3s-master" / "files"
+
+master_bootstrap_objects = [
+    s3.BucketObjectv2(
+        f"master-manifest-{manifest.stem}",
+        bucket=worker_userdata_bucket.id,
+        key=f"master/manifests/{manifest.name}",
+        source=pulumi.FileAsset(str(manifest)),
+    )
+    for manifest in sorted(master_files_dir.glob("*.yaml"))
+] + [
+    s3.BucketObjectv2(
+        "master-check-node-by-ip",
+        bucket=worker_userdata_bucket.id,
+        key="master/check-node-by-ip.sh",
+        source=pulumi.FileAsset(str(master_files_dir / "check-node-by-ip.sh")),
+    )
+]
+
+master_bootstrap_read_policy = iam.RolePolicy(
+    "k3s-master-bootstrap-read-policy",
+    role=master_role.id,
+    policy=worker_userdata_bucket.arn.apply(
+        lambda arn: json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"{arn}/master/*"},
+                {
+                    "Effect": "Allow",
+                    "Action": "s3:ListBucket",
+                    "Resource": arn,
+                    "Condition": {"StringLike": {"s3:prefix": "master/*"}},
+                },
+            ],
+        })
+    ),
+)
+
+# =============================================================================
 # EC2 Instances
 # =============================================================================
 # Note: These are initial seed instances. The autoscaler Lambda will
@@ -915,7 +962,20 @@ bastion_instance = ec2.Instance(
     tags={**common_tags, 'Name': 'k3s-bastion', 'NodeRole': 'bastion'}
 )
 
+master_user_data = pulumi.Output.all(worker_userdata_bucket.bucket, k3s_join_token_secret.name).apply(
+    lambda args: master_bootstrap.render_master_user_data(
+        region=region,
+        secret_id=args[1],
+        bucket=args[0],
+        k3s_version=k3s_version,
+        node_ip=master_static_ip,
+    )
+)
+
 # Master Instance (in private subnet - accessed via bastion)
+# cloud-init runs master_user_data once, on first boot. Changing it later does
+# not reconfigure a running master (and must not replace it: the cluster state
+# lives on this instance).
 master_instance = ec2.Instance(
     'master-instance',
     instance_type=master_instance_type,
@@ -928,7 +988,11 @@ master_instance = ec2.Instance(
     private_ip=master_static_ip,  # Static private IP for SSH config consistency
     iam_instance_profile=master_instance_profile.name,  # SSM access for kubectl drain
     key_name="MyKeyPair",
-    tags={**common_tags, 'Name': 'k3s-master', 'NodeRole': 'master'}
+    user_data=master_user_data,
+    tags={**common_tags, 'Name': 'k3s-master', 'NodeRole': 'master'},
+    opts=pulumi.ResourceOptions(
+        depends_on=[k3s_join_token_version, master_bootstrap_read_policy, *master_bootstrap_objects],
+    ),
 )
 
 # Worker Instance 1 (permanent, in private subnet)
