@@ -39,6 +39,10 @@ class ClusterMetrics:
     # Lowest worker CPU within the flash-sale detection window (Layer 3).
     # None when detection is disabled or the window query failed.
     worker_cpu_window_min: Optional[float] = None
+    # Burst sizing: CPU cores requested by Pending pods, and mean allocatable
+    # cores per worker. None when the query failed or returned no data.
+    pending_cpu_cores: Optional[float] = None
+    worker_allocatable_cores: Optional[float] = None
 
     def to_dict(self) -> dict:
         """Convert to dict for CloudWatch metrics."""
@@ -55,6 +59,18 @@ class ClusterMetrics:
             "master_memory_percent": self.master_memory_percent,
             "timestamp": self.timestamp,
         }
+
+
+# CPU requested by pods stuck in Pending (kube-state-metrics).
+PENDING_CPU_PROMQL = (
+    'sum(kube_pod_container_resource_requests{resource="cpu"} '
+    '* on(namespace, pod) group_left() (kube_pod_status_phase{phase="Pending"} == 1))'
+)
+# Mean schedulable CPU per worker, excluding control-plane nodes.
+WORKER_ALLOCATABLE_PROMQL = (
+    'avg(kube_node_status_allocatable{resource="cpu"} '
+    'unless on(node) kube_node_role{role="control-plane"})'
+)
 
 
 class PrometheusClient:
@@ -190,6 +206,8 @@ class PrometheusClient:
             worker_memory_percent = self._extract_average_value(worker_memory_result)
 
         worker_cpu_window_min = self._get_worker_cpu_window_min(worker_cpu_expr)
+        pending_cpu_cores = self._query_optional(PENDING_CPU_PROMQL)
+        worker_allocatable_cores = self._query_optional(WORKER_ALLOCATABLE_PROMQL)
 
         # ==========================================
         # CLUSTER-WIDE METRICS
@@ -228,7 +246,17 @@ class PrometheusClient:
             master_memory_percent=master_memory_percent,
             timestamp=datetime.now(timezone.utc).isoformat(),
             worker_cpu_window_min=worker_cpu_window_min,
+            pending_cpu_cores=pending_cpu_cores,
+            worker_allocatable_cores=worker_allocatable_cores,
         )
+
+    def _query_optional(self, promql: str) -> Optional[float]:
+        """Run a best-effort query; None on failure or no data."""
+        try:
+            return self._extract_value(self.query(promql))
+        except RuntimeError as e:
+            logger.warning(f"Optional metric query failed: {e}")
+            return None
 
     @staticmethod
     def _worker_cpu_promql(exclude_pattern: Optional[str]) -> str:

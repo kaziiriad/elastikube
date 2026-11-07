@@ -11,6 +11,7 @@ Determines when to scale up or down based on:
 """
 
 import logging
+import math
 from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime, timezone
@@ -77,6 +78,20 @@ class ScalingEngine:
         """Initialize the scaling engine."""
         self._config = get_config()
         self._flash_sale_detector = FlashSaleDetector()
+
+    def _pending_pods_step(self, metrics: ClusterMetrics, current_nodes: int) -> int:
+        """Nodes to add for Pending pods: their CPU requests / cores per worker.
+
+        Capped by MAX_SCALE_UP_STEP and MAX_NODES; at least 1. Falls back to 1
+        when the sizing metrics are missing or unusable.
+        """
+        pending_cpu = metrics.pending_cpu_cores
+        per_node = metrics.worker_allocatable_cores
+        if not pending_cpu or not per_node or pending_cpu <= 0 or per_node <= 0:
+            return 1
+        needed = math.ceil(pending_cpu / per_node)
+        headroom = self._config.max_nodes - current_nodes
+        return max(1, min(needed, self._config.max_scale_up_step, headroom))
 
     def evaluate(
         self,
@@ -188,9 +203,10 @@ class ScalingEngine:
         pods_trigger = metrics.pending_pods >= 1
 
         if (cpu_trigger or pods_trigger) and current_nodes < self._config.max_nodes:
+            step = self._pending_pods_step(metrics, current_nodes) if pods_trigger else 1
             # Build reason string based on actual trigger
             if pods_trigger:
-                reason = f"Pending pods ({metrics.pending_pods}) >= 1"
+                reason = f"Pending pods ({metrics.pending_pods}) >= 1, adding {step} node(s)"
             else:
                 period_info = f" [{period}]" if period else ""
                 # Indicate if prediction was used
@@ -206,7 +222,7 @@ class ScalingEngine:
                 action=ScalingAction.SCALE_UP,
                 reason=reason,
                 current_nodes=current_nodes,
-                target_nodes=current_nodes + 1,
+                target_nodes=current_nodes + step,
                 cpu_percent=cpu_for_scale_up,  # Record the CPU value that triggered
                 memory_percent=metrics.worker_memory_percent_avg,
                 pending_pods=metrics.pending_pods,

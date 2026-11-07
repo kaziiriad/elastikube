@@ -774,88 +774,93 @@ def _handle_scale_up(detail: dict) -> dict:
         # Set scaling_in_progress flag
         _set_scaling_in_progress(table_name, cluster_name, True)
 
-    # Step 4: Launch the new worker instance
+    # Step 4: Launch the worker instance(s) back to back. Each launch advances
+    # the AZ round-robin, then all joins are verified together, so an N-node
+    # burst costs one join time instead of N.
+    count = _launch_count(detail)
     try:
-        launch_result = _launch_test_instance()
-        launch_status = launch_result.get("statusCode", 500)
+        launched = []  # (instance_id, subnet_id, availability_zone)
+        last_failure = None
+        for n in range(count):
+            launch_result = _launch_test_instance()
+            if launch_result.get("statusCode", 500) != 200:
+                # Capacity/quota errors tend to repeat; keep what launched.
+                logger.error(f"Launch {n + 1}/{count} failed: {launch_result}")
+                last_failure = launch_result
+                break
+            launch_body = json.loads(launch_result.get("body", "{}"))
+            launch_config = launch_body.get("config", {})
+            launched.append((
+                launch_body.get("instance_id"),
+                launch_config.get("subnet", ""),
+                launch_config.get("availability_zone", ""),
+            ))
 
-        if launch_status == 200:
-            body = json.loads(launch_result.get("body", "{}"))
-            instance_id = body.get("instance_id")
+        if not launched:
+            logger.error(f"Failed to launch instance: {last_failure}")
+            return last_failure
 
-            logger.info(f"Launched instance {instance_id}, waiting for bootstrap...")
+        instance_ids = [instance_id for instance_id, _, _ in launched]
+        logger.info(f"Launched {len(instance_ids)}/{count} instance(s) {instance_ids}, waiting for bootstrap...")
 
-            # Verification: Wait for bootstrap script to set JoinStatus=success tag
-            # Use configured timeout (default 180s / 3 minutes)
-            bootstrap_timeout = config.get("bootstrap_timeout", 180)
-            verify_result = _verify_node_joined_tag(instance_id, timeout_seconds=bootstrap_timeout)
-
-            # Log verification result
-            if verify_result["success"]:
-                logger.info("✓ Node successfully joined cluster")
+        # Verification: wait for every bootstrap to set JoinStatus
+        bootstrap_timeout = config.get("bootstrap_timeout", 180)
+        results = _verify_nodes_joined(instance_ids, timeout_seconds=bootstrap_timeout)
+        joined = sum(1 for r in results.values() if r["success"])
+        for iid, r in results.items():
+            if r["success"]:
+                logger.info(f"✓ {iid} joined cluster")
             else:
-                logger.warning(f"Bootstrap verification: {verify_result.get('error')}")
+                logger.warning(f"Bootstrap verification for {iid}: {r.get('error')}")
 
-            # Update DynamoDB state with subnet and AZ information
-            if table_name:
-                try:
-                    # Extract subnet and AZ from launch result
-                    body = json.loads(launch_result.get("body", "{}"))
-                    subnet_id = body.get("config", {}).get("subnet", "")
-                    availability_zone = body.get("config", {}).get("availability_zone", "")
-
-                    dynamodb = boto3.client("dynamodb")
-                    update_expr = (
-                        "SET last_scale_operation = :op, "
-                        "last_scale_time = :time, "
-                        "last_launched_instance = :instance_id"
-                    )
-
-                    expr_values = {
-                        ":op": {"S": "SCALE_UP"},
-                        ":time": {"S": datetime.now(timezone.utc).isoformat()},
-                        ":instance_id": {"S": instance_id},
-                    }
-
-                    # Add subnet and AZ if available
-                    if subnet_id:
-                        update_expr += ", last_subnet_id = :subnet_id"
-                        expr_values[":subnet_id"] = {"S": subnet_id}
-                    if availability_zone:
-                        update_expr += ", last_availability_zone = :az"
-                        expr_values[":az"] = {"S": availability_zone}
-
-                    dynamodb.update_item(
-                        TableName=table_name,
-                        Key={"cluster_id": {"S": cluster_name}},
-                        UpdateExpression=update_expr,
-                        ExpressionAttributeValues=expr_values,
-                    )
-                    logger.info(f"✓ State updated: scale operation logged (subnet={subnet_id}, az={availability_zone})")
-                except ClientError as e:
-                    logger.error(f"Failed to update DynamoDB state: {e}")
-
-            logger.info("=" * 60)
-            logger.info("✓ SCALE-UP OPERATION COMPLETED")
-            logger.info(f"  Instance ID: {instance_id}")
-            logger.info(f"  Instance IP: {verify_result.get('private_ip', 'N/A')}")
-            logger.info(f"  K3s API: {verify_result.get('api_status', 'unknown')}")
-            logger.info(f"  Cluster: {cluster_name}")
-            logger.info("=" * 60)
-
-            return {
-                "statusCode": 200,
-                "body": json.dumps({
-                    "status": "success",
-                    "instance_id": instance_id,
-                    "private_ip": verify_result.get("private_ip"),
-                    "api_status": verify_result.get("api_status"),
-                    "message": f"Scale-up completed: instance {instance_id} launched",
-                }),
+        # Update DynamoDB state with the last launch's subnet and AZ
+        if table_name:
+            last_id, subnet_id, availability_zone = launched[-1]
+            update_expr = (
+                "SET last_scale_operation = :op, "
+                "last_scale_time = :time, "
+                "last_launched_instance = :instance_id"
+            )
+            expr_values = {
+                ":op": {"S": "SCALE_UP"},
+                ":time": {"S": datetime.now(timezone.utc).isoformat()},
+                ":instance_id": {"S": last_id},
             }
-        else:
-            logger.error(f"Failed to launch instance: {launch_result}")
-            return launch_result
+            if subnet_id:
+                update_expr += ", last_subnet_id = :subnet_id"
+                expr_values[":subnet_id"] = {"S": subnet_id}
+            if availability_zone:
+                update_expr += ", last_availability_zone = :az"
+                expr_values[":az"] = {"S": availability_zone}
+            try:
+                boto3.client("dynamodb").update_item(
+                    TableName=table_name,
+                    Key={"cluster_id": {"S": cluster_name}},
+                    UpdateExpression=update_expr,
+                    ExpressionAttributeValues=expr_values,
+                )
+                logger.info(f"✓ State updated: scale operation logged (subnet={subnet_id}, az={availability_zone})")
+            except ClientError as e:
+                logger.error(f"Failed to update DynamoDB state: {e}")
+
+        logger.info("=" * 60)
+        logger.info("✓ SCALE-UP OPERATION COMPLETED")
+        logger.info(f"  Instances: {instance_ids} ({joined}/{len(instance_ids)} joined, {count} requested)")
+        logger.info(f"  Cluster: {cluster_name}")
+        logger.info("=" * 60)
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "status": "success" if joined == count else "partial",
+                "instance_id": instance_ids[0],  # backward compatible
+                "instance_ids": instance_ids,
+                "requested": count,
+                "joined": joined,
+                "results": results,
+                "message": f"Scale-up: {len(instance_ids)}/{count} launched, {joined} joined",
+            }),
+        }
     finally:
         # Step 5: Always cleanup
         if table_name:
@@ -866,101 +871,147 @@ def _handle_scale_up(detail: dict) -> dict:
                 _release_distributed_lock(table_name, cluster_name, lock_id)
 
 
-def _verify_node_joined_tag(instance_id: str, timeout_seconds: int = 180) -> dict:
-    """Verify node joined by checking JoinStatus tag set by bootstrap script.
+def _join_timing(launch_time: datetime, tags: dict) -> dict | None:
+    """Split launch -> joined into EC2/boot/bootstrap phases.
 
-    The bootstrap script (user-data.sh.j2) tags the instance with:
-    - JoinStatus=success when K3s agent is running
-    - JoinStatus=failed when K3s agent fails to start
-
-    This is much simpler than using kubectl - just check the tag!
-
-    Args:
-        instance_id: EC2 instance ID
-        timeout_seconds: Maximum time to wait (default: 2 minutes)
+    Uses EC2 LaunchTime plus tags written by user-data:
+    BootstrapStartedAt (UTC, when user-data started), BootUptimeAtStart
+    (kernel uptime in seconds at that moment) and JoinedAt.
 
     Returns:
-        Dict with success, private_ip, api_status
+        Seconds per phase, or None if any input is missing or malformed.
+    """
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    try:
+        started = datetime.strptime(tags["BootstrapStartedAt"], fmt).replace(tzinfo=timezone.utc)
+        joined = datetime.strptime(tags["JoinedAt"], fmt).replace(tzinfo=timezone.utc)
+        uptime = float(tags["BootUptimeAtStart"])
+    except (KeyError, ValueError):
+        return None
+
+    userdata_start = (started - launch_time).total_seconds()
+    return {
+        "launch_to_os_boot_s": round(userdata_start - uptime, 1),
+        "os_boot_to_userdata_s": round(uptime, 1),
+        "userdata_to_joined_s": round((joined - started).total_seconds(), 1),
+        "launch_to_joined_s": round((joined - launch_time).total_seconds(), 1),
+    }
+
+
+def _report_join_timing(instance_id: str, timing: dict) -> None:
+    """Log the boot-phase breakdown and publish NodeJoinSeconds."""
+    logger.info(
+        f"Join timing for {instance_id}: "
+        f"EC2 launch->OS boot {timing['launch_to_os_boot_s']}s, "
+        f"OS boot->user-data {timing['os_boot_to_userdata_s']}s, "
+        f"user-data->joined {timing['userdata_to_joined_s']}s "
+        f"(total {timing['launch_to_joined_s']}s)"
+    )
+    try:
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace="K3sAutoscaler",
+            MetricData=[{
+                "MetricName": "NodeJoinSeconds",
+                "Value": timing["launch_to_joined_s"],
+                "Unit": "Seconds",
+                "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+            }],
+        )
+    except Exception as e:
+        logger.warning(f"Failed to publish NodeJoinSeconds: {e}")
+
+
+def _launch_count(detail: dict) -> int:
+    """Instances to launch for a ScaleUp event: target - current.
+
+    Capped by MAX_SCALE_UP_STEP (default 3), never below 1; malformed or
+    missing values mean 1, as before multi-node scale-ups existed.
+    """
+    try:
+        requested = int(detail["target_nodes"]) - int(detail["current_nodes"])
+    except (KeyError, TypeError, ValueError):
+        return 1
+    max_step = max(1, int(os.environ.get("MAX_SCALE_UP_STEP", "3")))
+    return max(1, min(requested, max_step))
+
+
+def _verify_nodes_joined(instance_ids: list[str], timeout_seconds: int = 180) -> dict:
+    """Wait for each instance's bootstrap to set its JoinStatus tag.
+
+    The bootstrap script (user-data.sh.j2) tags JoinStatus=success once the
+    kubelet is healthy (node joined) and JoinStatus=failed otherwise. All
+    instances are polled together in one loop.
+
+    Returns:
+        {instance_id: {"success", "private_ip", "api_status", "error"?}}
     """
     import time
 
-    logger.info(f"Waiting for bootstrap to complete (timeout={timeout_seconds}s)...")
-
+    poll_interval = 5
     ec2_client = boto3.client("ec2")
+    results: dict = {}
+    pending = list(instance_ids)
+    private_ips: dict = {}
+    deadline = time.monotonic() + timeout_seconds
+    logger.info(f"Waiting for bootstrap of {pending} (timeout={timeout_seconds}s)...")
 
-    # Get initial instance info
-    try:
-        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
-        instance = resp["Reservations"][0]["Instances"][0]
-        private_ip = instance.get("PrivateIpAddress", "")
-        logger.info(f"Worker IP: {private_ip}")
-    except (ClientError, IndexError, KeyError) as e:
-        return {
-            "success": False,
-            "error": f"Failed to get instance info: {e}",
-            "private_ip": None,
-            "api_status": "unknown",
-        }
-
-    # Poll for JoinStatus tag every 10 seconds
-    start_time = time.time()
-    check_interval = 10
-
-    while time.time() - start_time < timeout_seconds:
+    while pending:
         try:
-            resp = ec2_client.describe_instances(InstanceIds=[instance_id])
-            instance = resp["Reservations"][0]["Instances"][0]
-            tags = {tag["Key"]: tag["Value"] for tag in instance.get("Tags", [])}
+            resp = ec2_client.describe_instances(InstanceIds=pending)
+            instances = [i for r in resp["Reservations"] for i in r["Instances"]]
+        except ClientError as e:
+            logger.warning(f"Failed to check instance tags: {e}")
+            instances = []
 
-            join_status = tags.get("JoinStatus", "")
-
-            if join_status == "success":
-                logger.info("✓ Bootstrap completed successfully")
-                # Tag as verified for cleanup Lambda
+        for instance in instances:
+            iid = instance["InstanceId"]
+            private_ips[iid] = instance.get("PrivateIpAddress", "")
+            tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
+            status = tags.get("JoinStatus", "")
+            if status == "success":
+                logger.info(f"✓ Bootstrap of {iid} completed successfully")
+                timing = _join_timing(instance["LaunchTime"], tags) if "LaunchTime" in instance else None
+                if timing:
+                    _report_join_timing(iid, timing)
                 try:
+                    # Tag as verified for cleanup Lambda
                     ec2_client.create_tags(
-                        Resources=[instance_id],
+                        Resources=[iid],
                         Tags=[
                             {"Key": "JoinVerified", "Value": "true"},
                             {"Key": "VerifiedAt", "Value": datetime.now(timezone.utc).isoformat()},
-                        ]
+                        ],
                     )
-                    logger.info(f"✓ Tagged {instance_id} as verified")
                 except Exception as e:
-                    logger.warning(f"Failed to tag as verified: {e}")
-
-                return {
-                    "success": True,
-                    "private_ip": private_ip,
-                    "api_status": "ready",
-                }
-            elif join_status == "failed":
-                logger.error(f"Bootstrap failed for {instance_id}")
-                return {
+                    logger.warning(f"Failed to tag {iid} as verified: {e}")
+                results[iid] = {"success": True, "private_ip": private_ips[iid], "api_status": "ready"}
+            elif status == "failed":
+                logger.error(f"Bootstrap failed for {iid}")
+                results[iid] = {
                     "success": False,
                     "error": "Bootstrap script reported failure",
-                    "private_ip": private_ip,
+                    "private_ip": private_ips[iid],
                     "api_status": "failed",
                 }
-            else:
-                # No status yet - keep waiting
-                elapsed = int(time.time() - start_time)
-                logger.info(f"Bootstrap in progress... (elapsed: {elapsed}s)")
-                time.sleep(check_interval)
-                continue
+        pending = [i for i in pending if i not in results]
 
-        except ClientError as e:
-            logger.warning(f"Failed to check instance tags: {e}")
-            time.sleep(check_interval)
+        if pending and time.monotonic() >= deadline:
+            break
+        if pending:
+            logger.info(f"Bootstrap in progress for {pending}...")
+            time.sleep(poll_interval)
 
     # Timeout - but don't fail, let cleanup Lambda handle it
-    logger.warning(f"Bootstrap verification timed out after {timeout_seconds}s")
-    return {
-        "success": False,
-        "error": f"Bootstrap verification timeout ({timeout_seconds}s)",
-        "private_ip": private_ip,
-        "api_status": "timeout",
-    }
+    for iid in pending:
+        logger.warning(f"Bootstrap verification of {iid} timed out after {timeout_seconds}s")
+        results[iid] = {
+            "success": False,
+            "error": f"Bootstrap verification timeout ({timeout_seconds}s)",
+            "private_ip": private_ips.get(iid),
+            "api_status": "timeout",
+        }
+    return results
+
 
 
 def _fetch_bootstrap_script(s3_client, bucket: str, key: str) -> str:
@@ -987,7 +1038,6 @@ def _launch_test_instance() -> dict:
     2. Log bootstrap script content for verification
     3. Launch EC2 instance with bootstrap script as user-data
     """
-    import base64
 
     logger.info("=" * 60)
     logger.info("STEP 1: Initializing worker instance launch")
@@ -1035,11 +1085,9 @@ def _launch_test_instance() -> dict:
         {"Key": "AvailabilityZone", "Value": availability_zone},  # Track AZ for observability
     ]
 
-    # Prepare instance launch parameters
-    user_data_base64 = base64.b64encode(
-        bootstrap_script.encode("utf-8")
-    ).decode("utf-8")
-
+    # Prepare instance launch parameters.
+    # UserData is passed as the plain script: boto3 base64-encodes RunInstances
+    # UserData itself, so encoding it here delivered base64 text to the instance.
     run_params = {
         "ImageId": config["ami_id"],
         "InstanceType": config["instance_type"],
@@ -1048,7 +1096,7 @@ def _launch_test_instance() -> dict:
         "SubnetId": subnet_id,  # Use round-robin selected subnet
         "SecurityGroupIds": [config["security_group_id"]],
         "IamInstanceProfile": {"Name": config["iam_instance_profile"]},
-        "UserData": user_data_base64,
+        "UserData": bootstrap_script,
         "TagSpecifications": [
             {
                 "ResourceType": "instance",
@@ -1082,7 +1130,7 @@ def _launch_test_instance() -> dict:
 
     logger.info(f"Launching instance with: ami={run_params['ImageId']}, "
                 f"type={run_params['InstanceType']}, subnet={run_params['SubnetId']}")
-    logger.info(f"User-data size: {len(user_data_base64)} bytes (base64 encoded)")
+    logger.info(f"User-data size: {len(bootstrap_script.encode('utf-8'))} bytes")
 
     # Launch instance with spot fallback mechanism
     response = None

@@ -33,6 +33,7 @@
 - name: Download and install k3s agent
   shell: >
     curl -sfL https://get.k3s.io |
+    INSTALL_K3S_VERSION={{ k3s_install_version }}
     K3S_URL={{ k3s_url }}
     K3S_TOKEN={{ k3s_token }}
     INSTALL_K3S_EXEC="agent --node-ip={{ ansible_default_ipv4.address }} --node-label k3s-worker={{ node_name }}"

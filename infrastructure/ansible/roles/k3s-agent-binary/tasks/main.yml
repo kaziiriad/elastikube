@@ -46,7 +46,7 @@
   args:
     creates: /usr/local/bin/k3s
   environment:
-    K3S_CHANNEL: stable
+    INSTALL_K3S_VERSION: "{{ k3s_install_version }}"
 
 - name: Verify K3s binary exists
   ansible.builtin.stat:

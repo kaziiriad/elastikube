@@ -11,6 +11,7 @@ Environment variables:
     DATA_RETENTION_DAYS: Days to retain historical data (default: 90)
     MIN_NODES: Minimum number of worker nodes
     MAX_NODES: Maximum number of worker nodes
+    MAX_SCALE_UP_STEP: Max nodes added by one pending-pod scale-up (default: 3)
     SCALE_UP_THRESHOLD: CPU % to trigger scale-up (used if time-aware disabled)
     SCALE_DOWN_THRESHOLD: CPU % to trigger scale-down (used if time-aware disabled)
     SCALE_UP_COOLDOWN: Seconds to wait after scale-up
@@ -64,6 +65,7 @@ class Config:
     # Scaling limits
     min_nodes: int
     max_nodes: int
+    max_scale_up_step: int
 
     # Scaling thresholds (used when time-aware scaling is disabled)
     scale_up_threshold: float  # CPU %
@@ -136,6 +138,7 @@ class Config:
             # Scaling limits
             min_nodes=int(os.getenv("MIN_NODES", "2")),
             max_nodes=int(os.getenv("MAX_NODES", "10")),
+            max_scale_up_step=max(1, int(os.getenv("MAX_SCALE_UP_STEP", "3"))),
             # Scaling thresholds (fallback when time-aware disabled)
             scale_up_threshold=float(os.getenv("SCALE_UP_THRESHOLD", "70")),
             scale_down_threshold=float(os.getenv("SCALE_DOWN_THRESHOLD", "30")),

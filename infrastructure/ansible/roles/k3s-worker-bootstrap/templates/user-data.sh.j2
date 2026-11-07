@@ -10,6 +10,12 @@ AWS_REGION="{{ aws_region }}"
 SECRET_NAME="k3s-${CLUSTER_NAME}-join-token"
 SSM_MASTER_IP="/k3s/${CLUSTER_NAME}/master-ip"
 
+# Boot-phase timing: when user-data started and how long the kernel had been
+# up by then. Written as tags with JoinStatus so the scale-up Lambda can split
+# launch -> joined into EC2 launch / OS boot / bootstrap phases.
+BOOTSTRAP_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+BOOT_UPTIME_AT_START=$(cut -d' ' -f1 /proc/uptime)
+
 echo "=== K3s Worker Node Bootstrap (Pre-baked AMI) ==="
 echo "Cluster: $CLUSTER_NAME"
 echo "Region: $AWS_REGION"
@@ -134,7 +140,11 @@ systemctl stop k3s-agent 2>/dev/null || true
 systemctl disable k3s 2>/dev/null || true
 systemctl disable k3s-agent 2>/dev/null || true
 pkill -9 -f "k3s" 2>/dev/null || true
-sleep 2
+# Wait (max 5s) for killed processes to exit instead of a fixed sleep.
+for _ in $(seq 1 50); do
+    pgrep -f "k3s" > /dev/null 2>&1 || break
+    sleep 0.1
+done
 
 # Verify binary exists and is executable
 if [ ! -f /usr/local/bin/k3s ]; then
@@ -148,7 +158,9 @@ fi
 
 # Test master connectivity
 echo "Testing connectivity to master $MASTER_IP:6443..."
-if curl -sf --connect-timeout 5 "https://$MASTER_IP:6443" > /dev/null 2>&1; then
+# -k: the k3s API uses a self-signed cert. No -f: any HTTP answer (e.g. 401)
+# proves the API is reachable; only a connection failure is non-zero.
+if curl -sk -o /dev/null --connect-timeout 5 "https://$MASTER_IP:6443"; then
     echo "  Master API is reachable"
 else
     echo "  WARNING: Cannot reach master API - will retry"
@@ -171,6 +183,7 @@ nohup /usr/local/bin/k3s agent \
     --server="https://$MASTER_IP:6443" \
     --node-ip="$LOCAL_IP" \
     --node-name="ip-$LOCAL_IP" \
+    --with-node-id \
     --flannel-iface="$PRIMARY_IFACE" \
     "${NODE_LABEL_ARGS[@]}" \
     >> /var/log/k3s-agent.log 2>&1 &
@@ -178,27 +191,30 @@ nohup /usr/local/bin/k3s agent \
 K3S_PID=$!
 echo "  k3s-agent started with PID: $K3S_PID"
 
-# Wait for K3s agent to start and join cluster
-echo "  Waiting for K3s agent to start (max 120s)..."
-WAIT_COUNT=0
-MAX_WAIT=120
-while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
-    # Check if k3s-agent process is running
-    if pgrep -f "k3s agent" > /dev/null 2>&1; then
-        echo "  k3s-agent process is running"
+# Wait for the node to actually join. A running agent process is not proof:
+# with a wrong token, a rejected node password or an unreachable master the
+# agent keeps retrying forever. The kubelet only starts once the server has
+# accepted the agent and handed it its config, so a healthy kubelet
+# (127.0.0.1:10248/healthz) means the join succeeded. Must stay below the
+# scale-up Lambda's BOOTSTRAP_TIMEOUT_SECONDS (default 180s).
+JOIN_TIMEOUT=90
+echo "  Waiting for kubelet to become healthy (max ${JOIN_TIMEOUT}s)..."
+JOINED=false
+JOIN_START=$(date +%s)
+while [ $(( $(date +%s) - JOIN_START )) -lt $JOIN_TIMEOUT ]; do
+    if ! kill -0 "$K3S_PID" 2>/dev/null; then
+        echo "  k3s-agent exited"
         break
     fi
-    WAIT_COUNT=$((WAIT_COUNT + 5))
-    echo "  Waiting... ${WAIT_COUNT}s / ${MAX_WAIT}s"
-    sleep 5
+    if curl -sf --max-time 2 http://127.0.0.1:10248/healthz > /dev/null 2>&1; then
+        JOINED=true
+        echo "  kubelet healthy after $(( $(date +%s) - JOIN_START ))s"
+        break
+    fi
+    sleep 1
 done
 
-# Verify agent joined cluster by checking kubectl
-echo "  Verifying cluster join..."
-sleep 5
-
-# Check if k3s-agent process is still running
-if pgrep -f "k3s agent" > /dev/null 2>&1; then
+if [ "$JOINED" = "true" ]; then
     echo "[6/6] Tagging instance..."
 
     # Tag the instance with cluster metadata
@@ -209,12 +225,14 @@ if pgrep -f "k3s agent" > /dev/null 2>&1; then
             "Key=NodeRole,Value=worker" \
             "Key=JoinStatus,Value=success" \
             "Key=JoinedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "Key=BootstrapStartedAt,Value=$BOOTSTRAP_STARTED_AT" \
+            "Key=BootUptimeAtStart,Value=$BOOT_UPTIME_AT_START" \
         --region "$AWS_REGION" 2>/dev/null || true
 
     echo "=== Bootstrap Complete ==="
     echo "Worker node successfully joined cluster '$CLUSTER_NAME'!"
 else
-    echo "ERROR: k3s-agent process not running"
+    echo "ERROR: node did not join (kubelet not healthy within ${JOIN_TIMEOUT}s, or agent exited)"
     echo "Checking logs:"
     tail -30 /var/log/k3s-agent.log 2>/dev/null || echo "  No log file found"
 
@@ -226,6 +244,8 @@ else
             "Key=NodeRole,Value=worker" \
             "Key=JoinStatus,Value=failed" \
             "Key=FailedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "Key=BootstrapStartedAt,Value=$BOOTSTRAP_STARTED_AT" \
+            "Key=BootUptimeAtStart,Value=$BOOT_UPTIME_AT_START" \
         --region "$AWS_REGION" 2>/dev/null || true
     exit 1
 fi
