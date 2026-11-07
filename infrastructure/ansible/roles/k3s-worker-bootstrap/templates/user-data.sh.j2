@@ -10,6 +10,12 @@ AWS_REGION="{{ aws_region }}"
 SECRET_NAME="k3s-${CLUSTER_NAME}-join-token"
 SSM_MASTER_IP="/k3s/${CLUSTER_NAME}/master-ip"
 
+# Boot-phase timing: when user-data started and how long the kernel had been
+# up by then. Written as tags with JoinStatus so the scale-up Lambda can split
+# launch -> joined into EC2 launch / OS boot / bootstrap phases.
+BOOTSTRAP_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+BOOT_UPTIME_AT_START=$(cut -d' ' -f1 /proc/uptime)
+
 echo "=== K3s Worker Node Bootstrap (Pre-baked AMI) ==="
 echo "Cluster: $CLUSTER_NAME"
 echo "Region: $AWS_REGION"
@@ -219,6 +225,8 @@ if [ "$JOINED" = "true" ]; then
             "Key=NodeRole,Value=worker" \
             "Key=JoinStatus,Value=success" \
             "Key=JoinedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "Key=BootstrapStartedAt,Value=$BOOTSTRAP_STARTED_AT" \
+            "Key=BootUptimeAtStart,Value=$BOOT_UPTIME_AT_START" \
         --region "$AWS_REGION" 2>/dev/null || true
 
     echo "=== Bootstrap Complete ==="
@@ -236,6 +244,8 @@ else
             "Key=NodeRole,Value=worker" \
             "Key=JoinStatus,Value=failed" \
             "Key=FailedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "Key=BootstrapStartedAt,Value=$BOOTSTRAP_STARTED_AT" \
+            "Key=BootUptimeAtStart,Value=$BOOT_UPTIME_AT_START" \
         --region "$AWS_REGION" 2>/dev/null || true
     exit 1
 fi

@@ -866,6 +866,56 @@ def _handle_scale_up(detail: dict) -> dict:
                 _release_distributed_lock(table_name, cluster_name, lock_id)
 
 
+def _join_timing(launch_time: datetime, tags: dict) -> dict | None:
+    """Split launch -> joined into EC2/boot/bootstrap phases.
+
+    Uses EC2 LaunchTime plus tags written by user-data:
+    BootstrapStartedAt (UTC, when user-data started), BootUptimeAtStart
+    (kernel uptime in seconds at that moment) and JoinedAt.
+
+    Returns:
+        Seconds per phase, or None if any input is missing or malformed.
+    """
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    try:
+        started = datetime.strptime(tags["BootstrapStartedAt"], fmt).replace(tzinfo=timezone.utc)
+        joined = datetime.strptime(tags["JoinedAt"], fmt).replace(tzinfo=timezone.utc)
+        uptime = float(tags["BootUptimeAtStart"])
+    except (KeyError, ValueError):
+        return None
+
+    userdata_start = (started - launch_time).total_seconds()
+    return {
+        "launch_to_os_boot_s": round(userdata_start - uptime, 1),
+        "os_boot_to_userdata_s": round(uptime, 1),
+        "userdata_to_joined_s": round((joined - started).total_seconds(), 1),
+        "launch_to_joined_s": round((joined - launch_time).total_seconds(), 1),
+    }
+
+
+def _report_join_timing(instance_id: str, timing: dict) -> None:
+    """Log the boot-phase breakdown and publish NodeJoinSeconds."""
+    logger.info(
+        f"Join timing for {instance_id}: "
+        f"EC2 launch->OS boot {timing['launch_to_os_boot_s']}s, "
+        f"OS boot->user-data {timing['os_boot_to_userdata_s']}s, "
+        f"user-data->joined {timing['userdata_to_joined_s']}s "
+        f"(total {timing['launch_to_joined_s']}s)"
+    )
+    try:
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace="K3sAutoscaler",
+            MetricData=[{
+                "MetricName": "NodeJoinSeconds",
+                "Value": timing["launch_to_joined_s"],
+                "Unit": "Seconds",
+                "Dimensions": [{"Name": "Cluster", "Value": "k3s-cluster"}],
+            }],
+        )
+    except Exception as e:
+        logger.warning(f"Failed to publish NodeJoinSeconds: {e}")
+
+
 def _verify_node_joined_tag(instance_id: str, timeout_seconds: int = 180) -> dict:
     """Verify node joined by checking JoinStatus tag set by bootstrap script.
 
@@ -916,6 +966,9 @@ def _verify_node_joined_tag(instance_id: str, timeout_seconds: int = 180) -> dic
 
             if join_status == "success":
                 logger.info("✓ Bootstrap completed successfully")
+                timing = _join_timing(instance["LaunchTime"], tags) if "LaunchTime" in instance else None
+                if timing:
+                    _report_join_timing(instance_id, timing)
                 # Tag as verified for cleanup Lambda
                 try:
                     ec2_client.create_tags(
