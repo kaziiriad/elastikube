@@ -47,7 +47,11 @@ worker_instance_type = config.get("ec2:workerInstanceType", "t3.small")
 ami_id = config.get("ec2:amiId", "ami-0c687e8f5c4e54af5")  # ap-southeast-1 (Ubuntu 22.04)
 
 # Autoscaler Configuration
-check_interval = config.get_int("autoscaler:checkInterval", 120)
+check_interval = config.get_int("autoscaler:checkInterval", 60)
+# EventBridge schedules are whole minutes, at least 1.
+if check_interval < 60 or check_interval % 60:
+    raise ValueError(f"autoscaler:checkInterval must be a multiple of 60 (>= 60), got {check_interval}")
+check_interval_minutes = check_interval // 60
 scale_up_threshold = config.get_int("autoscaler:scaleUpThreshold", 70)
 scale_down_threshold = config.get_int("autoscaler:scaleDownThreshold", 30)
 scale_up_cooldown = config.get_int("autoscaler:scaleUpCooldown", 300)
@@ -937,10 +941,14 @@ worker_instance_2 = ec2.Instance('worker-instance-2',
 # EventBridge Rule
 # =============================================================================
 
-# EventBridge Rule - triggers every 2 minutes
+# EventBridge Rule - triggers every autoscaler:checkInterval seconds (default 1 minute).
+# Detection delay for Pending pods is up to one interval, so keep it short.
 event_rule = aws.cloudwatch.EventRule(
     "k3s-autoscaler-schedule",
-    schedule_expression="rate(2 minutes)",
+    schedule_expression=(
+        "rate(1 minute)" if check_interval_minutes == 1
+        else f"rate({check_interval_minutes} minutes)"
+    ),
     tags={**common_tags, "Name": "k3s-autoscaler-schedule"}
 )
 
@@ -1652,10 +1660,11 @@ cleanup_lambda_errors_alarm = aws.cloudwatch.MetricAlarm(
 prometheus_health_alarm = aws.cloudwatch.MetricAlarm(
     "k3s-prometheus-health-alarm",
     comparison_operator="LessThanThreshold",
-    evaluation_periods=2,  # Trigger after 2 consecutive failures (4 minutes)
+    # One period per decision run; alarm after ~4 minutes of failures.
+    evaluation_periods=max(1, 240 // check_interval),
     metric_name="PrometheusHealth",
     namespace="K3sAutoscaler",
-    period=120,  # 2 minutes (aligns with EventBridge schedule)
+    period=check_interval,  # aligns with the EventBridge schedule
     statistic="Average",
     threshold=1.0,  # Below 1 means PrometheusHealth = 0 (failed)
     alarm_description="CRITICAL: Prometheus metrics unreachable for 4+ minutes. Autoscaler cannot make scaling decisions. Check Prometheus service and network connectivity from Lambda to master node.",
