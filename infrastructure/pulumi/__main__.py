@@ -27,38 +27,47 @@ from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3, sns
 # Configuration
 # =============================================================================
 config = pulumi.Config()
+# Namespaced settings ("ec2:amiId", "k3s:minNodes", ...) live under their own
+# namespace. pulumi.Config() is scoped to the project, so config.get("ec2:amiId")
+# looked up k3s-autoscaler:ec2:amiId -- a key that can't exist -- and silently
+# returned the default for every one of these settings.
+aws_config = pulumi.Config("aws")
+k3s_config = pulumi.Config("k3s")
+ec2_config = pulumi.Config("ec2")
+autoscaler_config = pulumi.Config("autoscaler")
+alarm_config = pulumi.Config("alarm")
 
 # Get AWS account ID for resource naming
 caller_identity = aws.get_caller_identity()
 account_id = caller_identity.account_id
 
 # AWS Region
-region = config.get("aws:region", "ap-southeast-1")
+region = aws_config.get("region", "ap-southeast-1")
 
 # K3s Configuration
-cluster_name = config.get("k3s:clusterName", "production-k3s")
-min_nodes = config.get_int("k3s:minNodes", 2)
-max_nodes = config.get_int("k3s:maxNodes", 10)
+cluster_name = k3s_config.get("clusterName", "production-k3s")
+min_nodes = k3s_config.get_int("minNodes", 2)
+max_nodes = k3s_config.get_int("maxNodes", 10)
 
 # EC2 Configuration
-master_instance_type = config.get("ec2:masterInstanceType", "t3.small")  # Free Tier eligible
-worker_instance_type = config.get("ec2:workerInstanceType", "t3.small")
+master_instance_type = ec2_config.get("masterInstanceType", "t3.small")  # Free Tier eligible
+worker_instance_type = ec2_config.get("workerInstanceType", "t3.small")
 # Ubuntu 22.04 AMI IDs (update if using different region)
-ami_id = config.get("ec2:amiId", "ami-0c687e8f5c4e54af5")  # ap-southeast-1 (Ubuntu 22.04)
+ami_id = ec2_config.get("amiId", "ami-0c687e8f5c4e54af5")  # ap-southeast-1 (Ubuntu 22.04)
 
 # Autoscaler Configuration
-check_interval = config.get_int("autoscaler:checkInterval", 60)
+check_interval = autoscaler_config.get_int("checkInterval", 60)
 # EventBridge schedules are whole minutes, at least 1.
 if check_interval < 60 or check_interval % 60:
     raise ValueError(f"autoscaler:checkInterval must be a multiple of 60 (>= 60), got {check_interval}")
 check_interval_minutes = check_interval // 60
-scale_up_threshold = config.get_int("autoscaler:scaleUpThreshold", 70)
-scale_down_threshold = config.get_int("autoscaler:scaleDownThreshold", 30)
-scale_up_cooldown = config.get_int("autoscaler:scaleUpCooldown", 300)
-scale_down_cooldown = config.get_int("autoscaler:scaleDownCooldown", 900)
+scale_up_threshold = autoscaler_config.get_int("scaleUpThreshold", 70)
+scale_down_threshold = autoscaler_config.get_int("scaleDownThreshold", 30)
+scale_up_cooldown = autoscaler_config.get_int("scaleUpCooldown", 300)
+scale_down_cooldown = autoscaler_config.get_int("scaleDownCooldown", 900)
 
 # Alarm Notification Configuration
-alarm_email = config.get("alarm:email", None)  # Optional: Set to your email for alarm notifications
+alarm_email = alarm_config.get("email", None)  # Optional: Set to your email for alarm notifications
 
 # =============================================================================
 # Tags
@@ -872,7 +881,7 @@ master_cloudwatch_policy = iam.RolePolicy(
 
 # SSH Key Pair - use existing MyKeyPair in AWS
 # Note: Key pair must already exist in AWS for this region
-existing_key_name = config.get("ec2:keyPairName", "MyKeyPair")
+existing_key_name = ec2_config.get("keyPairName", "MyKeyPair")
 
 
 # Static IP assignments for consistent infrastructure across deployments
