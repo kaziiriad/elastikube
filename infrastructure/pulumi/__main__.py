@@ -19,6 +19,7 @@ import pulumi
 import pulumi_command as command
 from pulumi_command import local
 import pulumi_aws as aws
+import pulumi_random
 from pulumi_aws import ec2, lambda_, dynamodb, iam, ssm, secretsmanager, s3, sns, cloudwatch
 
 # If CustomTimeouts is provider-specific (e.g., AWS, Kubernetes):
@@ -483,11 +484,19 @@ k3s_join_token_secret = secretsmanager.Secret(
     recovery_window_in_days=0,  # Immediate deletion, no recovery window (dev/test)
 )
 
-# Secret version (initial value, will be updated by Ansible)
+# The join token is generated here, before any node exists, so the master can
+# start with it (K3S_TOKEN) and workers can read it without waiting for the
+# master to boot and publish its own token.
+k3s_join_token = pulumi_random.RandomPassword(
+    "k3s-join-token-value",
+    length=48,
+    special=False,
+)
+
 k3s_join_token_version = secretsmanager.SecretVersion(
     "k3s-join-token-version",
     secret_id=k3s_join_token_secret.id,
-    secret_string="PENDING",  # Will be populated by Ansible after cluster setup
+    secret_string=k3s_join_token.result,
 )
 
 # =============================================================================
