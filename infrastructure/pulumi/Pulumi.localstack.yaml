@@ -2,6 +2,7 @@ encryptionsalt: v1:gMtO2bB6R5A=:v1:FM3ltAkSw/IFvcyl:vBfMwusT1iwCHUZw0+akeaHqS0EC
 config:
   aws:region: ap-southeast-1
   aws:skipCredentialsValidation: "true"
-  aws:skipRequestingAccountId: "true"
+  aws:skipRequestingAccountId: "false"
   aws:skipMetadataApiCheck: "true"
-  ec2:amiId: ami-00000000000000000
+  ec2:amiId: ami-785db401
+  aws:s3UsePathStyle: "true"

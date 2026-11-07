@@ -20,6 +20,9 @@
 # Export AWS endpoint + dummy creds accepted by LocalStack
 export AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-http://localhost:4566}"
 export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-http://localhost:4566}"
+# S3 Control prefixes the account ID to the host (000000000000.localhost),
+# which doesn't resolve; *.localhost.localstack.cloud resolves to 127.0.0.1.
+export AWS_ENDPOINT_URL_S3_CONTROL="${AWS_ENDPOINT_URL_S3_CONTROL:-http://localhost.localstack.cloud:4566}"
 export AWS_ENDPOINT_URL_DYNAMODB="${AWS_ENDPOINT_URL_DYNAMODB:-http://localhost:4566}"
 export AWS_ENDPOINT_URL_IAM="${AWS_ENDPOINT_URL_IAM:-http://localhost:4566}"
 export AWS_ENDPOINT_URL_LAMBDA="${AWS_ENDPOINT_URL_LAMBDA:-http://localhost:4566}"
