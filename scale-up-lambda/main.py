@@ -1038,7 +1038,6 @@ def _launch_test_instance() -> dict:
     2. Log bootstrap script content for verification
     3. Launch EC2 instance with bootstrap script as user-data
     """
-    import base64
 
     logger.info("=" * 60)
     logger.info("STEP 1: Initializing worker instance launch")
@@ -1086,11 +1085,9 @@ def _launch_test_instance() -> dict:
         {"Key": "AvailabilityZone", "Value": availability_zone},  # Track AZ for observability
     ]
 
-    # Prepare instance launch parameters
-    user_data_base64 = base64.b64encode(
-        bootstrap_script.encode("utf-8")
-    ).decode("utf-8")
-
+    # Prepare instance launch parameters.
+    # UserData is passed as the plain script: boto3 base64-encodes RunInstances
+    # UserData itself, so encoding it here delivered base64 text to the instance.
     run_params = {
         "ImageId": config["ami_id"],
         "InstanceType": config["instance_type"],
@@ -1099,7 +1096,7 @@ def _launch_test_instance() -> dict:
         "SubnetId": subnet_id,  # Use round-robin selected subnet
         "SecurityGroupIds": [config["security_group_id"]],
         "IamInstanceProfile": {"Name": config["iam_instance_profile"]},
-        "UserData": user_data_base64,
+        "UserData": bootstrap_script,
         "TagSpecifications": [
             {
                 "ResourceType": "instance",
@@ -1133,7 +1130,7 @@ def _launch_test_instance() -> dict:
 
     logger.info(f"Launching instance with: ami={run_params['ImageId']}, "
                 f"type={run_params['InstanceType']}, subnet={run_params['SubnetId']}")
-    logger.info(f"User-data size: {len(user_data_base64)} bytes (base64 encoded)")
+    logger.info(f"User-data size: {len(bootstrap_script.encode('utf-8'))} bytes")
 
     # Launch instance with spot fallback mechanism
     response = None
