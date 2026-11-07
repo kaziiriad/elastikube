@@ -1,0 +1,7 @@
+---
+# Single k3s version for the whole cluster: master, permanent workers and the
+# baked worker AMI (k3s-agent-binary) that Lambda-launched workers boot from.
+# Unpinned installs drift with the k3s "stable" channel, so an AMI baked months
+# before the master was (re)installed can end up far outside the supported
+# kubelet/apiserver version skew.
+k3s_install_version: v1.37.2+k3s1

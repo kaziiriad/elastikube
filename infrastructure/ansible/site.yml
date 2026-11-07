@@ -186,6 +186,7 @@
           --ssh-common-args='-o StrictHostKeyChecking=no -o ProxyJump=k3s-bastion' \
           -u ubuntu \
           --private-key=~/.ssh/{{ ssh_key_name }}.pem \
+          -e k3s_install_version={{ k3s_install_version }} \
           -m include_role -a "name=k3s-agent-binary"
       args:
         executable: /bin/bash
