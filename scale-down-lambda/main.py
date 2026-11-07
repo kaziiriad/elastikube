@@ -13,6 +13,7 @@ Environment variables required:
     SUBNET_ID: Subnet ID for filtering
 """
 
+import ipaddress
 import json
 import logging
 import os
@@ -426,6 +427,34 @@ def _describe_worker(instance_id: str) -> dict:
     }
 
 
+def _drain_commands(private_ip: str) -> list[str]:
+    """Shell commands (run on the master via SSM) to drain + delete a worker.
+
+    Workers register with `k3s agent --with-node-id`, so node names carry a
+    random suffix and can't be derived from the IP. Resolve the node by an
+    exact InternalIP match instead (a grep would also match 10.0.1.50 for
+    10.0.1.5). AWS-RunShellScript runs the list as one script, so $NODE
+    carries across lines; a missing node exits non-zero so the caller aborts
+    termination, as a failed drain did before.
+
+    Raises:
+        ValueError: If private_ip is not a valid IP address.
+    """
+    ip = str(ipaddress.ip_address(private_ip))
+    jsonpath = (
+        '{range .items[*]}{.metadata.name}{" "}'
+        '{.status.addresses[?(@.type=="InternalIP")].address}{"\\n"}{end}'
+    )
+    return [
+        f"NODE=$(sudo kubectl get nodes -o jsonpath='{jsonpath}' "
+        f"| awk -v ip='{ip}' '$2 == ip {{print $1}}')",
+        f'if [ -z "$NODE" ]; then echo "No node with InternalIP {ip}" >&2; exit 1; fi',
+        'echo "Node: $NODE"',
+        'sudo kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --timeout=120s',
+        'sudo kubectl delete node "$NODE" --ignore-not-found=true',
+    ]
+
+
 def _drain_worker(instance_id: str) -> dict:
     """Drain a worker node using kubectl via SSM.
 
@@ -478,20 +507,23 @@ def _drain_worker(instance_id: str) -> dict:
             }),
         }
 
-    # K3s node names use dots, not dashes: ip-10.0.2.42 not ip-10-0-2-42
-    node_name = f"ip-{private_ip}"
-    logger.info(f"Node name: {node_name}")
+    try:
+        commands = _drain_commands(private_ip)
+    except ValueError as e:
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "error": f"Invalid private IP {private_ip!r} for instance {instance_id}: {e}",
+            }),
+        }
 
-    # Execute kubectl drain and kubectl delete via SSM on master
-    drain_command = f"sudo kubectl drain {node_name} --ignore-daemonsets --delete-emptydir-data --timeout=120s"
-    delete_command = f"sudo kubectl delete node {node_name} --ignore-not-found=true"
-
-    logger.info("Executing drain command via SSM on master")
+    # Execute node lookup + kubectl drain + kubectl delete via SSM on master
+    logger.info(f"Executing drain via SSM on master for InternalIP {private_ip}")
     try:
         ssm_response = ssm_client.send_command(
             InstanceIds=[master_instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [drain_command, delete_command]},
+            Parameters={"commands": commands},
             TimeoutSeconds=120,
         )
 
@@ -531,8 +563,12 @@ def _drain_worker(instance_id: str) -> dict:
             stdout = result.get("StandardOutputContent", "")
             stderr = result.get("StandardErrorContent", "")
             status = result["Status"]
+            node_name = next(
+                (line[len("Node: "):] for line in stdout.splitlines() if line.startswith("Node: ")),
+                "unknown",
+            )
 
-            logger.info(f"Drain command status: {status}")
+            logger.info(f"Drain command status: {status} (node={node_name})")
 
             if status == "Success":
                 return {
