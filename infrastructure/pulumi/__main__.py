@@ -988,6 +988,9 @@ master_instance = ec2.Instance(
     tags={**common_tags, 'Name': 'k3s-master', 'NodeRole': 'master'},
     opts=pulumi.ResourceOptions(
         depends_on=[k3s_join_token_version, master_bootstrap_read_policy, *master_bootstrap_objects],
+        # A changed script applies to the next master, never through a
+        # stop/start of the running one (cloud-init would not rerun it).
+        ignore_changes=["userData"],
     ),
 )
 
@@ -1015,8 +1018,12 @@ worker_launch_template = ec2.LaunchTemplate(
     tags={**common_tags, "Name": "k3s-worker-template"},
 )
 
-# Permanent workers (in private subnet). "$Latest" keeps a template change from
-# replacing them; like the master, they run their user-data only on first boot.
+# Permanent workers (in private subnet). Like the master, they run their
+# user-data only on first boot, so a new template version applies to newly
+# launched workers only. Both fields are ignored: the provider resolves "$Latest"
+# to a version number and would replace these instances on every template
+# change, and the instance reports back the template's user-data, which would
+# otherwise read as a change on every run.
 # No public IP: the private subnet sets map_public_ip_on_launch=False. Not set
 # here explicitly: LocalStack echoes back an empty Association, which the
 # provider reads as True and treats as a change forcing replacement.
@@ -1025,7 +1032,10 @@ worker_instance_1 = ec2.Instance('worker-instance-1',
     subnet_id=private_subnet.id,  # Private subnet for security
     private_ip=worker_1_static_ip,  # Static private IP
     tags={**common_tags, 'Name': 'k3s-worker-1', 'NodeRole': 'worker', 'Permanent': 'true'},
-    opts=pulumi.ResourceOptions(depends_on=[k3s_join_token_version, master_ip_parameter]),
+    opts=pulumi.ResourceOptions(
+        depends_on=[k3s_join_token_version, master_ip_parameter],
+        ignore_changes=["launchTemplate", "userData"],
+    ),
 )
 
 worker_instance_2 = ec2.Instance('worker-instance-2',
@@ -1033,7 +1043,10 @@ worker_instance_2 = ec2.Instance('worker-instance-2',
     subnet_id=private_subnet.id,  # Private subnet for security
     private_ip=worker_2_static_ip,  # Static private IP
     tags={**common_tags, 'Name': 'k3s-worker-2', 'NodeRole': 'worker', 'Permanent': 'true'},
-    opts=pulumi.ResourceOptions(depends_on=[k3s_join_token_version, master_ip_parameter]),
+    opts=pulumi.ResourceOptions(
+        depends_on=[k3s_join_token_version, master_ip_parameter],
+        ignore_changes=["launchTemplate", "userData"],
+    ),
 )
 
 # =============================================================================

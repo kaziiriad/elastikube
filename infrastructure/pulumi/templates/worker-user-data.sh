@@ -186,7 +186,6 @@ until curl -sk -o /dev/null --connect-timeout 5 "https://$MASTER_IP:6443"; do
 done
 echo "  Master API check done after $(( $(date +%s) - MASTER_WAIT_START ))s"
 
-# Start k3s agent directly (bypass systemd for faster bootstrap)
 echo "Starting k3s-agent..."
 
 # Permanent workers carry an extra `--node-label` so the matching
@@ -198,18 +197,62 @@ if [ "$WORKER_PERMANENT" = "true" ] && [ -n "$WORKER_NAME" ]; then
     echo "  Applying k3s-worker=$WORKER_NAME label at registration"
 fi
 
-nohup /usr/local/bin/k3s agent \
-    --token="$JOIN_TOKEN" \
-    --server="https://$MASTER_IP:6443" \
-    --node-ip="$LOCAL_IP" \
-    --node-name="ip-$LOCAL_IP" \
-    --with-node-id \
-    --flannel-iface="$PRIMARY_IFACE" \
-    "${NODE_LABEL_ARGS[@]}" \
-    >> /var/log/k3s-agent.log 2>&1 &
+AGENT_ARGS=(
+    --server="https://$MASTER_IP:6443"
+    --node-ip="$LOCAL_IP"
+    --node-name="ip-$LOCAL_IP"
+    --with-node-id
+    --flannel-iface="$PRIMARY_IFACE"
+    "${NODE_LABEL_ARGS[@]}"
+)
 
-K3S_PID=$!
-echo "  k3s-agent started with PID: $K3S_PID"
+# The token reaches the agent through K3S_TOKEN in a root-only env file: not
+# on the command line (visible in ps) and not in the unit file (world-readable).
+(umask 077 && printf 'K3S_TOKEN=%s\n' "$JOIN_TOKEN" > /etc/k3s-agent.env)
+chmod 600 /etc/k3s-agent.env
+unset JOIN_TOKEN
+
+if [ -d /run/systemd/system ]; then
+    # cloud-init runs user-data only on first boot, so the agent must be an
+    # enabled unit to come back after a reboot.
+    EXEC_ARGS=$(printf '"%s" ' "${AGENT_ARGS[@]}")
+    cat > /etc/systemd/system/k3s-agent.service <<UNIT
+[Unit]
+Description=k3s agent (ElastiKube worker)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/k3s-agent.env
+ExecStart=/usr/local/bin/k3s agent ${EXEC_ARGS}
+Restart=always
+RestartSec=5
+KillMode=process
+Delegate=yes
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+StandardOutput=append:/var/log/k3s-agent.log
+StandardError=append:/var/log/k3s-agent.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable --now k3s-agent
+    echo "  k3s-agent started as an enabled systemd unit"
+    agent_running() { systemctl is-active --quiet k3s-agent; }
+else
+    # No systemd (minimal images): run directly. Does not survive a reboot.
+    set -a; . /etc/k3s-agent.env; set +a
+    nohup /usr/local/bin/k3s agent "${AGENT_ARGS[@]}" >> /var/log/k3s-agent.log 2>&1 &
+    K3S_PID=$!
+    unset K3S_TOKEN
+    echo "  k3s-agent started with PID: $K3S_PID (no systemd)"
+    agent_running() { kill -0 "$K3S_PID" 2>/dev/null; }
+fi
 
 # Wait for the node to actually join. A running agent process is not proof:
 # with a wrong token, a rejected node password or an unreachable master the
@@ -222,7 +265,7 @@ echo "  Waiting for kubelet to become healthy (max ${JOIN_TIMEOUT}s)..."
 JOINED=false
 JOIN_START=$(date +%s)
 while [ $(( $(date +%s) - JOIN_START )) -lt $JOIN_TIMEOUT ]; do
-    if ! kill -0 "$K3S_PID" 2>/dev/null; then
+    if ! agent_running; then
         echo "  k3s-agent exited"
         break
     fi

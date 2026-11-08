@@ -112,3 +112,22 @@ def test_worker_never_logs_or_embeds_the_token():
 def test_worker_rejects_malformed_values(field, value):
     with pytest.raises(ValueError, match=field):
         bootstrap.render_worker_user_data(**{**WORKER_ARGS, field: value})
+
+
+def test_worker_agent_survives_reboot_under_systemd():
+    """cloud-init runs user-data once, so the agent must be an enabled unit."""
+    script = bootstrap.render_worker_user_data(**WORKER_ARGS)
+
+    assert "/etc/systemd/system/k3s-agent.service" in script
+    assert "Restart=always" in script
+    assert "WantedBy=multi-user.target" in script
+    assert "systemctl enable --now k3s-agent" in script
+
+
+def test_worker_token_kept_out_of_world_readable_unit():
+    script = bootstrap.render_worker_user_data(**WORKER_ARGS)
+    unit = script.split("k3s-agent.service <<UNIT\n", 1)[1].split("\nUNIT\n", 1)[0]
+
+    assert "EnvironmentFile=/etc/k3s-agent.env" in unit
+    assert "JOIN_TOKEN" not in unit and "--token" not in unit
+    assert "chmod 600 /etc/k3s-agent.env" in script
