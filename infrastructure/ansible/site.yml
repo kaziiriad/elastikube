@@ -1,18 +1,14 @@
 ---
-# K3s Autoscaler Production - Cluster Deployment Playbook
-# This playbook sets up:
-# - Common host setup (k3s itself is installed by cloud-init from Pulumi)
-# - ML Training CronJob (optional, when deploy_ml_training flag is set)
-
-- hosts: k3s_cluster
-  become: true
-  gather_facts: true
-  roles:
-    - common
-
-# The master and every worker (permanent and Lambda-launched) are configured by
-# cloud-init from user-data that Pulumi renders
-# (infrastructure/pulumi/templates/{master,worker}-user-data.sh), not by Ansible.
+# K3s Autoscaler Production - optional cluster add-ons
+#
+# Not part of bring-up: `pulumi up` alone produces a working cluster. The master
+# and every worker (permanent and Lambda-launched) are configured by cloud-init
+# from user-data that Pulumi renders
+# (infrastructure/pulumi/templates/{master,worker}-user-data.sh).
+#
+# This playbook only runs opt-in extras:
+# - ML Training CronJob (deploy_ml_training=true)
+# - Worker AMI bake (bake_ami=true)
 
 # Deploy ML Training CronJob (optional - only runs when deploy_ml_training=true)
 # PHASE 1: Build Docker image on localhost
