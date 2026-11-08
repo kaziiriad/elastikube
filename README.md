@@ -1024,11 +1024,19 @@ pulumi stack init k3s-production-stack
 pulumi up
 ```
 
-### Deploy K3s Cluster with Ansible
+### K3s Cluster
+
+No separate step: `pulumi up` creates the cluster. The master and every worker
+configure themselves with cloud-init on first boot, from user-data Pulumi renders
+(`infrastructure/pulumi/templates/`): the master installs k3s and the monitoring
+stack, and workers join with the Pulumi-generated token.
+
+Ansible is only needed for opt-in extras:
 
 ```bash
 cd infrastructure/ansible
-ansible-playbook -i inventory/hosts.ini site.yml
+ansible-playbook -i inventory/hosts.ini site.yml -e deploy_ml_training=true  # ML training CronJob
+ansible-playbook -i inventory/hosts.ini site.yml -e bake_ami=true            # worker AMI bake
 ```
 
 ### Deploy Lambda Functions
@@ -1059,10 +1067,12 @@ cd monitoring/scripts
 ├── infrastructure/
 │   ├── pulumi/                 # Pulumi IaC for AWS resources
 │   │   ├── __main__.py        # Main Pulumi program
+│   │   ├── bootstrap.py       # Renders master/worker cloud-init user-data
+│   │   ├── templates/         # master-user-data.sh, worker-user-data.sh
 │   │   ├── Pulumi.yaml        # Pulumi configuration
 │   │   └── README.md          # Pulumi setup guide
-│   ├── ansible/                # Ansible playbooks for K3s setup
-│   │   ├── site.yml           # Main playbook
+│   ├── ansible/                # Opt-in extras (ML CronJob, AMI bake)
+│   │   ├── site.yml           # Extras playbook (not needed for bring-up)
 │   │   ├── worker-bootstrap.yml
 │   │   └── roles/
 │   │       ├── k3s-master/
